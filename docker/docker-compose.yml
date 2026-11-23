@@ -48,6 +48,8 @@ services:
       WORKER_DATABASE_URL: postgres://openrag_worker:${OPENRAG_WORKER_DB_PASSWORD:-openrag_worker_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
       ADMIN_DATABASE_URL: postgres://${POSTGRES_USER:-openrag}:${POSTGRES_PASSWORD:-openrag_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
       OPENRAG_PIPELINE_CONFIG: ${OPENRAG_PIPELINE_CONFIG:-/app/configs/pipeline.default.yaml}
+      # `docker compose exec openrag-api openrag init …` runs as the local operator (first org and key).
+      OPENRAG_OPERATOR: "1"
       # 32-byte hex key that wraps the PII vault keys; without it the server uses a fixed dev key.
       OPENRAG_PII_KEK_HEX: ${OPENRAG_PII_KEK_HEX:?set OPENRAG_PII_KEK_HEX (openssl rand -hex 32)}
       # Page thumbnails are off by default (thumbnail.enabled in the pipeline config). When enabled

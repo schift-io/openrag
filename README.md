@@ -65,18 +65,25 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
   up -d postgres local-embed openrag-api
 ```
 
-### Then: one command from a running server to asking questions
+### Then: set it up from inside the server container
+Nothing to install on the host: the API image ships the `openrag` CLI.
 ```bash
-# the stack's database, needed once to create the first organization and admin
-export DATABASE_URL=postgres://openrag:openrag_dev_pass@127.0.0.1:5432/openrag OPENRAG_OPERATOR=1
-openrag init --slug acme --name "ACME" --docs ./my-docs --connect claude
+# same -f files as the `up` above
+docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
+docker compose -f docker/docker-compose.yml exec openrag-api \
+  openrag init --slug acme --name "ACME" --docs /tmp/my-docs
 ```
 `openrag init` creates the organization, a department and an admin (permission level 10), mints
-the admin's API key into `~/.config/openrag/config.toml` (mode 600), creates the bucket `docs`,
-ingests every supported file under `./my-docs` and registers the server's `/mcp` in Claude Code
-(`claude mcp add --scope user`). Then ask Claude Code about the documents: it searches them with
-`rag_search` and answers with the sources. Running it again reuses the organization and bucket.
-`--connect codex` registers Codex instead (it reads the key from `$OPENRAG_API_KEY`).
+the admin's API key, creates the bucket `docs` and ingests every supported file under the folder.
+It prints the key and two commands, `connect.claude` and `connect.codex`; run one on the machine
+with Claude Code or Codex (use `--public-url http://<server>:8080` when that is another machine).
+Then ask Claude Code about the documents: it searches them with `rag_search` and answers with the
+sources. Running it again reuses the organization and bucket and mints a new key.
+
+A host build of `openrag` (`cargo build --release -p openrag-server --bin openrag`) does the same
+with `DATABASE_URL` pointing at the stack's database and `OPENRAG_OPERATOR=1`, saves the key to
+`~/.config/openrag/config.toml` (mode 600), and `--connect claude|codex` registers the clients
+directly.
 
 The API runs as one process (it drains the indexing outbox inline; there is no worker service).
 Page thumbnails and figure crops are off by default (`thumbnail.enabled: false`): nothing shows them
@@ -194,13 +201,12 @@ text is not.
 }
 ```
 
-`openrag connect claude` and `openrag connect codex` register the HTTP endpoint with the key from the
-CLI config. The stdio server (`openrag mcp --stdio`, `openrag-mcp`) talks to the database directly,
-so it only runs on the server host with `DATABASE_URL` set.
+The stdio server (`openrag mcp --stdio`, `openrag-mcp`) talks to the database directly, so it only
+runs on the server host with `DATABASE_URL` set. Other machines use the HTTP endpoint below; with a
+host build, `openrag connect claude|codex` runs these commands with the key from the CLI config.
 
 ### Claude Code
 ```bash
-openrag connect claude    # same as:
 claude mcp add --transport http --scope user openrag http://localhost:8080/mcp \
   --header "Authorization: Bearer ${OPENRAG_API_KEY}"
 ```
@@ -221,7 +227,6 @@ claude mcp add --transport http --scope user openrag http://localhost:8080/mcp \
 
 ### Codex
 ```bash
-openrag connect codex     # same as:
 codex mcp add openrag --url http://localhost:8080/mcp --bearer-token-env-var OPENRAG_API_KEY
 export OPENRAG_API_KEY=orag_…   # Codex reads the key from this variable
 ```

@@ -225,6 +225,10 @@ pub struct InitArgs {
     /// Server to set up; it must be running (`openrag up` or `openrag serve`)
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     pub api_url: String,
+    /// URL MCP clients use to reach the server (default: --api-url); set it when the clients run
+    /// on other machines
+    #[arg(long)]
+    pub public_url: Option<String>,
     #[command(flatten)]
     pub org: OrgSpec,
     /// Bucket to create for the documents
@@ -2616,13 +2620,22 @@ async fn cmd_init(a: InitArgs) -> Result<(), CliError> {
     }
     // 2. Organization, department, admin and the admin's API key (reused on a second run).
     let b = bootstrap_org(&a.org, true, "init").await?;
-    // 3. CLI config, so later commands (ingest, bucket, connect) need no flags.
-    let config = save_cli_config(&[
+    let public = a
+        .public_url
+        .as_deref()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| base.clone());
+    // 3. CLI config, so later commands (ingest, bucket, connect) need no flags. Inside the server
+    // container there may be no writable home; the setup goes on without it.
+    let config = match save_cli_config(&[
         ("api_url", base.clone()),
         ("api_key", b.api_key.clone()),
         ("org_id", b.org_id.to_string()),
         ("principal_id", b.principal_id.to_string()),
-    ])?;
+    ]) {
+        Ok(path) => json!(path.display().to_string()),
+        Err(e) => json!({ "not_saved": e.0 }),
+    };
     let remote = Exec::Remote(Remote {
         base: base.clone(),
         key: b.api_key.clone(),
@@ -2656,26 +2669,48 @@ async fn cmd_init(a: InitArgs) -> Result<(), CliError> {
         }
         None => Value::Null,
     };
-    // 6. MCP clients.
+    // 6. MCP clients: registered here with --connect, otherwise the commands to run where they are.
     let mut clients = Vec::new();
     for c in &a.connect {
-        clients.push(match connect_client(*c, "openrag", a.mcp_scope, &base, &b.api_key, false).await {
+        clients.push(match connect_client(*c, "openrag", a.mcp_scope, &public, &b.api_key, false).await {
             Ok(v) => v,
             Err(e) => json!({ "client": format!("{c:?}").to_lowercase(), "error": e.0 }),
         });
     }
+    let (api_key, connect, next) = if a.connect.is_empty() {
+        (
+            json!(b.api_key),
+            connect_commands(&public, &b.api_key),
+            "Run connect.claude (or connect.codex) on the machine with Claude Code (or Codex), then ask it about the documents. Keep the key: running init again mints a new one.",
+        )
+    } else {
+        (
+            json!(mask_key(&b.api_key)),
+            json!(clients),
+            "Ask your MCP client about the documents; it searches them with rag_search. More files: openrag ingest <file or folder> --bucket <bucket>",
+        )
+    };
     print_json(&json!({
-        "server": base,
+        "server": public,
         "org": { "id": b.org_id, "slug": a.org.slug, "created": b.created, "dept_id": b.dept_id },
         "admin": { "principal_id": b.principal_id, "email": a.org.admin_email },
-        "api_key": mask_key(&b.api_key),
-        "config": config.display().to_string(),
+        "api_key": api_key,
+        "config": config,
         "bucket": bucket,
         "documents": documents,
-        "mcp_clients": clients,
-        "next": "Ask your MCP client about the documents; it searches them with rag_search. More files: openrag ingest <file or folder> --bucket <bucket>",
+        "connect": connect,
+        "next": next,
     }));
     Ok(())
+}
+
+/// Shell commands that register the server in Claude Code and Codex, for the machine they run on.
+fn connect_commands(public: &str, key: &str) -> Value {
+    let mcp = format!("{}/mcp", public.trim_end_matches('/'));
+    json!({
+        "claude": format!("claude mcp add --transport http --scope user openrag {mcp} --header 'Authorization: Bearer {key}'"),
+        "codex": format!("export OPENRAG_API_KEY='{key}' && codex mcp add openrag --url {mcp} --bearer-token-env-var OPENRAG_API_KEY"),
+    })
 }
 
 #[cfg(test)]
