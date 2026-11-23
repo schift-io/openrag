@@ -1,0 +1,35 @@
+[package]
+name = "openrag-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+openrag-core.workspace = true
+openrag-db.workspace = true
+openrag-iam.workspace = true
+openrag-pii.workspace = true
+openrag-memory.workspace = true
+openrag-store.workspace = true
+openrag-retrieve.workspace = true
+
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pgvector.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

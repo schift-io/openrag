@@ -1,0 +1,35 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Ephemeral PostgreSQL test cluster
+.tmp-pg/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+web/dist/
+.pnpm-store/
+
+# Python / plugins
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# OS & editors
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Tool caches
+.ruff_cache/

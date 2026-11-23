@@ -1,0 +1,40 @@
+version: 1
+golden_set: gov_v1
+strategy: greedy_node
+metric: ndcg_at_10
+
+security_gates:
+  require_zero_pii_leak: true
+  require_zero_arn_violation: true
+
+nodes:
+  parse_ocr_engine:
+    - schift_ocr
+    - pdf_native
+  parse_dewarp_enabled:
+    - true
+    - false
+  store_pg_pinecone_engine:
+    - native
+    - pgvector
+  retrieve_fusion:
+    - rrf
+    - convex
+  retrieve_alpha:
+    - 0.2
+    - 0.3
+    - 0.5
+  retrieve_top_k:
+    - 8
+    - 12
+    - 20
+  retrieve_rerank:
+    - true
+    - false
+  retrieve_latest_revision_boost:
+    - 0.0
+    - 0.15
+    - 0.25
+  llm_model:
+    - "anthropic/claude-3.5-sonnet"
+    - "Qwen/Qwen2.5-32B-Instruct"

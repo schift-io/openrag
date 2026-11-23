@@ -1,0 +1,74 @@
+networks:
+  openrag_airgap:
+    driver: bridge
+    internal: true
+
+services:
+  postgres:
+    networks: [openrag_airgap]
+
+  minio:
+    networks: [openrag_airgap]
+
+  minio-init:
+    networks: [openrag_airgap]
+
+  vllm:
+    profiles: ["airgap"]
+    image: ${AIRGAP_VLLM_IMAGE:-vllm/vllm-openai:latest}
+    restart: unless-stopped
+    networks: [openrag_airgap]
+    command:
+      - --model
+      - ${AIRGAP_LLM_MODEL:-Qwen/Qwen2.5-32B-Instruct}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    volumes:
+      - ${AIRGAP_MODEL_DIR:-./models}:/models:ro
+
+  local-ocr:
+    profiles: ["airgap"]
+    image: ${AIRGAP_OCR_IMAGE:-openrag/local-ocr:latest}
+    restart: unless-stopped
+    networks: [openrag_airgap]
+    environment:
+      OCR_PORT: "8081"
+      OCR_MODE_ENFORCE: "private"
+
+  local-embed:
+    profiles: ["airgap"]
+    image: ${AIRGAP_EMBED_IMAGE:-openrag/local-embed:latest}
+    restart: unless-stopped
+    networks: [openrag_airgap]
+    environment:
+      EMBED_DIM: "256"
+      EMBED_PORT: "8082"
+
+  openrag-api:
+    networks: [openrag_airgap]
+    environment:
+      OPENRAG_CONFIG: /app/configs/pipeline.airgap.yaml
+      OPENRAG_OFFLINE_AIRGAP: "true"
+      OPENRAG_LOCAL_LLM_URL: http://vllm:8000/v1
+      OPENRAG_LOCAL_OCR_URL: http://local-ocr:8081
+      OPENRAG_LOCAL_EMBED_URL: http://local-embed:8082
+      OPENROUTER_API_KEY: ""
+      SCHIFT_OCR_API_KEY: ""
+      PINECONE_API_KEY: ""
+
+  openrag-worker:
+    networks: [openrag_airgap]
+    environment:
+      OPENRAG_CONFIG: /app/configs/pipeline.airgap.yaml
+      OPENRAG_OFFLINE_AIRGAP: "true"
+      OPENRAG_LOCAL_LLM_URL: http://vllm:8000/v1
+      OPENRAG_LOCAL_OCR_URL: http://local-ocr:8081
+      OPENRAG_LOCAL_EMBED_URL: http://local-embed:8082
+      OPENROUTER_API_KEY: ""
+      SCHIFT_OCR_API_KEY: ""
+      PINECONE_API_KEY: ""
+
+  openrag-web:
+    networks: [openrag_airgap]

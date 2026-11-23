@@ -1,0 +1,784 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use image::{GenericImageView, Rgb, RgbImage};
+use openrag_core::{BBoxNorm1000, OpenRagError, ParseConfig, Sensitivity};
+use reqwest::multipart;
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+
+use crate::aliases::extract_parenthetical_aliases;
+use crate::model::{
+    sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrBlock, OcrExecutionTarget,
+    OcrPolicyDecision, OcrTask, ParsePolicyCtx, ParsedDocument, ParsedPage,
+};
+
+pub const DEFAULT_SHARE_DAILY_LIMIT: u32 = 50;
+
+fn ocr_mode_rank(mode: Sensitivity) -> u8 {
+    match mode {
+        Sensitivity::Share | Sensitivity::Normal => 1,
+        Sensitivity::Private | Sensitivity::Confidential | Sensitivity::Secret => 2,
+        Sensitivity::Zdr => 3,
+    }
+}
+
+fn normalize_ocr_mode(s: Sensitivity) -> Sensitivity {
+    match s {
+        Sensitivity::Share | Sensitivity::Normal => Sensitivity::Share,
+        Sensitivity::Private | Sensitivity::Confidential | Sensitivity::Secret => {
+            Sensitivity::Private
+        }
+        Sensitivity::Zdr => Sensitivity::Zdr,
+    }
+}
+
+fn max_ocr_mode(a: Sensitivity, b: Sensitivity) -> Sensitivity {
+    let na = normalize_ocr_mode(a);
+    let nb = normalize_ocr_mode(b);
+    if ocr_mode_rank(na) >= ocr_mode_rank(nb) {
+        na
+    } else {
+        nb
+    }
+}
+
+/// Evaluates the OCR privacy mode (`share` | `private` | `zdr`) and execution target
+/// (`SchiftCloud` | `LocalVllm` | `OfflineFallback`).
+///
+/// Guarantees:
+/// - Never allows `share` when `auth_level` requires `private` / `zdr`, when `sensitivity` is
+///   `Private`/`Confidential`/`Secret`/`Zdr`, or when `cfg.ocr_engine == "local_vllm"`.
+/// - Rejects `zdr` + `batch=true` with `OpenRagError::Validation("zdr_batch_unsupported: ...")`.
+pub fn resolve_ocr_policy(
+    cfg: &ParseConfig,
+    ctx: &ParsePolicyCtx,
+) -> Result<OcrPolicyDecision, OpenRagError> {
+    let has_remote_url = std::env::var("OPENRAG_SCHIFT_OCR_URL")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    resolve_ocr_policy_with_target(cfg, ctx, has_remote_url)
+}
+
+pub fn resolve_ocr_policy_with_target(
+    cfg: &ParseConfig,
+    ctx: &ParsePolicyCtx,
+    has_remote_ocr_endpoint: bool,
+) -> Result<OcrPolicyDecision, OpenRagError> {
+    let mut required_by_level = normalize_ocr_mode(cfg.default_ocr_mode);
+    let mut best_rule_level = 0u8;
+    for rule in &cfg.ocr_mode_by_auth_level {
+        if ctx.auth_level >= rule.min_auth_level && rule.min_auth_level.as_u8() >= best_rule_level
+        {
+            best_rule_level = rule.min_auth_level.as_u8();
+            required_by_level = normalize_ocr_mode(rule.required_mode);
+        }
+    }
+
+    let sensitivity_floor = match ctx.sensitivity {
+        Sensitivity::Share | Sensitivity::Normal => Sensitivity::Share,
+        Sensitivity::Private | Sensitivity::Confidential | Sensitivity::Secret => {
+            Sensitivity::Private
+        }
+        Sensitivity::Zdr => Sensitivity::Zdr,
+    };
+
+    let requested = ctx
+        .requested_ocr_mode
+        .map(normalize_ocr_mode)
+        .unwrap_or_else(|| normalize_ocr_mode(cfg.default_ocr_mode));
+
+    let mut effective_mode = max_ocr_mode(requested, max_ocr_mode(required_by_level, sensitivity_floor));
+
+    // Airgap / local_vllm never transmits to free external `share` tier.
+    if cfg.ocr_engine == "local_vllm" && effective_mode == Sensitivity::Share {
+        effective_mode = Sensitivity::Private;
+    }
+
+    if cfg.reject_zdr_with_batch
+        && ctx.batch
+        && (effective_mode == Sensitivity::Zdr
+            || ctx.requested_ocr_mode == Some(Sensitivity::Zdr))
+    {
+        return Err(OpenRagError::Validation(
+            "zdr_batch_unsupported: ZDR mode cannot be used with batch=true; use_mode=private"
+                .into(),
+        ));
+    }
+
+    let upgraded_from_share =
+        ctx.requested_ocr_mode == Some(Sensitivity::Share) && effective_mode != Sensitivity::Share;
+
+    let execution_target = if cfg.ocr_engine == "local_vllm" {
+        OcrExecutionTarget::LocalVllm
+    } else if has_remote_ocr_endpoint && cfg.ocr_engine == "schift_ocr" {
+        OcrExecutionTarget::SchiftCloud
+    } else {
+        OcrExecutionTarget::OfflineFallback
+    };
+
+    Ok(OcrPolicyDecision {
+        effective_mode,
+        execution_target,
+        upgraded_from_share,
+    })
+}
+
+/// Thread-safe KST (UTC+09:00) daily quota tracker enforcing the 50 pages/day free `share` limit.
+#[derive(Debug)]
+pub struct ShareQuotaTracker {
+    daily_limit: u32,
+    counts: Mutex<HashMap<(String, NaiveDate), u32>>,
+}
+
+impl Default for ShareQuotaTracker {
+    fn default() -> Self {
+        Self::new(DEFAULT_SHARE_DAILY_LIMIT)
+    }
+}
+
+impl ShareQuotaTracker {
+    pub fn new(daily_limit: u32) -> Self {
+        Self {
+            daily_limit,
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn kst_date(now: DateTime<Utc>) -> NaiveDate {
+        match FixedOffset::east_opt(9 * 3600) {
+            Some(kst) => now.with_timezone(&kst).date_naive(),
+            None => now.date_naive(),
+        }
+    }
+
+    pub fn try_consume(&self, tenant_key: &str, pages: u32) -> Result<u32, OpenRagError> {
+        self.try_consume_at(tenant_key, pages, Utc::now())
+    }
+
+    pub fn try_consume_at(
+        &self,
+        tenant_key: &str,
+        pages: u32,
+        now: DateTime<Utc>,
+    ) -> Result<u32, OpenRagError> {
+        let date = Self::kst_date(now);
+        let mut guard = self.counts.lock().map_err(|_| {
+            OpenRagError::Internal("share quota tracker mutex poisoned".into())
+        })?;
+        let key = (tenant_key.to_string(), date);
+        let used = guard.get(&key).copied().unwrap_or(0);
+        let next = used.saturating_add(pages);
+        if next > self.daily_limit {
+            return Err(OpenRagError::Validation(format!(
+                "share_quota_exceeded: daily free share limit of {} pages/KST day reached (used={used}, requested={pages})",
+                self.daily_limit
+            )));
+        }
+        guard.insert(key, next);
+        Ok(self.daily_limit.saturating_sub(next))
+    }
+
+    pub fn used_today(&self, tenant_key: &str) -> u32 {
+        let date = Self::kst_date(Utc::now());
+        self.counts
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&(tenant_key.to_string(), date)).copied())
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchiftOcrImageItem {
+    pub image: String,
+    #[serde(default)]
+    pub image_base64: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub bbox: Option<[i32; 4]>,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchiftOcrBlockItem {
+    #[serde(default = "default_block_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub bbox: Option<[i32; 4]>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+fn default_block_kind() -> String {
+    "text".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchiftOcrPageItem {
+    pub page_no: Option<i32>,
+    #[serde(default)]
+    pub markdown: String,
+    #[serde(default)]
+    pub blocks: Vec<SchiftOcrBlockItem>,
+    #[serde(default)]
+    pub images: Vec<SchiftOcrImageItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchiftOcrResponse {
+    #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blocks: Vec<SchiftOcrBlockItem>,
+    #[serde(default)]
+    pub pages: Vec<SchiftOcrPageItem>,
+    #[serde(default)]
+    pub images: Vec<SchiftOcrImageItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchiftOcrClient {
+    endpoint_url: String,
+    api_key: Option<String>,
+    client: reqwest::Client,
+}
+
+impl SchiftOcrClient {
+    pub fn new(
+        endpoint_url: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Result<Self, OpenRagError> {
+        let endpoint = endpoint_url.into();
+        if endpoint.trim().is_empty() {
+            return Err(OpenRagError::Config(
+                "Schift OCR endpoint_url must not be empty".into(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| {
+                OpenRagError::Internal(format!("failed to construct Schift OCR HTTP client: {e}"))
+            })?;
+        Ok(Self {
+            endpoint_url: endpoint.trim_end_matches('/').to_string(),
+            api_key,
+            client,
+        })
+    }
+
+    pub async fn run_ocr(
+        &self,
+        image_bytes: &[u8],
+        filename: &str,
+        mode: Sensitivity,
+        batch: bool,
+        task: OcrTask,
+    ) -> Result<SchiftOcrResponse, OpenRagError> {
+        if batch && normalize_ocr_mode(mode) == Sensitivity::Zdr {
+            return Err(OpenRagError::Validation(
+                "zdr_batch_unsupported: ZDR mode cannot be used with batch=true; use_mode=private"
+                    .into(),
+            ));
+        }
+        if image_bytes.is_empty() {
+            return Err(OpenRagError::Validation(
+                "cannot submit empty image bytes to OCR".into(),
+            ));
+        }
+
+        let url = format!("{}/v1/run", self.endpoint_url);
+        let file_part = multipart::Part::bytes(image_bytes.to_vec())
+            .file_name(filename.to_string());
+        let form = multipart::Form::new()
+            .part("image", file_part)
+            .text("task", task.as_str().to_string())
+            .text("mode", normalize_ocr_mode(mode).as_str().to_string())
+            .text("batch", if batch { "true" } else { "false" }.to_string());
+
+        let mut req = self.client.post(&url).multipart(form);
+        if let Some(key) = self.api_key.as_deref() {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req.send().await.map_err(|e| OpenRagError::ExternalAdapter {
+            adapter: "schift_ocr".into(),
+            message: format!("HTTP request failed: {e}"),
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400 && body.contains("zdr_batch_unsupported") {
+                return Err(OpenRagError::Validation(format!(
+                    "zdr_batch_unsupported: {body}"
+                )));
+            }
+            return Err(OpenRagError::ExternalAdapter {
+                adapter: "schift_ocr".into(),
+                message: format!("HTTP {status}: {body}"),
+            });
+        }
+
+        resp.json::<SchiftOcrResponse>()
+            .await
+            .map_err(|e| OpenRagError::ExternalAdapter {
+                adapter: "schift_ocr".into(),
+                message: format!("failed to parse OCR JSON response: {e}"),
+            })
+    }
+}
+
+/// Deterministic skew estimator (`-5..=+5` degrees) + bilinear rotation when `dewarp_enabled` is true.
+pub fn dewarp_image(img: &RgbImage, cfg: &ParseConfig) -> RgbImage {
+    if !cfg.dewarp_enabled || img.width() < 16 || img.height() < 16 {
+        return img.clone();
+    }
+
+    let (w, h) = img.dimensions();
+    // Estimate skew angle on a small proxy grid for fast deterministic execution.
+    let step_x = (w / 128).max(1);
+    let step_y = (h / 128).max(1);
+    let mut best_angle = 0.0f32;
+    let mut best_var = f64::NEG_INFINITY;
+
+    let mut deg = -5.0f32;
+    while deg <= 5.001 {
+        let rad = deg.to_radians();
+        let sin_a = rad.sin();
+        let mut row_sums: HashMap<i32, u64> = HashMap::new();
+        for y in (0..h).step_by(step_y as usize) {
+            for x in (0..w).step_by(step_x as usize) {
+                let px = img.get_pixel(x, y);
+                let lum = (0.299 * (px[0] as f32) + 0.587 * (px[1] as f32) + 0.114 * (px[2] as f32))
+                    as u64;
+                let darkness = 255u64.saturating_sub(lum);
+                let proj_y = ((y as f32) - (x as f32) * sin_a).round() as i32;
+                *row_sums.entry(proj_y).or_insert(0) += darkness;
+            }
+        }
+        let n = (row_sums.len().max(1)) as f64;
+        let mean = row_sums.values().sum::<u64>() as f64 / n;
+        let var = row_sums
+            .values()
+            .map(|&v| {
+                let d = (v as f64) - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+        if var > best_var {
+            best_var = var;
+            best_angle = deg;
+        }
+        deg += 1.0;
+    }
+
+    if best_angle.abs() < 0.5 {
+        return img.clone();
+    }
+
+    rotate_rgb_bilinear(img, -best_angle.to_radians())
+}
+
+fn rotate_rgb_bilinear(img: &RgbImage, rad: f32) -> RgbImage {
+    let (w, h) = img.dimensions();
+    let cx = (w as f32) / 2.0;
+    let cy = (h as f32) / 2.0;
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+    let mut out = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+
+    for y in 0..h {
+        let dy = (y as f32) - cy;
+        for x in 0..w {
+            let dx = (x as f32) - cx;
+            let sx = cos_a * dx + sin_a * dy + cx;
+            let sy = -sin_a * dx + cos_a * dy + cy;
+            if sx >= 0.0 && sx < (w - 1) as f32 && sy >= 0.0 && sy < (h - 1) as f32 {
+                let x0 = sx.floor() as u32;
+                let y0 = sy.floor() as u32;
+                let fx = sx - (x0 as f32);
+                let fy = sy - (y0 as f32);
+
+                let p00 = img.get_pixel(x0, y0);
+                let p10 = img.get_pixel(x0 + 1, y0);
+                let p01 = img.get_pixel(x0, y0 + 1);
+                let p11 = img.get_pixel(x0 + 1, y0 + 1);
+
+                let mut rgb = [0u8; 3];
+                for c in 0..3 {
+                    let v0 = (p00[c] as f32) * (1.0 - fx) + (p10[c] as f32) * fx;
+                    let v1 = (p01[c] as f32) * (1.0 - fx) + (p11[c] as f32) * fx;
+                    rgb[c] = (v0 * (1.0 - fy) + v1 * fy).round().clamp(0.0, 255.0) as u8;
+                }
+                out.put_pixel(x, y, Rgb(rgb));
+            }
+        }
+    }
+    out
+}
+
+pub async fn parse_image_with_ocr(
+    bytes: &[u8],
+    format: DocumentFormat,
+    filename: Option<&str>,
+    cfg: &ParseConfig,
+    ctx: &ParsePolicyCtx,
+    quota: Option<&ShareQuotaTracker>,
+    remote_client: Option<&SchiftOcrClient>,
+) -> Result<ParsedDocument, OpenRagError> {
+    if bytes.is_empty() {
+        return Err(OpenRagError::Validation(
+            "empty image payload cannot be parsed".into(),
+        ));
+    }
+
+    let dyn_img = image::load_from_memory(bytes)
+        .map_err(|e| OpenRagError::Validation(format!("invalid or corrupt image payload: {e}")))?;
+    let (orig_w, orig_h) = dyn_img.dimensions();
+    if orig_w == 0 || orig_h == 0 {
+        return Err(OpenRagError::Validation("image has zero dimensions".into()));
+    }
+
+    let policy = resolve_ocr_policy_with_target(cfg, ctx, remote_client.is_some())?;
+    if policy.effective_mode == Sensitivity::Share {
+        if let Some(q) = quota {
+            let tenant = ctx.tenant_key.as_deref().unwrap_or("default");
+            q.try_consume(tenant, 1)?;
+        }
+    }
+
+    let rgb_raw = dyn_img.to_rgb8();
+    let dewarped = dewarp_image(&rgb_raw, cfg);
+
+    if policy.execution_target == OcrExecutionTarget::SchiftCloud {
+        if let Some(client) = remote_client {
+            let fname = filename.unwrap_or("page.png");
+            let resp = client
+                .run_ocr(bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
+                .await?;
+            return build_doc_from_schift_response(bytes, format, filename, &dewarped, resp, policy);
+        }
+    }
+
+    // Deterministic offline OCR fallback (optionally augmented by tesseract CLI)
+    let mut blocks = detect_foreground_blocks(&dewarped);
+    let tesseract_text = try_tesseract_cli(bytes).await;
+
+    let raw_markdown = if let Some(txt) = tesseract_text.filter(|t| !t.trim().is_empty()) {
+        if blocks.is_empty() {
+            let full_box = BBoxNorm1000::new(0, 0, 999, 999)?;
+            blocks.push(OcrBlock {
+                kind: "text".into(),
+                text: txt.clone(),
+                bbox_norm_1000: Some(full_box),
+                confidence: Some(0.90),
+            });
+        } else if let Some(first) = blocks.first_mut() {
+            first.text = txt.clone();
+        }
+        txt
+    } else if !blocks.is_empty() {
+        blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        let full_box = BBoxNorm1000::new(0, 0, 999, 999)?;
+        let fallback_line = format!("[OCR image {}x{}]", dewarped.width(), dewarped.height());
+        blocks.push(OcrBlock {
+            kind: "text".into(),
+            text: fallback_line.clone(),
+            bbox_norm_1000: Some(full_box),
+            confidence: Some(0.50),
+        });
+        fallback_line
+    };
+
+    let aliases = extract_parenthetical_aliases(&raw_markdown);
+    let (w, h) = dewarped.dimensions();
+    let page = ParsedPage {
+        page_no: 1,
+        raw_markdown: raw_markdown.clone(),
+        tables_html: Vec::new(),
+        formulas: Vec::new(),
+        fields: Vec::new(),
+        blocks,
+        extracted_aliases: aliases.clone(),
+        page_image_rgb: Some((w, h, dewarped.into_raw())),
+        content_sha256: sha256_hex_str(&raw_markdown),
+    };
+
+    let title = filename
+        .and_then(|f| Path::new(f).file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("OCR Image")
+        .to_string();
+
+    let engine = match policy.execution_target {
+        OcrExecutionTarget::LocalVllm => "local_vllm",
+        OcrExecutionTarget::SchiftCloud => "schift_ocr",
+        OcrExecutionTarget::OfflineFallback => "offline_ocr",
+    };
+
+    Ok(ParsedDocument {
+        title,
+        format,
+        mime_type: format.default_mime().to_string(),
+        content_sha256: sha256_hex_bytes(bytes),
+        pages: vec![page],
+        full_markdown: raw_markdown,
+        extracted_aliases: aliases,
+        ocr_policy: Some(policy),
+        parser_engine: engine.to_string(),
+    })
+}
+
+fn build_doc_from_schift_response(
+    bytes: &[u8],
+    format: DocumentFormat,
+    filename: Option<&str>,
+    img: &RgbImage,
+    resp: SchiftOcrResponse,
+    policy: OcrPolicyDecision,
+) -> Result<ParsedDocument, OpenRagError> {
+    let mut pages = Vec::new();
+    let (w, h) = img.dimensions();
+
+    if resp.pages.is_empty() {
+        let md = resp
+            .markdown
+            .or(resp.text)
+            .unwrap_or_default();
+        let blocks = convert_ocr_blocks(&resp.blocks)?;
+        let aliases = extract_parenthetical_aliases(&md);
+        pages.push(ParsedPage {
+            page_no: 1,
+            raw_markdown: md.clone(),
+            tables_html: Vec::new(),
+            formulas: Vec::new(),
+            fields: Vec::new(),
+            blocks,
+            extracted_aliases: aliases,
+            page_image_rgb: Some((w, h, img.clone().into_raw())),
+            content_sha256: sha256_hex_str(&md),
+        });
+    } else {
+        for (idx, p) in resp.pages.iter().enumerate() {
+            let blocks = convert_ocr_blocks(&p.blocks)?;
+            let aliases = extract_parenthetical_aliases(&p.markdown);
+            pages.push(ParsedPage {
+                page_no: p.page_no.unwrap_or((idx + 1) as i32),
+                raw_markdown: p.markdown.clone(),
+                tables_html: Vec::new(),
+                formulas: Vec::new(),
+                fields: Vec::new(),
+                blocks,
+                extracted_aliases: aliases,
+                page_image_rgb: if idx == 0 {
+                    Some((w, h, img.clone().into_raw()))
+                } else {
+                    None
+                },
+                content_sha256: sha256_hex_str(&p.markdown),
+            });
+        }
+    }
+
+    let full_markdown = pages
+        .iter()
+        .map(|p| p.raw_markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let extracted_aliases = extract_parenthetical_aliases(&full_markdown);
+    let title = filename
+        .and_then(|f| Path::new(f).file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("OCR Document")
+        .to_string();
+
+    Ok(ParsedDocument {
+        title,
+        format,
+        mime_type: format.default_mime().to_string(),
+        content_sha256: sha256_hex_bytes(bytes),
+        pages,
+        full_markdown,
+        extracted_aliases,
+        ocr_policy: Some(policy),
+        parser_engine: "schift_ocr".to_string(),
+    })
+}
+
+fn convert_ocr_blocks(items: &[SchiftOcrBlockItem]) -> Result<Vec<OcrBlock>, OpenRagError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let bbox = match item.bbox {
+            Some([x0, y0, x1, y1]) => Some(BBoxNorm1000::new(
+                x0.clamp(0, 999),
+                y0.clamp(0, 999),
+                x1.clamp(0, 999).max(x0.clamp(0, 999)),
+                y1.clamp(0, 999).max(y0.clamp(0, 999)),
+            )?),
+            None => None,
+        };
+        out.push(OcrBlock {
+            kind: item.kind.clone(),
+            text: item.text.clone(),
+            bbox_norm_1000: bbox,
+            confidence: item.confidence,
+        });
+    }
+    Ok(out)
+}
+
+/// Detects non-background connected rectangular regions in normalized `0..=999` coordinates.
+pub fn detect_foreground_blocks(img: &RgbImage) -> Vec<OcrBlock> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+
+    // Estimate background color from the four corners
+    let corners = [
+        img.get_pixel(0, 0),
+        img.get_pixel(w - 1, 0),
+        img.get_pixel(0, h - 1),
+        img.get_pixel(w - 1, h - 1),
+    ];
+    let bg_r = corners.iter().map(|p| p[0] as i32).sum::<i32>() / 4;
+    let bg_g = corners.iter().map(|p| p[1] as i32).sum::<i32>() / 4;
+    let bg_b = corners.iter().map(|p| p[2] as i32).sum::<i32>() / 4;
+
+    // 25x25 coarse grid occupancy mask
+    const GX: usize = 25;
+    const GY: usize = 25;
+    let mut active = [[false; GX]; GY];
+
+    for (gy, active_row) in active.iter_mut().enumerate().take(GY) {
+        let y0 = (gy * (h as usize)) / GY;
+        let y1 = (((gy + 1) * (h as usize)) / GY).max(y0 + 1).min(h as usize);
+        for (gx, active_cell) in active_row.iter_mut().enumerate().take(GX) {
+            let x0 = (gx * (w as usize)) / GX;
+            let x1 = (((gx + 1) * (w as usize)) / GX).max(x0 + 1).min(w as usize);
+            let mut fg = 0usize;
+            let mut total = 0usize;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let p = img.get_pixel(px as u32, py as u32);
+                    let diff = (p[0] as i32 - bg_r).abs()
+                        + (p[1] as i32 - bg_g).abs()
+                        + (p[2] as i32 - bg_b).abs();
+                    if diff > 36 {
+                        fg += 1;
+                    }
+                    total += 1;
+                }
+            }
+            if total > 0 && fg * 10 >= total {
+                *active_cell = true;
+            }
+        }
+    }
+
+    // BFS connected components on the 25x25 grid
+    let mut visited = [[false; GX]; GY];
+    let mut blocks = Vec::new();
+
+    for sy in 0..GY {
+        for sx in 0..GX {
+            if !active[sy][sx] || visited[sy][sx] {
+                continue;
+            }
+            let mut queue = vec![(sx, sy)];
+            visited[sy][sx] = true;
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (sx, sy, sx, sy);
+            let mut cell_count = 0usize;
+
+            while let Some((cx, cy)) = queue.pop() {
+                cell_count += 1;
+                min_x = min_x.min(cx);
+                min_y = min_y.min(cy);
+                max_x = max_x.max(cx);
+                max_y = max_y.max(cy);
+
+                let neighbors = [
+                    (cx.wrapping_sub(1), cy),
+                    (cx + 1, cy),
+                    (cx, cy.wrapping_sub(1)),
+                    (cx, cy + 1),
+                ];
+                for (nx, ny) in neighbors {
+                    if nx < GX && ny < GY && active[ny][nx] && !visited[ny][nx] {
+                        visited[ny][nx] = true;
+                        queue.push((nx, ny));
+                    }
+                }
+            }
+
+            if cell_count == 0 {
+                continue;
+            }
+
+            let bx0 = ((min_x * 1000) / GX).min(998) as i32;
+            let by0 = ((min_y * 1000) / GY).min(998) as i32;
+            let bx1 = ((((max_x + 1) * 1000) / GX).saturating_sub(1))
+                .clamp(bx0 as usize + 1, 999) as i32;
+            let by1 = ((((max_y + 1) * 1000) / GY).saturating_sub(1))
+                .clamp(by0 as usize + 1, 999) as i32;
+
+            if let Ok(bbox) = BBoxNorm1000::new(bx0, by0, bx1, by1) {
+                let idx = blocks.len();
+                blocks.push(OcrBlock {
+                    kind: "figure".into(),
+                    text: format!(
+                        "[OCR region #{idx} bbox=({bx0},{by0},{bx1},{by1})]"
+                    ),
+                    bbox_norm_1000: Some(bbox),
+                    confidence: Some(0.85),
+                });
+            }
+        }
+    }
+
+    blocks
+}
+
+async fn try_tesseract_cli(bytes: &[u8]) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    let bin = std::env::split_paths(&path_var)
+        .map(|d| d.join("tesseract"))
+        .find(|p| p.is_file())?;
+
+    let tmp_path = std::env::temp_dir().join(format!("openrag-ocr-{}.png", uuid::Uuid::now_v7()));
+    if tokio::fs::write(&tmp_path, bytes).await.is_err() {
+        return None;
+    }
+
+    let mut cmd = Command::new(bin);
+    cmd.arg(&tmp_path).arg("stdout").arg("--psm").arg("6");
+    let res = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await;
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    let Ok(Ok(out)) = res else {
+        return None;
+    };
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}

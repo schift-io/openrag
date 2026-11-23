@@ -1,0 +1,31 @@
+[package]
+name = "openrag-retrieve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+openrag-core.workspace = true
+openrag-db.workspace = true
+openrag-store.workspace = true
+openrag-memory.workspace = true
+
+async-trait.workspace = true
+chrono.workspace = true
+pgvector.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_yaml_ng.workspace = true
+
+[lints]
+workspace = true

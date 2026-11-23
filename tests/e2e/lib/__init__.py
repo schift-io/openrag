@@ -1,0 +1,95 @@
+"""OpenRAG E2E test harness support library."""
+
+from .cli_client import (
+    CliBinaryNotFoundError,
+    CliError,
+    CliExecutionError,
+    CliResult,
+    OpenRagCli,
+    resolve_binary,
+)
+from .fixtures import (
+    BBoxPixelReport,
+    FixtureFactory,
+    inspect_bbox_blackout,
+    make_hwpx_bytes,
+    make_korean_pii_doc,
+    make_obsidian_vault,
+    make_pdf_bytes,
+    make_pipeline_yaml,
+    make_png_bytes,
+    make_search_space_yaml,
+    make_secret_payload,
+    make_webp_bytes,
+)
+from .http_client import (
+    EphemeralOpenRagServer,
+    HttpResponse,
+    OpenRagHttpClient,
+    SseEvent,
+    extract_sse_text,
+)
+from .mcp_client import (
+    McpError,
+    McpHttpClient,
+    McpJsonRpcError,
+    McpProtocolError,
+    McpSessionMixin,
+    McpStdioClient,
+    McpToolResult,
+)
+from .pg_harness import (
+    PgEphemeralCluster,
+    PgPrincipalContext,
+    PgSandboxError,
+    build_rls_preamble_sql,
+)
+from .plugin_client import PluginClient
+from .web_client import (
+    APP_ROUTES,
+    FORBIDDEN_APP_JARGON,
+    STUDIO_ROUTES,
+    WebClient,
+)
+
+__all__ = [
+    "APP_ROUTES",
+    "BBoxPixelReport",
+    "CliBinaryNotFoundError",
+    "CliError",
+    "CliExecutionError",
+    "CliResult",
+    "EphemeralOpenRagServer",
+    "FORBIDDEN_APP_JARGON",
+    "FixtureFactory",
+    "HttpResponse",
+    "McpError",
+    "McpHttpClient",
+    "McpJsonRpcError",
+    "McpProtocolError",
+    "McpSessionMixin",
+    "McpStdioClient",
+    "McpToolResult",
+    "OpenRagCli",
+    "OpenRagHttpClient",
+    "PgEphemeralCluster",
+    "PgPrincipalContext",
+    "PgSandboxError",
+    "PluginClient",
+    "STUDIO_ROUTES",
+    "SseEvent",
+    "WebClient",
+    "build_rls_preamble_sql",
+    "extract_sse_text",
+    "inspect_bbox_blackout",
+    "make_hwpx_bytes",
+    "make_korean_pii_doc",
+    "make_obsidian_vault",
+    "make_pdf_bytes",
+    "make_pipeline_yaml",
+    "make_png_bytes",
+    "make_search_space_yaml",
+    "make_secret_payload",
+    "make_webp_bytes",
+    "resolve_binary",
+]

@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openrag-core",
+    "crates/openrag-db",
+    "crates/openrag-iam",
+    "crates/openrag-parse",
+    "crates/openrag-pii",
+    "crates/openrag-store",
+    "crates/openrag-memory",
+    "crates/openrag-retrieve",
+    "crates/openrag-eval",
+    "crates/openrag-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/schift-io/openrag"
+authors = ["OpenRAG Contributors"]
+
+[workspace.dependencies]
+# Core serialization & errors
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+thiserror = "2.0"
+anyhow = "1.0"
+
+# IDs, time, regex, hashing
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+regex = "1.13"
+sha2 = "0.11"
+hex = "0.4"
+unicode-normalization = "0.1"
+
+# Async & observability
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "fs", "io-std", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Document parsing, archives, XML, images, crypto, HTTP
+base64 = "0.22"
+cfb = "0.15"
+flate2 = "1.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+quick-xml = "0.42"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+ring = "0.17"
+zeroize = { version = "1.9", features = ["derive"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# PostgreSQL & pgvector (runtime queries; no compile-time DATABASE_URL macro dependency)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "chrono", "json", "migrate"] }
+pgvector = { version = "0.4", features = ["sqlx", "serde"] }
+
+# HTTP server, router & CLI
+axum = { version = "0.8", features = ["json", "macros", "multipart", "query", "tokio"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+futures-util = "0.3"
+http = "1.5"
+http-body-util = "0.1"
+mime = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "set-header", "trace"] }
+
+# CLI config file (~/.config/openrag/config.toml)
+toml = "1"
+
+# Testing helpers
+tempfile = "3"
+
+# Internal workspace crates
+openrag-core = { path = "crates/openrag-core" }
+openrag-db = { path = "crates/openrag-db" }
+openrag-iam = { path = "crates/openrag-iam" }
+openrag-parse = { path = "crates/openrag-parse" }
+openrag-pii = { path = "crates/openrag-pii" }
+openrag-store = { path = "crates/openrag-store" }
+openrag-memory = { path = "crates/openrag-memory" }
+openrag-retrieve = { path = "crates/openrag-retrieve" }
+openrag-eval = { path = "crates/openrag-eval" }
+openrag-server = { path = "crates/openrag-server" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

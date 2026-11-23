@@ -1,0 +1,107 @@
+version: 1
+profile: standard
+
+parse:
+  hwp_engine: kordoc
+  ocr_engine: schift_ocr
+  dewarp_enabled: true
+  pdf_native_enabled: true
+  default_ocr_mode: share
+  ocr_mode_by_auth_level:
+    - min_auth_level: 8
+      required_mode: zdr
+    - min_auth_level: 5
+      required_mode: private
+  reject_zdr_with_batch: true
+
+thumbnail:
+  format: webp
+  max_edge_px: 1600
+  figure_max_edge_px: 1280
+  figure_max_bytes: 307200
+
+pii:
+  schift_v7: true
+  marker_ko_pii: false
+  schift_v6: false
+  custom_dict_terms: []
+  allowlist_terms: []
+  capsule_enabled: true
+  guard:
+    enabled: true
+    default_action: mask
+    allowlist: []
+    rules:
+      - kind: pii_category
+        pattern_or_category: rrn_kr
+        action: block
+        surfaces: [llm_egress, mcp_egress]
+        enabled: true
+        priority: 10
+      - kind: pii_category
+        pattern_or_category: phone_kr
+        action: mask
+        surfaces: [inbound_query, llm_egress, mcp_egress, ingestion_gate]
+        enabled: true
+        priority: 20
+      - kind: pii_category
+        pattern_or_category: email
+        action: mask
+        surfaces: [llm_egress, mcp_egress]
+        enabled: true
+        priority: 30
+      - kind: safe_word
+        pattern_or_category: "PROJECT-BLACKBOX"
+        action: block
+        surfaces: [inbound_query, llm_egress, mcp_egress, ingestion_gate]
+        enabled: true
+        priority: 5
+      - kind: keyword
+        pattern_or_category: "CONFIDENTIAL-DRAFT"
+        action: warn
+        surfaces: [mcp_egress, llm_egress]
+        enabled: true
+        priority: 40
+      - kind: regex
+        pattern_or_category: '(?i)\bsk-[a-z0-9][a-z0-9_-]{15,}'
+        action: block
+        surfaces: [ingestion_gate, llm_egress, mcp_egress]
+        replacement_text: "[REDACTED_API_KEY]"
+        enabled: true
+        priority: 1
+
+memory:
+  backend: openrag_pg
+  offline_fallback: true
+
+store:
+  pg_pinecone_engine: native
+  dim: 256
+  bm25_engine: pg_search
+  bm25_fallback: pg_trgm
+  external_mirror: none
+  outbox_batch_size: 64
+  outbox_max_attempts: 3
+
+retrieve:
+  # Text spaces are ranked by the embedding model alone: on Ko-StrategyQA (EmbeddingGemma-2 @256d)
+  # BM25 fusion lowered nDCG@10 from 0.781 to 0.703, and convex alpha=0 skips the BM25 query.
+  # Page thumbnails are not a default space: their vectors are visual and cannot be compared with
+  # a text query vector. Without a text embedding model (OPENRAG_TEXT_EMBED_URL unset) the server
+  # falls back to rrf, since hash vectors carry no meaning.
+  spaces: [chunks, wiki, memory]
+  fusion: convex
+  rrf_k: 60
+  alpha: 0.0
+  top_k: 12
+  rerank: true
+  latest_revision_boost: 0.15
+  admission_threshold: 0.35
+
+llm:
+  external_provider: openrouter
+  external_model: "anthropic/claude-3.5-sonnet"
+  local_provider: vllm_local
+  local_model: "Qwen/Qwen2.5-32B-Instruct"
+  local_only_min_auth_level: 8
+  require_pii_masked_for_external: true
