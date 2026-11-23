@@ -15,6 +15,29 @@ use openrag_pii::{
 use pgvector::Vector;
 use uuid::Uuid;
 
+/// The production fallback text embedder, behind the redactor's embedder trait.
+struct TestTextEmbedder;
+
+#[async_trait::async_trait]
+impl openrag_pii::RedactionTextEmbedder for TestTextEmbedder {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {
+        openrag_memory::TextEmbedder::embed_text(&openrag_memory::DeterministicTextEmbedder::default(), text)
+            .await
+    }
+}
+
+/// The stored vector must be the embedding of the text stored next to it.
+async fn assert_embedding_matches_text(
+    pool: &DbPool,
+    sql: &str,
+    id: Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (text, emb): (String, Vector) = sqlx::query_as(sql).bind(id).fetch_one(pool.inner()).await?;
+    let expected = openrag_memory::DeterministicTextEmbedder::embed_sync(&text)?;
+    assert_eq!(emb.to_vec(), expected, "stale embedding for {sql}");
+    Ok(())
+}
+
 fn env_url(key: &str) -> Result<String, Box<dyn std::error::Error>> {
     std::env::var(key).map_err(|e| format!("missing env var {key}: {e}").into())
 }
@@ -380,6 +403,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
             reason: "unauthorized attempt".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await;
@@ -399,6 +423,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
             reason: "text only redaction".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await?;
@@ -426,6 +451,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
             reason: "GDPR / PIPA hard purge".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await?;
@@ -455,6 +481,16 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
     .fetch_one(worker.inner())
     .await?;
     assert_eq!(non_null_prev, 0);
+
+    // Scrubbed rows are re-embedded from their scrubbed text (no vector of the pre-redaction text)
+    assert_embedding_matches_text(&worker, "SELECT redacted_text, embedding FROM corpus.chunks WHERE id = $1", chunk_id).await?;
+    assert_embedding_matches_text(&worker, "SELECT effective_text, embedding FROM memory.entries WHERE id = $1", mem_id).await?;
+    assert_embedding_matches_text(
+        &worker,
+        "SELECT title || E'\\n' || body_md, embedding FROM wiki.pages WHERE id = $1",
+        wiki_id,
+    )
+    .await?;
 
     // Check purged vault entry fails unmask
     let purged_unmask = Capsule::unmask_pg(
@@ -667,6 +703,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
                 reason: "cross-dept test".into(),
             },
             &thumb_store,
+            &TestTextEmbedder,
                 Some(&kek),
         )
         .await;
@@ -689,6 +726,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
             reason: "dept A doc redaction".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await?;
@@ -756,6 +794,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
             reason: "purge before re-ingest".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         None,
     )
     .await?;
@@ -832,6 +871,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
             reason: "pattern_dept chunk_spans purge without kek".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         None,
     )
     .await?;
@@ -993,6 +1033,7 @@ async fn live_pattern_dept_kek_vault_isolation_and_empty_pattern_rejected() -> R
             reason: "empty pattern should fail".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await;
@@ -1017,6 +1058,7 @@ async fn live_pattern_dept_kek_vault_isolation_and_empty_pattern_rejected() -> R
             reason: "dept A pattern purge must not touch dept B vault".into(),
         },
         &thumb_store,
+        &TestTextEmbedder,
         Some(&kek),
     )
     .await?;

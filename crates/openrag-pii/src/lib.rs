@@ -28,7 +28,7 @@ pub use detector::{
 pub use guard::{GuardEngine, GuardPolicyRow, GuardPolicyRuntime, GuardRepo, GuardRuleRow, GuardRuleRuntime};
 pub use redactor::{
     AffectedCounts, CascadeRedactor, RedactionJobRequest, RedactionJobResult, RedactionMode,
-    RedactionTargetScope,
+    RedactionTargetScope, RedactionTextEmbedder,
 };
 pub use thumbnail::{mask_image_bboxes, LocalThumbnailStore, ThumbnailStore};
 pub use vault::{MasterKek, PiiVaultRepo, StoredChunkSpanInput, VaultCrypto, VaultEntryRow};

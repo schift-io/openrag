@@ -1509,6 +1509,7 @@ dependencies = [
  "openrag-core",
  "openrag-db",
  "openrag-iam",
+ "openrag-memory",
  "pgvector",
  "rand 0.8.8",
  "regex",

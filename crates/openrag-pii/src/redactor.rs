@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use async_trait::async_trait;
 use openrag_core::{BBoxNorm1000, OpenRagError, PrincipalContext};
+use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -8,6 +10,14 @@ use uuid::Uuid;
 
 use crate::thumbnail::{mask_image_bboxes, LocalThumbnailStore, ThumbnailStore};
 use crate::vault::{MasterKek, VaultCrypto};
+
+/// The text embedder ingestion uses. A scrubbed chunk, memory entry or wiki page is re-embedded
+/// from its scrubbed text inside the redaction transaction, so its vector is always derived from
+/// the text stored next to it and a failed embedding rolls the whole job back.
+#[async_trait]
+pub trait RedactionTextEmbedder: Send + Sync {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +144,7 @@ impl CascadeRedactor {
         caller: &PrincipalContext,
         req: RedactionJobRequest,
         thumb_store: &dyn ThumbnailStore,
+        text_embedder: &dyn RedactionTextEmbedder,
         kek: Option<&MasterKek>,
     ) -> Result<RedactionJobResult, OpenRagError> {
         Self::authorize_caller(caller, &req)?;
@@ -177,6 +188,7 @@ impl CascadeRedactor {
             &replacement,
             &mut counts,
             thumb_store,
+            text_embedder,
             kek,
         )
         .await;
@@ -227,6 +239,7 @@ impl CascadeRedactor {
         replacement: &str,
         counts: &mut AffectedCounts,
         thumb_store: &dyn ThumbnailStore,
+        text_embedder: &dyn RedactionTextEmbedder,
         kek: Option<&MasterKek>,
     ) -> Result<(), OpenRagError> {
         let org_id = req.org_id;
@@ -701,10 +714,12 @@ impl CascadeRedactor {
             let new_bm25 = scrub_text(&old_bm25, pattern.as_deref(), replacement);
             let new_tbl = old_tbl.map(|t| scrub_text(&t, pattern.as_deref(), replacement));
             let new_hash = sha256_hex_str(&new_red);
+            // Ingestion embeds the masked chunk text; the scrubbed text replaces it.
+            let new_emb = Vector::from(text_embedder.embed_text(&new_red).await?);
 
             sqlx::query(
                 "UPDATE corpus.chunks
-                 SET redacted_text = $3, bm25_text = $4, table_html = $5, text_hash = $6
+                 SET redacted_text = $3, bm25_text = $4, table_html = $5, text_hash = $6, embedding = $7
                  WHERE org_id = $1 AND id = $2",
             )
             .bind(org_id)
@@ -713,6 +728,7 @@ impl CascadeRedactor {
             .bind(&new_bm25)
             .bind(&new_tbl)
             .bind(&new_hash)
+            .bind(new_emb)
             .execute(&mut **tx)
             .await
             .map_err(|e| OpenRagError::Database(e.to_string()))?;
@@ -876,11 +892,12 @@ impl CascadeRedactor {
             let new_bm25 = scrub_text(&old_bm25, pattern.as_deref(), replacement);
             let new_sha = sha256_hex_str(&new_text);
             let new_ver = version + 1;
+            let new_emb = Vector::from(text_embedder.embed_text(&new_text).await?);
 
             sqlx::query(
                 "UPDATE memory.entries
                  SET effective_text = $3, bm25_text = $4, content_sha256 = $5,
-                     version = $6, status = 'redacted', updated_at = now()
+                     version = $6, status = 'redacted', updated_at = now(), embedding = $7
                  WHERE org_id = $1 AND id = $2",
             )
             .bind(org_id)
@@ -889,6 +906,7 @@ impl CascadeRedactor {
             .bind(&new_bm25)
             .bind(&new_sha)
             .bind(new_ver)
+            .bind(new_emb)
             .execute(&mut **tx)
             .await
             .map_err(|e| OpenRagError::Database(e.to_string()))?;
@@ -974,7 +992,7 @@ impl CascadeRedactor {
         // 6. Scrub wiki.pages & wiki.revisions
         for wid in &wiki_ids {
             let row = sqlx::query(
-                "SELECT body_md, bm25_text, version FROM wiki.pages WHERE org_id = $1 AND id = $2",
+                "SELECT title, body_md, bm25_text, version FROM wiki.pages WHERE org_id = $1 AND id = $2",
             )
             .bind(org_id)
             .bind(wid)
@@ -985,6 +1003,7 @@ impl CascadeRedactor {
             let Some(row) = row else {
                 continue;
             };
+            let title: String = row.try_get("title").map_err(|e| OpenRagError::Database(e.to_string()))?;
             let old_body: String = row.try_get("body_md").map_err(|e| OpenRagError::Database(e.to_string()))?;
             let old_bm25: String = row.try_get("bm25_text").map_err(|e| OpenRagError::Database(e.to_string()))?;
             let version: i32 = row.try_get("version").map_err(|e| OpenRagError::Database(e.to_string()))?;
@@ -993,11 +1012,13 @@ impl CascadeRedactor {
             let new_bm25 = scrub_text(&old_bm25, pattern.as_deref(), replacement);
             let new_sha = sha256_hex_str(&new_body);
             let new_ver = version + 1;
+            // Same input as the wiki write path (openrag-memory wiki.rs): title, newline, body.
+            let new_emb = Vector::from(text_embedder.embed_text(&format!("{title}\n{new_body}")).await?);
 
             sqlx::query(
                 "UPDATE wiki.pages
                  SET body_md = $3, bm25_text = $4, body_sha256 = $5,
-                     version = $6, status = 'redacted', updated_at = now()
+                     version = $6, status = 'redacted', updated_at = now(), embedding = $7
                  WHERE org_id = $1 AND id = $2",
             )
             .bind(org_id)
@@ -1006,6 +1027,7 @@ impl CascadeRedactor {
             .bind(&new_bm25)
             .bind(&new_sha)
             .bind(new_ver)
+            .bind(new_emb)
             .execute(&mut **tx)
             .await
             .map_err(|e| OpenRagError::Database(e.to_string()))?;

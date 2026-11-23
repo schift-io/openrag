@@ -27,7 +27,7 @@ use openrag_parse::{resolve_ocr_policy, OcrTask, ParsePolicyCtx, ThumbnailBlobSt
 use openrag_pii::{
     CascadeRedactor, DetectorProfileInput, GuardPolicyRuntime, GuardRepo, GuardRuleRuntime,
     LocalThumbnailStore, PiiEngine, PiiProfileRepo, RedactionJobRequest, RedactionMode,
-    RedactionTargetScope, ThumbnailStore as PiiThumbnailStore,
+    RedactionTargetScope, RedactionTextEmbedder, ThumbnailStore as PiiThumbnailStore,
 };
 use openrag_retrieve::SearchRequest;
 use openrag_store::{
@@ -318,6 +318,16 @@ impl PiiThumbnailStore for BlobThumbnailStoreAdapter {
         } else {
             LocalThumbnailStore::new().write_bytes(uri, bytes)
         }
+    }
+}
+
+/// The server's text embedder, handed to the redactor so scrubbed rows are re-embedded.
+pub struct RedactionEmbedderAdapter(pub Arc<dyn openrag_memory::TextEmbedder>);
+
+#[async_trait::async_trait]
+impl RedactionTextEmbedder for RedactionEmbedderAdapter {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {
+        self.0.embed_text(text).await
     }
 }
 
@@ -2831,11 +2841,13 @@ async fn studio_pii_redactions_create_handler(
     };
 
     let thumb_adapter = BlobThumbnailStoreAdapter(Arc::clone(&state.blob_store));
+    let embed_adapter = RedactionEmbedderAdapter(Arc::clone(&state.text_embedder));
     let res = CascadeRedactor::run_job(
         worker_pool.inner(),
         &principal,
         job_req,
         &thumb_adapter,
+        &embed_adapter,
         Some(&state.master_kek),
     )
     .await
