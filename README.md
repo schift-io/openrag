@@ -4,235 +4,197 @@
 [![PostgreSQL 17/18](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791.svg)](migrations/)
 [![Rust Workspace](https://img.shields.io/badge/Rust-2021%20(1.85%2B)-orange.svg)](Cargo.toml)
 
-**OpenRAG** is an open-source, institutional- and enterprise-grade RAG platform built in **Rust** and **PostgreSQL 17/18** (`pg_pinecone` + `pgvector` + `pg_search` Lindera Korean BM25), designed for zero-trust access control, Korean document fidelity, live memory/wiki evolution, and declarative AutoRAG optimization.
+**OpenRAG**는 사내 문서를 Claude Code·Codex 같은 AI 도구가 근거로 쓸 수 있게 해 주는 RAG 서버예요.
+Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는지와 개인정보가 어디까지 나가는지를
+서버가 지켜요.
+
+**[사용 가이드](docs/guide.md)** · [English](README.en.md)
 
 ---
 
-## Core Architecture & 5 Differentiators
+## 이런 걸 해요
 
-```text
-User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
-   │
-   ├─► App API (/api/app) ──► Chat, Upload, Wiki, Memory, Connect (backend for a user console)
-   ├─► Studio API (/api/studio) ─► Pipeline YAML, Engine Switcher, IAM Simulator, Guard, Bench
-   ├─► HTTP API (/v2/buckets, /v1/chat/completions, /v1/eval/ab-search, /mcp)
-   └─► Local Stdio MCP (openrag mcp --stdio / openrag-mcp)
-                                     │
-   ┌─────────────────────────────────▼──────────────────────────────────┐
-   │ Rust Core Platform                                                 │
-   │  • 3-Axis IAM (ARN + Permission Group + Permission Level) & RLS    │
-   │  • Configurable PII & Safe-Word Guard (allow | warn | mask | block)│
-   │  • M1 Parse/Dewarp (kordoc, Schift OCR) ─► M2 Thumbnailer (256d)   │
-   │  • M3 PII Capsule (AES-256-GCM) & Full-Layer Cascade Redaction     │
-   │  • M4 CCLG Memory Patch Ledger & DB-Native Wiki (KoParaRel + .md)  │
-   │  • M5 Incremental Outbox (SHA-256 No-Op, Watermarks, Quarantine)   │
-   │  • M6 256d Multi-Space Hybrid Retriever (RRF/Convex) & Admission   │
-   │  • M7 Policy LLM Router (no bundled LLM; L8+ -> on-prem only)      │
-   │  • M8 4-Axis Golden Set, 3-Track Bench & AutoRAG Greedy Optimizer  │
-   └─────────────────────────────────┬──────────────────────────────────┘
-                                     ▼
-   PostgreSQL 17/18 (10 Schemas: iam, vectors, corpus, pii, memory,
-                     wiki, indexing, gateway, plugins, eval)
-   + Optional External Vectors (Amazon S3 Vectors STS ARN | OSS Vector)
-```
+- **AI 도구에 사내 문서 검색을 붙여요.** Claude Code나 Codex에 MCP로 연결하면, 질문을 받을 때
+  OpenRAG에서 근거 문단을 찾아 출처와 함께 답해요.
+- **사람마다 볼 수 있는 문서가 달라요.** 문서마다 최소 등급(1~10)과 공개 범위(조직·부서·그룹·개인)를
+  정해요. PostgreSQL의 행 단위 보안(RLS)이 막기 때문에, 권한 없는 문서는 검색 결과에도 나오지 않아요.
+- **개인정보는 AI로 나갈 때만 가려요.** 저장과 검색은 원문 그대로 하고, AI 모델로 가는 요청과 MCP 도구
+  결과에서만 주민등록번호·전화번호·이메일 같은 값을 토큰으로 바꿔요.
+- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, 이미지는 Schift OCR로 읽어요. 키워드
+  검색은 한국어 형태소 분석(`pg_search` Lindera)을 써요.
+- **AI 모델을 들고 있지 않아요.** 답은 연결한 Claude Code·Codex가 쓰거나, 사내 LLM 서버(vLLM 등)를
+  연결하면 서버가 직접 써요.
+- **폐쇄망에서도 돌아가요.** 임베딩 모델을 함께 띄우고, 바깥 연결은 설정한 주소로만 허용해요.
 
-1. **`pg_pinecone` 3-Engine + `256d` Multi-Space + S3 Vectors/OSS**: Table-level switching between `native` (RaBitQ IVF, zero external account), `pgvector` (HNSW), and `remote` (Pinecone Serverless) without changing SQL queries, plus optional Amazon S3 Vectors (per-tenant STS bucket-ARN isolation) and OSS vector adapters.
-2. **Korean Document Ecosystem Native**: Table-preserving HWP/HWPX/HML parsing (`kordoc`), Schift OCR with automatic confidentiality mode guard (`share` / `private` / `zdr` / local vLLM) and `schift-dewarp`, plus ParadeDB `pg_search` Tantivy BM25 with Lindera Korean morphology (`pg_trgm` + `tsvector` fallback when compiled extensions are absent locally).
-3. **Zero-Trust 3-Axis IAM, Fail-Closed RLS & PII/Safe-Word Guard**:
-   - Unified authorization across **ARN** (`arn:openrag:<org>:<dept_path>:<scope>:<type>:L<1..10>/<id>`), **Permission Groups** (`iam.groups`, `iam.group_members`, `iam.resource_group_bindings`), and **Permission Levels** (`auth_level 1..10`), enforcing Explicit Deny > Allow and strict `dept_admin` vs `peer` isolation on `private` resources in PostgreSQL Fail-Closed RLS (`FORCE ROW LEVEL SECURITY`) and Rust `openrag-iam`.
-   - 2-Stage AES-256-GCM PII Capsule (`schift-ko-pii-v7`, optional `ko-pii`, custom dictionaries), **Configurable PII & Safe-Word Guard** (`allow` | `warn` | `mask` | `block` across `inbound_query`, `llm_egress`, `mcp_egress`, `ingestion_gate`), and **Cascade Redaction** (text + thumbnail BBox black-box pixel masking + immutable audit trail).
-4. **Living Knowledge & Incremental Outbox**: CCLG-style immutable `memory.episodes` + `memory.entries` + `memory.patches` (`amend`/`supersede`/`retract`/`redact`/`promote_scope`/`promote_wiki`), DB-Native LLM Wiki with KoParaRel 6-label edges and `.md`/Obsidian bidirectional sync, and `indexing.outbox` SHA-256 No-Op skip, watermarks, and 3-attempt quarantine.
-5. **AutoRAG Greedy Optimizer & 2-Tier API**: Declarative `search_space.yaml` greedy node optimization with mandatory hard security gates (`0 PII leak`, `0 ARN/Group/Level violation`) and strict separation between the user-facing `/api/app` and the operator-only `/api/studio`.
+## 빠르게 시작하기
 
----
+준비물은 Docker 하나예요. 호스트에 따로 설치할 프로그램은 없어요.
 
-## 3-Minute Quickstart
-
-### Option A: Standard Docker Stack
 ```bash
-export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # keep it: it wraps the PII vault keys
+# 1) 서버 띄우기
+export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # 다시 띄울 때도 같은 값을 쓰니 적어 두세요
 docker compose -f docker/docker-compose.yml --profile app up -d postgres openrag-api
-```
 
-### Option B: Air-Gapped On-Premises Docker Stack
-```bash
-# on a connected machine, from docker/: fetch the embedding weights into ./models
-hf download google/embeddinggemma-2 --cache-dir ./models
-# on the air-gapped host, from docker/
-export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
-export AIRGAP_LLM_URL=http://<vllm-host>:8000/v1 AIRGAP_LLM_MODEL=<served model>   # optional
-docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app --profile airgap \
-  up -d postgres local-embed openrag-api
-```
-
-### Then: set it up from inside the server container
-Nothing to install on the host: the API image ships the `openrag` CLI.
-```bash
-# same -f files as the `up` above
+# 2) 문서 넣고 첫 설정 (조직·관리자·API 키·버킷·문서를 한 번에)
 docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
 docker compose -f docker/docker-compose.yml exec openrag-api \
   openrag init --slug acme --name "ACME" --docs /tmp/my-docs
 ```
-`openrag init` creates the organization, a department and an admin (permission level 10), mints
-the admin's API key, creates the bucket `docs` and ingests every supported file under the folder.
-It prints the key and two commands, `connect.claude` and `connect.codex`; run one on the machine
-with Claude Code or Codex (use `--public-url http://<server>:8080` when that is another machine).
-Then ask Claude Code about the documents: it searches them with `rag_search` and answers with the
-sources. Running it again reuses the organization and bucket and mints a new key.
 
-A host build of `openrag` (`cargo build --release -p openrag-server --bin openrag`) does the same
-with `DATABASE_URL` pointing at the stack's database and `OPENRAG_OPERATOR=1`, saves the key to
-`~/.config/openrag/config.toml` (mode 600), and `--connect claude|codex` registers the clients
-directly.
+`init`은 마지막에 PC에서 실행할 연결 명령(`connect.claude`, `connect.codex`)을 출력해요.
+Claude Code를 쓰는 PC에서 그 줄을 실행하면 끝이에요.
 
-The API runs as one process (it drains the indexing outbox inline; there is no worker service).
-Page thumbnails and figure crops are off by default (`thumbnail.enabled: false`): nothing shows them
-yet. When enabled they go to an S3-compatible bucket (AWS S3, RustFS, …) set through
-`OPENRAG_S3_ENDPOINT`, `OPENRAG_S3_BUCKET`, `OPENRAG_S3_REGION`, `OPENRAG_S3_ACCESS_KEY_ID`,
-`OPENRAG_S3_SECRET_ACCESS_KEY` and `OPENRAG_S3_URL_STYLE` (`path` | `virtual`).
+```bash
+claude mcp add --transport http --scope user openrag http://127.0.0.1:8080/mcp \
+  --header 'Authorization: Bearer orag_…'
+```
 
-### Option C: Local Rust & PostgreSQL 17 Verification
-Run all offline unit tests and strict lints:
+이제 Claude Code에 "사내 문서에서 찾아서 답해줘: 부산 출장 숙박비 한도가 얼마야?"처럼 물어보면 돼요.
+
+폐쇄망 구성, 문서 추가, 팀원 추가, 권한, 개인정보 처리, OCR, 문제 해결은
+**[사용 가이드](docs/guide.md)**에 순서대로 정리했어요.
+
+> 기본 구성에는 임베딩 서버가 없어서 키워드 검색(BM25)으로만 찾아요. 뜻으로 찾게 하려면
+> `OPENRAG_TEXT_EMBED_URL`과 `OPENRAG_TEXT_EMBED_MODEL`을 넣으세요(가이드 11장).
+
+---
+
+## 구성
+
+```text
+Claude Code · Codex · Cursor ──▶ /mcp (MCP over HTTP)
+HTTP 클라이언트 ───────────────▶ /v2/buckets · /v1/chat/completions · /api/app · /api/studio
+서버 호스트 ───────────────────▶ openrag mcp --stdio
+                                      │
+   ┌──────────────────────────────────▼──────────────────────────────────┐
+   │ OpenRAG API (Rust, 프로세스 하나)                                     │
+   │  • 권한: ARN + 권한 그룹 + 등급(1~10), PostgreSQL RLS                │
+   │  • 문서 읽기: kordoc(HWP 계열), PDF 텍스트, Schift OCR(이미지)       │
+   │  • 개인정보 가드: allow · warn · mask · block                        │
+   │  • 색인: 바뀐 내용만 다시 색인(SHA-256), 실패 3회면 격리             │
+   │  • 검색: 256차원 벡터 검색(pg_pinecone), BM25는 선택                 │
+   │  • LLM 라우터: 등급 8 이상은 사내 LLM만                              │
+   │  • 메모리 원장 · DB 위키 · 평가(골든셋, AutoRAG)                     │
+   └──────────────────────────────────┬──────────────────────────────────┘
+                                      ▼
+               PostgreSQL 17/18 (iam, corpus, vectors, pii, memory, wiki,
+                                 indexing, gateway, plugins, eval)
+```
+
+- **벡터 엔진**은 표마다 바꿀 수 있어요: `native`(pg_pinecone RaBitQ IVF, 외부 계정 불필요),
+  `pgvector`(HNSW), `remote`(Pinecone Serverless). Amazon S3 Vectors나 OSS 벡터 저장소로 복제할 수도 있어요.
+- **임베딩**은 `google/embeddinggemma-2`를 256차원으로 쓰도록 맞춰 뒀어요(폐쇄망 구성은 이 모델을 같이
+  띄워요). 한국어 검색 평가(Ko-StrategyQA)에서 nDCG@10 0.781이 나왔고, BM25를 섞으면 0.703으로 떨어져서
+  기본으로는 섞지 않아요.
+- **메모리와 위키**: 대화에서 얻은 사실을 고칠 수 없는 패치(`amend` · `supersede` · `retract` · `redact`)로
+  쌓고, DB 안의 위키는 `.md`/Obsidian과 양방향으로 동기화해요.
+- **페이지 썸네일**은 기본으로 꺼져 있어요(`thumbnail.enabled: false`). 켜면 S3 호환 저장소
+  (`OPENRAG_S3_*`)에 저장해요.
+
+## MCP 도구 (13개)
+
+| 도구 | 하는 일 |
+| --- | --- |
+| `rag_search` | 내가 볼 수 있는 문서에서 찾기. 기본으로 지금 효력이 있는 문서만 찾아요 |
+| `rag_ask` | 문서를 근거로 서버가 직접 답하기(서버에 LLM을 연결했을 때만) |
+| `rag_ingest` | 텍스트를 버킷에 넣기. 파일 경로는 stdio 연결에서만 돼요 |
+| `rag_get_page` | 문서 한 페이지 읽기(가린 본문, 그림 위치, 썸네일 링크) |
+| `wiki_search` / `wiki_get` | 위키 페이지 찾기 / 읽기 |
+| `memory_search` | 지금 유효한 메모리 찾기(철회·대체된 항목 제외) |
+| `memory_patch` | 메모리에 패치 추가: 수정, 대체, 철회, 가림 |
+| `memory_engage` | 개념을 넓혀 가며 메모리 떠올리기 |
+| `memory_reflect` | 대화 한 토막과 거기서 얻은 메모리 기록하기 |
+| `guard_check` | 글이 개인정보·금지어 규칙에 걸리는지 보기 |
+| `concept_link` / `concept_resolve` | 같은 뜻의 용어(한글·영어 등) 묶기 / 찾기 |
+
+모든 도구 호출은 호출한 사람의 권한으로 돌고, 결과의 개인정보는 가려져요.
+
+Claude Code·Codex 외의 MCP 클라이언트도 HTTP 주소와 키만 넣으면 돼요. Cursor(`.cursor/mcp.json`)는 이렇게 써요.
+
+```json
+{
+  "mcpServers": {
+    "openrag": {
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer ${OPENRAG_API_KEY}" }
+    }
+  }
+}
+```
+
+stdio 방식(`openrag mcp --stdio`, `openrag-mcp`)은 데이터베이스에 직접 붙기 때문에 서버 호스트에서
+`DATABASE_URL`을 넣고 실행할 때만 써요.
+
+## `openrag` 명령
+
+서버 이미지 안에 들어 있어요. `docker compose -f docker/docker-compose.yml exec openrag-api openrag <명령>`으로
+실행해요. 소스에서 직접 빌드(`cargo build --release -p openrag-server --bin openrag`)해 호스트에서 써도 돼요.
+
+| 명령 | 하는 일 |
+| --- | --- |
+| `openrag init` | 첫 설정 한 번에: 조직·관리자·API 키·버킷·문서, 연결 명령 출력 |
+| `openrag org init` | 조직·부서·관리자와 API 키만 만들기 |
+| `openrag bucket {create\|list}` | 버킷 만들기 / 보기 |
+| `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 문서 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요 |
+| `openrag connect {claude\|codex}` | 이 서버를 Claude Code나 Codex에 등록(호스트에서 실행할 때) |
+| `openrag up --profile <standard\|airgap>` | docker compose로 스택 띄우기 |
+| `openrag index {engine\|mirror\|status\|retry}` | 벡터 엔진 바꾸기, 외부 복제, 색인 대기열 보기 |
+| `openrag memory {patch\|promote}` | 메모리 패치, 공개 범위 올리기(개인 → 부서 → 위키) |
+| `openrag redact run` | 개인정보를 모든 저장 위치에서 지우기 |
+| `openrag wiki {import\|export}` | `.md` / Obsidian 동기화 |
+| `openrag bench {run\|optimize}`, `openrag pipeline promote` | 평가와 AutoRAG 최적화, 설정 승격 |
+| `openrag mcp --stdio` | 서버 호스트에서 stdio MCP 서버 실행(`DATABASE_URL` 필요) |
+
+## HTTP API
+
+- **기본 API**: `/v2/buckets`(버킷·문서·검색), `/v1/chat/completions`(OpenAI 호환), `/v1/eval/ab-search`,
+  `/mcp`(Streamable HTTP, JSON-RPC 2.0)
+- **앱 API (`/api/app`)**: 채팅, 업로드, 페이지 썸네일(썸네일이 꺼져 있으면 404), 위키, 메모리, 개념, 피드백
+- **관리 API (`/api/studio`, 조직 관리자 전용)**: 파이프라인 설정, 색인, 계정·권한(IAM), 개인정보 가드,
+  LLM 게이트웨이, 평가, 위키, 플러그인
+
+OpenRAG에는 화면(GUI)이 없어요. 사람은 MCP 클라이언트로 쓰고, 관리는 HTTP API로 해요.
+
+## LLM
+
+OpenRAG는 LLM을 내장하지 않아요. 기본으로는 연결한 Claude Code·Codex·Cursor가 `rag_search`로 찾은
+문단을 보고 답을 써요. 서버가 직접 답하는 `/v1/chat/completions`와 `rag_ask`는 아래 중 하나를 설정했을
+때만 동작해요(설정이 없으면 503).
+
+- `OPENRAG_LOCAL_LLM_URL` + `OPENRAG_LOCAL_LLM_MODEL`: 사내 OpenAI 호환 서버(vLLM 등). 회사 밖으로
+  나가면 안 되는 요청(폐쇄망 구성의 모든 요청, 기본 구성에서는 등급 8 이상)은 이 서버만 써요.
+- `OPENRAG_LLM_CLI=claude` 또는 `codex`: 서버 호스트의 Claude Code(`claude -p`)나 Codex(`codex exec`)
+  CLI로 답해요. 내용이 Anthropic·OpenAI로 나가기 때문에 외부 LLM으로 취급해요(개인정보는 가리고,
+  등급 7까지). 서버는 전용 계정으로 실행하세요. CLI가 그 계정의 지침 파일(`~/.claude/CLAUDE.md`,
+  `~/.codex/AGENTS.md`)과 설정을 읽어서, 모든 사용자의 답에 영향을 줘요.
+
+폐쇄망 구성에서는 설정한 주소(`OPENRAG_LOCAL_LLM_URL`, `OPENRAG_TEXT_EMBED_URL`, `OPENRAG_SCHIFT_OCR_URL`,
+`OPENRAG_S3_ENDPOINT`)와 `configs/pipeline.airgap.yaml`의 `egress.allow`에만 연결해요. 다른 곳을 가리키면
+403으로 막고, CLI 방식은 꺼져요.
+
+## 설정 파일 (`configs/`)
+
+- `pipeline.default.yaml`: 기본 구성. 256차원 임베딩, `pg_pinecone` native, kordoc, 등급별 Schift OCR 모드,
+  개인정보 가드 규칙, 등급 8 이상 사내 LLM 전용
+- `pipeline.airgap.yaml`: 폐쇄망 구성. 로컬 임베딩·사내 LLM, 바깥 연결 허용 목록, 엄격한 가드
+- `search_space.example.yaml`: AutoRAG 탐색 공간. 개인정보 유출 0건, 권한 위반 0건을 통과해야만 채택해요
+
+YAML은 `openrag-core`의 Rust 타입과 1:1로 맞고, 모르는 키가 있으면 설정을 읽을 때 오류가 나요.
+
+## 개발자용: 빌드와 테스트
+
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Spin up an ephemeral local PostgreSQL 17 cluster, apply `migrations/000_init.sql`–`007_memory_redaction_indexing.sql`, verify non-superuser `openrag_app` Fail-Closed RLS and 3-axis parity tests, and tear down automatically:
+임시 PostgreSQL 17을 띄워 마이그레이션을 적용하고, `openrag_app` 계정의 RLS가 닫힌 상태로 동작하는지
+확인한 뒤 정리해요.
+
 ```bash
 ./scripts/test-pg-local.sh
 ```
 
----
+## 라이선스
 
-## Configuration (`configs/`)
-
-- `configs/pipeline.default.yaml` — Standard profile (`256d`, `pg_pinecone: native`, `kordoc`, Schift OCR with `auth_level` mode guard, `schift_v7` PII Capsule, `pii.guard` PII & Safe-Word rules, RRF `k=60`, `L8+` local vLLM routing).
-- `configs/pipeline.airgap.yaml` — Air-gapped profile (local OCR/vLLM/256d embedder, strict `default_action: block` guard, `local_only_min_auth_level: 1`).
-- `configs/search_space.example.yaml` — AutoRAG greedy node search space with mandatory `require_zero_pii_leak: true` and `require_zero_arn_violation: true` security gates.
-
-All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(deny_unknown_fields)]`.
-
----
-
-## CLI & API Overview
-
-> Note: OpenRAG ships no graphical console. Users reach it through MCP clients and the HTTP API; `/api/app` and `/api/studio` are the backends a console would call.
-
-### `openrag` CLI
-- `openrag up --profile <standard|airgap>` — Start platform stack
-- `openrag init [--docs <folder>] [--connect claude|codex]` — One-step setup: first organization and admin key, CLI config, a bucket, documents, MCP clients
-- `openrag org init` — First organization, department and admin plus an API key (local operator, `DATABASE_URL`)
-- `openrag bucket {create|list}` — Buckets
-- `openrag connect {claude|codex}` — Register this server's `/mcp` in Claude Code or Codex
-- `openrag ingest <file or folder> --bucket <slug> [--scope private|dept|group|org] [--auth-level 1..10]`
-- `openrag index {engine|mirror|status|retry}` — Switch `pg_pinecone` engines, mirror S3 Vectors/OSS, inspect outbox/quarantine
-- `openrag memory {patch|promote}` — Append CCLG patches or promote `private -> dept -> wiki`
-- `openrag redact run` — Execute full-layer Cascade Redaction (including thumbnail black-box masking)
-- `openrag wiki {import|export}` — Bidirectional `.md` / Obsidian vault sync
-- `openrag bench {run|optimize}` & `openrag pipeline promote` — 3-Track Bench & AutoRAG optimizer
-- `openrag mcp --stdio` (or `openrag-mcp`) — Start local stdio MCP server
-
-### HTTP API
-- **Core API**: `/v2/buckets` (CRUD, ingest, search), `/v1/chat/completions` (OpenAI & Docufinder Anything compatible), `/v1/eval/ab-search`, `/mcp` (Streamable HTTP JSON-RPC 2.0)
-- **App API (`/api/app`)**: `chat`, `upload`, `pages/{id}/thumbnail` (404 while thumbnails are off), `wiki`, `memory`, `concepts`, `connect`, `feedback`
-- **Studio API (`/api/studio`, org admins)**: `pipeline`, `index`, `iam`, `pii` (guard sandbox, cascade redaction), `gateway`, `eval`, `wiki`, `knowledge`, `concepts`, `plugins`
-
----
-
-## Connect External AI Clients via MCP
-
-OpenRAG exposes identical RAG, Wiki, Memory, and Guard capabilities over both **Local Stdio MCP** (`openrag mcp --stdio` / `openrag-mcp`) and **Streamable HTTP MCP** (`/mcp`). Every tool call enforces the caller's ARN, Permission Group, Permission Level, PostgreSQL RLS, and PII/Safe-Word Guard.
-
-### LLM
-
-OpenRAG bundles no LLM. By default the MCP client is the LLM: Claude Code, Codex or Cursor calls
-`rag_search` and writes the answer itself. `/v1/chat/completions` and `rag_ask` answer only when a
-provider is configured (otherwise HTTP 503):
-
-- `OPENRAG_LOCAL_LLM_URL` + `OPENRAG_LOCAL_LLM_MODEL` — an on-prem OpenAI-compatible chat completions
-  server (vLLM or any compatible one). Requests that must stay on-prem (all of them in the
-  air-gapped profile; L8+ or unmasked-PII ones in the standard profile) can only use this one.
-- `OPENRAG_LLM_CLI=claude` or `codex` (optional `OPENRAG_LLM_CLI_MODEL`, `OPENRAG_LLM_CLI_COMMAND`) —
-  runs the Claude Code (`claude -p`, no tools, no MCP servers) or Codex (`codex exec`, read-only
-  sandbox) CLI on the server host, logged in as the user the server runs as. The prompt leaves for
-  Anthropic / OpenAI, so it is an external provider: masked PII only, up to L7. Run the server
-  under a dedicated service account: the CLI also reads that account's own instructions
-  (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`) and settings, which would otherwise shape every
-  user's answers.
-
-These seed an org's providers the first time it asks for an answer; change them later in
-`gateway.providers`. In the air-gapped profile the server calls only the hosts it is configured
-with (`OPENRAG_LOCAL_LLM_URL`, `OPENRAG_TEXT_EMBED_URL`, `OPENRAG_SCHIFT_OCR_URL`,
-`OPENRAG_S3_ENDPOINT`) plus `egress.allow` in `configs/pipeline.airgap.yaml`; a provider pointed
-anywhere else is refused with 403, and the CLI providers are off.
-
-### PII
-
-Stored text, search, embeddings and the HTTP API keep PII as written: whoever may read a document
-sees it. PII is replaced with `[PII:<TYPE>:<hash>]` tokens only where text goes to an AI — the
-prompt and context sent to an LLM provider, and every MCP tool result. `/v1/chat/completions`
-answers come back with the original values; MCP `rag_ask` keeps the tokens. Names are detected
-after a label (`성명:`, `담당자:`, …) or an attached title (`김민준과장`); a bare name in running
-text is not.
-
-### Exposed MCP Tools (9)
-- `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)
-- `rag_ask` — Grounded RAG Q&A through the policy-enforced LLM router
-- `rag_ingest` — Ingest document/text with scope, permission groups, and clearance level
-- `rag_get_page` — Fetch redacted page text, thumbnail URI, and `bbox_norm_1000` coordinates
-- `wiki_search` / `wiki_get` — Query and retrieve DB-native LLM Wiki pages
-- `memory_search` / `memory_patch` — Search active memory view and append CCLG patches
-- `guard_check` — Inspect text against active PII + Safe-Word Guard policies (`allow` | `warn` | `mask` | `block`)
-
-### Claude Desktop (`claude_desktop_config.json`)
-```json
-{
-  "mcpServers": {
-    "openrag": {
-      "command": "openrag",
-      "args": ["mcp", "--stdio"],
-      "env": {
-        "OPENRAG_API_KEY": "orag_your_api_key_here",
-        "DATABASE_URL": "postgres://openrag_app@127.0.0.1:5432/openrag"
-      }
-    }
-  }
-}
-```
-
-The stdio server (`openrag mcp --stdio`, `openrag-mcp`) talks to the database directly, so it only
-runs on the server host with `DATABASE_URL` set. Other machines use the HTTP endpoint below; with a
-host build, `openrag connect claude|codex` runs these commands with the key from the CLI config.
-
-### Claude Code
-```bash
-claude mcp add --transport http --scope user openrag http://localhost:8080/mcp \
-  --header "Authorization: Bearer ${OPENRAG_API_KEY}"
-```
-
-### Cursor (`.cursor/mcp.json`)
-```json
-{
-  "mcpServers": {
-    "openrag-http": {
-      "url": "http://localhost:8080/mcp",
-      "headers": {
-        "Authorization": "Bearer ${OPENRAG_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-### Codex
-```bash
-codex mcp add openrag --url http://localhost:8080/mcp --bearer-token-env-var OPENRAG_API_KEY
-export OPENRAG_API_KEY=orag_…   # Codex reads the key from this variable
-```
-
----
-
-## License
-
-Licensed under the [Apache License, Version 2.0](LICENSE).
+[Apache License 2.0](LICENSE)
