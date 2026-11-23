@@ -99,20 +99,6 @@ services:
     volumes:
       - ../configs:/app/configs:ro
 
-  openrag-web:
-    profiles: ["app"]
-    build:
-      context: ../web
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      - openrag-api
-    environment:
-      NEXT_PUBLIC_OPENRAG_API_URL: ${NEXT_PUBLIC_OPENRAG_API_URL:-http://localhost:8080}
-      OPENRAG_API_INTERNAL_URL: http://openrag-api:8080
-    ports:
-      - "${OPENRAG_WEB_PORT:-3000}:3000"
-
 volumes:
   pg_data:
   s3_data:

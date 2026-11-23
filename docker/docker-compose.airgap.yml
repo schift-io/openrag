@@ -1,6 +1,5 @@
 # Air-gapped overlay: docker compose -f docker-compose.yml -f docker-compose.airgap.yml \
 #   --profile app --profile airgap up -d postgres object-store local-embed openrag-api
-# (openrag-web is left out: its build context ../web is not in this repository.)
 #
 # postgres, object-store and local-embed sit on an internal network with no route out. openrag-api is
 # also on openrag_edge so clients can reach its port and it can reach the site's own LLM / OCR
@@ -53,6 +52,3 @@ services:
       SCHIFT_OCR_API_KEY: ${SCHIFT_OCR_API_KEY:-}
       OPENROUTER_API_KEY: ""
       PINECONE_API_KEY: ""
-
-  openrag-web:
-    networks: [openrag_airgap]
