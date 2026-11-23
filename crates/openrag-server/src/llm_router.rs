@@ -181,16 +181,23 @@ pub async fn ensure_default_providers(
         return Ok(());
     }
 
+    // The on-prem provider speaks the OpenAI chat completions API: vLLM or any compatible server.
+    let local_url = crate::state::non_empty_env("OPENRAG_LOCAL_LLM_URL")
+        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
+    let local_model = crate::state::non_empty_env("OPENRAG_LOCAL_LLM_MODEL")
+        .unwrap_or_else(|| "Qwen/Qwen2.5-32B-Instruct".to_string());
     sqlx::query(
         "INSERT INTO gateway.providers (
             org_id, name, provider_type, base_url, model_id,
             is_on_premise, max_auth_level, allow_unmasked_pii, config, enabled
          ) VALUES
          ($1, 'openrouter', 'openrouter', 'https://openrouter.ai/api/v1', 'anthropic/claude-3.5-sonnet', false, 7, false, '{\"api_key_env\": \"OPENROUTER_API_KEY\"}'::jsonb, true),
-         ($1, 'vllm_local', 'vllm_local', 'http://127.0.0.1:8000/v1', 'Qwen/Qwen2.5-32B-Instruct', true, 10, true, '{\"api_key_env\": \"VLLM_API_KEY\"}'::jsonb, true)
+         ($1, 'vllm_local', 'vllm_local', $2, $3, true, 10, true, '{\"api_key_env\": \"VLLM_API_KEY\"}'::jsonb, true)
          ON CONFLICT (org_id, name) DO NOTHING",
     )
     .bind(org_id)
+    .bind(&local_url)
+    .bind(&local_model)
     .execute(worker_pool.inner())
     .await
     .map_err(|e| OpenRagError::Database(format!("failed seeding gateway.providers: {e}")))?;

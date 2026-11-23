@@ -19,7 +19,8 @@ use openrag_memory::{
     MemoryBackend, MemoryGuardHook, MemoryRouter, PostgresMemoryBackend,
 };
 use openrag_parse::{
-    DocumentParser, InMemoryBlobStore, LocalFsBlobStore, ThumbnailBlobStore, Thumbnailer,
+    DocumentParser, InMemoryBlobStore, LocalFsBlobStore, SchiftOcrClient, ThumbnailBlobStore,
+    Thumbnailer,
 };
 use openrag_pii::{
     GuardEngine, GuardPolicyRuntime, GuardRepo, GuardRuleRuntime, InMemoryConceptAliasLookup,
@@ -329,7 +330,7 @@ impl AppState {
             master_kek,
             pii_engine,
             in_memory_vault: Arc::new(InMemoryVaultStore::new()),
-            parser: Arc::new(DocumentParser::new()),
+            parser: Arc::new(document_parser_from_env()?),
             thumbnailer: Thumbnailer::new(),
             text_embedder,
             has_text_model,
@@ -423,6 +424,17 @@ impl AppState {
         }
         MemoryRouter::from_backends(&mem_cfg, pg_dyn, Some(kumiho_dyn))
     }
+}
+
+/// OCR goes to a Schift OCR endpoint when `OPENRAG_SCHIFT_OCR_URL` is set: Schift's service, an
+/// on-prem Schift, or any server speaking its `/v1/run` API (key in `SCHIFT_OCR_API_KEY`).
+/// Unset, images fall back to local foreground-block detection.
+fn document_parser_from_env() -> Result<DocumentParser, OpenRagError> {
+    let mut parser = DocumentParser::new();
+    if let Some(url) = non_empty_env("OPENRAG_SCHIFT_OCR_URL") {
+        parser.ocr_client = Some(SchiftOcrClient::new(url, non_empty_env("SCHIFT_OCR_API_KEY"))?);
+    }
+    Ok(parser)
 }
 
 pub fn non_empty_env(name: &str) -> Option<String> {

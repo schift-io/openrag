@@ -15,11 +15,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-openrag}
       POSTGRES_USER: ${POSTGRES_USER:-openrag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openrag_dev_pass}
+      # Roles the API connects as (docker/postgres/initdb/10-openrag.sh creates them on first start)
+      OPENRAG_APP_DB_PASSWORD: ${OPENRAG_APP_DB_PASSWORD:-openrag_app_dev_pass}
+      OPENRAG_WORKER_DB_PASSWORD: ${OPENRAG_WORKER_DB_PASSWORD:-openrag_worker_dev_pass}
     ports:
       - "${PG_PORT:-5432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ../migrations:/docker-entrypoint-initdb.d:ro
+      - ../migrations:/openrag/migrations:ro
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openrag} -d ${POSTGRES_DB:-openrag}"]
       interval: 5s
@@ -59,57 +63,37 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY:-openrag_minio_secret}
       S3_BUCKET: ${S3_BUCKET:-openrag-artifacts}
 
+  # One process: the API drains the indexing outbox inline, so there is no separate worker.
   openrag-api:
     profiles: ["app"]
     build:
       context: ..
       dockerfile: Dockerfile
       target: api
+    image: openrag/api:local
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-openrag}:${POSTGRES_PASSWORD:-openrag_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
-      OPENRAG_CONFIG: ${OPENRAG_CONFIG:-/app/configs/pipeline.default.yaml}
-      OPENRAG_VAULT_MASTER_KEY: ${OPENRAG_VAULT_MASTER_KEY:-dev_only_32_byte_master_key_override_me}
-      S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: ${S3_BUCKET:-openrag-artifacts}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-openrag_minio}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-openrag_minio_secret}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Request traffic runs as openrag_app (RLS enforced); background work as openrag_worker.
+      DATABASE_URL: postgres://openrag_app:${OPENRAG_APP_DB_PASSWORD:-openrag_app_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
+      WORKER_DATABASE_URL: postgres://openrag_worker:${OPENRAG_WORKER_DB_PASSWORD:-openrag_worker_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
+      ADMIN_DATABASE_URL: postgres://${POSTGRES_USER:-openrag}:${POSTGRES_PASSWORD:-openrag_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
+      OPENRAG_PIPELINE_CONFIG: ${OPENRAG_PIPELINE_CONFIG:-/app/configs/pipeline.default.yaml}
+      # 32-byte hex key that wraps the PII vault keys; without it the server uses a fixed dev key.
+      OPENRAG_PII_KEK_HEX: ${OPENRAG_PII_KEK_HEX:?set OPENRAG_PII_KEK_HEX (openssl rand -hex 32)}
+      OPENRAG_TEXT_EMBED_URL: ${OPENRAG_TEXT_EMBED_URL:-}
+      OPENRAG_TEXT_EMBED_MODEL: ${OPENRAG_TEXT_EMBED_MODEL:-}
+      OPENRAG_SCHIFT_OCR_URL: ${OPENRAG_SCHIFT_OCR_URL:-}
       SCHIFT_OCR_API_KEY: ${SCHIFT_OCR_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       PINECONE_API_KEY: ${PINECONE_API_KEY:-}
     ports:
       - "${OPENRAG_API_PORT:-8080}:8080"
     volumes:
       - ../configs:/app/configs:ro
-
-  openrag-worker:
-    profiles: ["app"]
-    build:
-      context: ..
-      dockerfile: Dockerfile
-      target: api
-    restart: unless-stopped
-    command: ["openrag", "worker"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-openrag}:${POSTGRES_PASSWORD:-openrag_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
-      OPENRAG_CONFIG: ${OPENRAG_CONFIG:-/app/configs/pipeline.default.yaml}
-      OPENRAG_VAULT_MASTER_KEY: ${OPENRAG_VAULT_MASTER_KEY:-dev_only_32_byte_master_key_override_me}
-      S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: ${S3_BUCKET:-openrag-artifacts}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-openrag_minio}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-openrag_minio_secret}
-    volumes:
-      - ../configs:/app/configs:ro
+      - blob_data:/app/blobs
 
   openrag-web:
     profiles: ["app"]
@@ -128,3 +112,4 @@ services:
 volumes:
   pg_data:
   minio_data:
+  blob_data:

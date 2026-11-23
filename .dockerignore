@@ -1,0 +1,8 @@
+target/
+.git/
+.ruff_cache/
+**/__pycache__/
+**/*.py[cod]
+.env
+.env.*
+docker/models/
