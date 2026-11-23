@@ -221,6 +221,27 @@ fn default_block_kind() -> String {
     "text".to_string()
 }
 
+/// One page's model output. Schift's `/v1/run` sends it under `result`
+/// (`{"result": {"markdown": "…", "images": […]}, "job_id": …, "usage": …}`, seen on schift.io
+/// 2026-11-23, model schift-ocr-2-20261112). The same fields at the top level are still read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchiftOcrResult {
+    #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blocks: Vec<SchiftOcrBlockItem>,
+    #[serde(default)]
+    pub images: Vec<SchiftOcrImageItem>,
+}
+
+impl SchiftOcrResult {
+    fn page_text(&self) -> Option<&str> {
+        self.markdown.as_deref().or(self.text.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchiftOcrPageItem {
     pub page_no: Option<i32>,
@@ -230,6 +251,25 @@ pub struct SchiftOcrPageItem {
     pub blocks: Vec<SchiftOcrBlockItem>,
     #[serde(default)]
     pub images: Vec<SchiftOcrImageItem>,
+    #[serde(default)]
+    pub result: Option<SchiftOcrResult>,
+}
+
+impl SchiftOcrPageItem {
+    /// `result.markdown` (or `result.text`), else the top-level `markdown`.
+    pub fn page_markdown(&self) -> &str {
+        self.result
+            .as_ref()
+            .and_then(SchiftOcrResult::page_text)
+            .unwrap_or(&self.markdown)
+    }
+
+    pub fn page_blocks(&self) -> &[SchiftOcrBlockItem] {
+        match &self.result {
+            Some(r) if !r.blocks.is_empty() => &r.blocks,
+            _ => &self.blocks,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +284,60 @@ pub struct SchiftOcrResponse {
     pub pages: Vec<SchiftOcrPageItem>,
     #[serde(default)]
     pub images: Vec<SchiftOcrImageItem>,
+    #[serde(default)]
+    pub result: Option<SchiftOcrResult>,
+}
+
+impl SchiftOcrResponse {
+    /// Text of a single-page response: `result.markdown` / `result.text`, else the same fields
+    /// at the top level.
+    pub fn page_markdown(&self) -> Option<&str> {
+        self.result
+            .as_ref()
+            .and_then(SchiftOcrResult::page_text)
+            .or(self.markdown.as_deref())
+            .or(self.text.as_deref())
+    }
+
+    pub fn page_blocks(&self) -> &[SchiftOcrBlockItem] {
+        match &self.result {
+            Some(r) if !r.blocks.is_empty() => &r.blocks,
+            _ => &self.blocks,
+        }
+    }
+
+    /// Whether the response carries page content in a shape this client reads.
+    fn has_content(&self) -> bool {
+        self.page_markdown().is_some()
+            || !self.page_blocks().is_empty()
+            || self
+                .pages
+                .iter()
+                .any(|p| p.result.is_some() || !p.markdown.is_empty() || !p.blocks.is_empty())
+    }
+}
+
+/// Decode a `/v1/run` body. A 200 whose page text sits under no field this client reads is an
+/// error: the document would otherwise be indexed with an empty body.
+fn decode_ocr_body(body: serde_json::Value) -> Result<SchiftOcrResponse, OpenRagError> {
+    let keys = body
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    let resp: SchiftOcrResponse =
+        serde_json::from_value(body).map_err(|e| OpenRagError::ExternalAdapter {
+            adapter: "schift_ocr".into(),
+            message: format!("failed to parse OCR JSON response: {e}"),
+        })?;
+    if !resp.has_content() {
+        return Err(OpenRagError::ExternalAdapter {
+            adapter: "schift_ocr".into(),
+            message: format!(
+                "OCR response has no page text (expected result.markdown); keys: [{keys}]"
+            ),
+        });
+    }
+    Ok(resp)
 }
 
 #[derive(Debug, Clone)]
@@ -330,12 +424,12 @@ impl SchiftOcrClient {
             });
         }
 
-        resp.json::<SchiftOcrResponse>()
-            .await
-            .map_err(|e| OpenRagError::ExternalAdapter {
-                adapter: "schift_ocr".into(),
-                message: format!("failed to parse OCR JSON response: {e}"),
-            })
+        let body = resp.json::<serde_json::Value>().await;
+        let body = body.map_err(|e| OpenRagError::ExternalAdapter {
+            adapter: "schift_ocr".into(),
+            message: format!("failed to parse OCR JSON response: {e}"),
+        })?;
+        decode_ocr_body(body)
     }
 }
 
@@ -557,11 +651,8 @@ fn build_doc_from_schift_response(
     let (w, h) = img.dimensions();
 
     if resp.pages.is_empty() {
-        let md = resp
-            .markdown
-            .or(resp.text)
-            .unwrap_or_default();
-        let blocks = convert_ocr_blocks(&resp.blocks)?;
+        let md = resp.page_markdown().unwrap_or_default().to_string();
+        let blocks = convert_ocr_blocks(resp.page_blocks())?;
         let aliases = extract_parenthetical_aliases(&md);
         pages.push(ParsedPage {
             page_no: 1,
@@ -576,11 +667,12 @@ fn build_doc_from_schift_response(
         });
     } else {
         for (idx, p) in resp.pages.iter().enumerate() {
-            let blocks = convert_ocr_blocks(&p.blocks)?;
-            let aliases = extract_parenthetical_aliases(&p.markdown);
+            let md = p.page_markdown();
+            let blocks = convert_ocr_blocks(p.page_blocks())?;
+            let aliases = extract_parenthetical_aliases(md);
             pages.push(ParsedPage {
                 page_no: p.page_no.unwrap_or((idx + 1) as i32),
-                raw_markdown: p.markdown.clone(),
+                raw_markdown: md.to_string(),
                 tables_html: Vec::new(),
                 formulas: Vec::new(),
                 fields: Vec::new(),
@@ -591,7 +683,7 @@ fn build_doc_from_schift_response(
                 } else {
                     None
                 },
-                content_sha256: sha256_hex_str(&p.markdown),
+                content_sha256: sha256_hex_str(md),
             });
         }
     }
@@ -780,5 +872,86 @@ async fn try_tesseract_cli(bytes: &[u8]) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn build(body: serde_json::Value) -> Result<ParsedDocument, OpenRagError> {
+        let policy = OcrPolicyDecision {
+            effective_mode: Sensitivity::Share,
+            execution_target: OcrExecutionTarget::SchiftCloud,
+            upgraded_from_share: false,
+        };
+        build_doc_from_schift_response(
+            b"png",
+            DocumentFormat::Png,
+            Some("card.png"),
+            &RgbImage::new(2, 2),
+            decode_ocr_body(body)?,
+            policy,
+        )
+    }
+
+    /// Shape of a real `POST https://schift.io/v1/run` reply (2026-11-23, task=markdown, share);
+    /// the page text is shortened.
+    #[test]
+    fn run_response_text_comes_from_result_markdown() -> TestResult {
+        let md = "# 인사 기록 카드 (시험용 가상 데이터)\n\n연차: 입사 1년 후 15일, 이월 불가";
+        let doc = build(json!({
+            "id": "5f66c3726f73", "task": "markdown", "model_version": "schift-ocr-2-20261112",
+            "image_size": [1100, 440], "result": {"markdown": md}, "truncated": false,
+            "model_usage": {"input_tokens": 1314, "output_tokens": 85, "ms": 615},
+            "job_id": "d7a1bee9c86f4cf4a14e8afff8816284", "mode": "share", "stored": true,
+            "usage": {"pages": 1, "credits": 0, "credits_paid": 0, "free": 0, "paid": 0, "mode": "share"}
+        }))?;
+        assert_eq!(doc.pages.len(), 1);
+        assert_eq!(doc.pages[0].raw_markdown, md);
+        assert_eq!(doc.full_markdown, md);
+        Ok(())
+    }
+
+    /// A blank page comes back as one picture (real reply, 2026-11-23): kept, not an error.
+    #[test]
+    fn picture_only_page_is_kept() -> TestResult {
+        let doc = build(json!({
+            "task": "markdown", "job_id": "5dcfab062ca94079bcf620d1aac54ebf", "mode": "share",
+            "result": {"markdown": "![](page-001-fig-1.png)", "images": [{
+                "image": "page-001-fig-1.png", "bbox": [0, 0, 400, 300], "caption": null,
+                "image_url": "/v1/jobs/5dcfab062ca94079bcf620d1aac54ebf/images/page-001-fig-1.png"
+            }]}
+        }))?;
+        assert_eq!(doc.full_markdown, "![](page-001-fig-1.png)");
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_fields_and_per_page_results_are_read() -> TestResult {
+        assert_eq!(build(json!({"markdown": "top"}))?.full_markdown, "top");
+        assert_eq!(build(json!({"text": "plain"}))?.full_markdown, "plain");
+        let doc = build(json!({"pages": [
+            {"page_no": 1, "result": {"markdown": "one"}},
+            {"markdown": "two"}
+        ]}))?;
+        let texts: Vec<&str> = doc.pages.iter().map(|p| p.raw_markdown.as_str()).collect();
+        assert_eq!(texts, ["one", "two"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reply_without_page_text_is_an_error() -> TestResult {
+        let reply = json!({"job_id": "x", "output": {"md": "text in a field we do not read"}});
+        let Err(OpenRagError::ExternalAdapter { adapter, message }) = build(reply) else {
+            return Err("expected a schift_ocr adapter error".into());
+        };
+        assert_eq!(adapter, "schift_ocr");
+        assert!(message.contains("no page text"), "{message}");
+        assert!(message.contains("output"), "{message}");
+        Ok(())
     }
 }
