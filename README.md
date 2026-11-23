@@ -131,7 +131,10 @@ provider is configured (otherwise HTTP 503):
 - `OPENRAG_LLM_CLI=claude` or `codex` (optional `OPENRAG_LLM_CLI_MODEL`, `OPENRAG_LLM_CLI_COMMAND`) —
   runs the Claude Code (`claude -p`, no tools, no MCP servers) or Codex (`codex exec`, read-only
   sandbox) CLI on the server host, logged in as the user the server runs as. The prompt leaves for
-  Anthropic / OpenAI, so it is an external provider: masked PII only, up to L7.
+  Anthropic / OpenAI, so it is an external provider: masked PII only, up to L7. Run the server
+  under a dedicated service account: the CLI also reads that account's own instructions
+  (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`) and settings, which would otherwise shape every
+  user's answers.
 
 These seed an org's providers the first time it asks for an answer; change them later in
 `gateway.providers`. In the air-gapped profile the server calls only the hosts it is configured
