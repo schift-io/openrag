@@ -1,8 +1,8 @@
 # Air-gapped overlay: docker compose -f docker-compose.yml -f docker-compose.airgap.yml \
-#   --profile app --profile airgap up -d postgres minio local-embed openrag-api
+#   --profile app --profile airgap up -d postgres object-store local-embed openrag-api
 # (openrag-web is left out: its build context ../web is not in this repository.)
 #
-# postgres, minio and local-embed sit on an internal network with no route out. openrag-api is
+# postgres, object-store and local-embed sit on an internal network with no route out. openrag-api is
 # also on openrag_edge so clients can reach its port and it can reach the site's own LLM / OCR
 # servers. The embedding weights come from a Hugging Face hub cache mounted read-only at /models
 # (AIRGAP_MODEL_DIR), filled beforehand on a connected machine with
@@ -21,7 +21,7 @@ services:
   postgres:
     networks: [openrag_airgap]
 
-  minio:
+  object-store:
     networks: [openrag_airgap]
 
   local-embed:

@@ -30,26 +30,29 @@ services:
       timeout: 5s
       retries: 12
 
-  # S3-compatible object store for page thumbnails and figure crops. minio/minio is no longer
-  # published (Docker Hub dropped it in 2026-09); pgsty/minio is a maintained fork with the same
-  # interface. Any S3-compatible image works, or point OPENRAG_S3_* at AWS S3 and others.
-  minio:
-    image: ${OBJECT_STORE_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+  # S3-compatible object store for page thumbnails and figure crops: RustFS (Apache-2.0). Objects
+  # live in the s3_data volume. Any S3-compatible server works in its place, or point OPENRAG_S3_*
+  # at AWS S3 and other hosted buckets.
+  object-store:
+    image: ${OBJECT_STORE_IMAGE:-rustfs/rustfs:1.0.6}
     restart: unless-stopped
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-openrag_minio}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-openrag_minio_secret}
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-openrag_s3}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-openrag_s3_secret}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${S3_PORT:-9000}:9000"
+      - "${S3_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - minio_data:/data
+      - s3_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
 
   # One process: the API drains the indexing outbox inline, so there is no separate worker.
   openrag-api:
@@ -63,7 +66,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      minio:
+      object-store:
         condition: service_healthy
     environment:
       # Request traffic runs as openrag_app (RLS enforced); background work as openrag_worker.
@@ -73,12 +76,12 @@ services:
       OPENRAG_PIPELINE_CONFIG: ${OPENRAG_PIPELINE_CONFIG:-/app/configs/pipeline.default.yaml}
       # 32-byte hex key that wraps the PII vault keys; without it the server uses a fixed dev key.
       OPENRAG_PII_KEK_HEX: ${OPENRAG_PII_KEK_HEX:?set OPENRAG_PII_KEK_HEX (openssl rand -hex 32)}
-      # Thumbnails go to this bucket (created on first start). Defaults: the minio service above.
-      OPENRAG_S3_ENDPOINT: ${OPENRAG_S3_ENDPOINT:-http://minio:9000}
+      # Thumbnails go to this bucket (created on first start). Defaults: the object-store service above.
+      OPENRAG_S3_ENDPOINT: ${OPENRAG_S3_ENDPOINT:-http://object-store:9000}
       OPENRAG_S3_BUCKET: ${S3_BUCKET:-openrag-artifacts}
       OPENRAG_S3_REGION: ${OPENRAG_S3_REGION:-us-east-1}
-      OPENRAG_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-openrag_minio}
-      OPENRAG_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-openrag_minio_secret}
+      OPENRAG_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-openrag_s3}
+      OPENRAG_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-openrag_s3_secret}
       OPENRAG_S3_URL_STYLE: ${OPENRAG_S3_URL_STYLE:-path}
       # LLM for /v1/chat/completions and rag_ask: an OpenAI-compatible server (vLLM, ...).
       # Unset = none; MCP clients (Claude Code, Codex) answer from rag_search instead.
@@ -112,4 +115,4 @@ services:
 
 volumes:
   pg_data:
-  minio_data:
+  s3_data:
