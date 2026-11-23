@@ -73,7 +73,7 @@ pub enum Command {
     Up(UpArgs),
     /// Run the HTTP API and Streamable HTTP MCP endpoint (POST /mcp)
     Serve(ServeArgs),
-    /// Ingest a file (HWP/HWPX/PDF/MD/TXT/PNG) into a bucket
+    /// Ingest a file or a folder (HWP/HWPX/PDF/MD/TXT/PNG/JPG) into a bucket
     Ingest(IngestArgs),
     /// Vector index engines, external mirrors and the indexing outbox
     #[command(subcommand)]
@@ -101,6 +101,144 @@ pub enum Command {
     /// One-time CLI authorization codes (exchanged for API keys)
     #[command(subcommand)]
     Auth(AuthCmd),
+    /// First organization, department and admin on a fresh database (local operator)
+    #[command(subcommand)]
+    Org(OrgCmd),
+    /// Create and list buckets
+    #[command(subcommand)]
+    Bucket(BucketCmd),
+    /// Register this server's MCP endpoint in Claude Code or Codex
+    Connect(ConnectArgs),
+    /// Set up a fresh install in one step: org and admin key, CLI config, a bucket, a folder of
+    /// documents and MCP clients
+    Init(InitArgs),
+}
+
+/// The first organization of a fresh install.
+#[derive(Debug, Clone, Args)]
+pub struct OrgSpec {
+    /// Organization slug (a-z, 0-9, '-', '_'; used in ARNs)
+    #[arg(long, default_value = "default")]
+    pub slug: String,
+    /// Organization display name
+    #[arg(long, default_value = "Default")]
+    pub name: String,
+    /// First department's ARN path (a-z, 0-9, '-', '_')
+    #[arg(long, default_value = "general")]
+    pub dept: String,
+    /// First department's display name (default: --dept)
+    #[arg(long)]
+    pub dept_name: Option<String>,
+    /// Admin e-mail
+    #[arg(long, default_value = "admin@localhost")]
+    pub admin_email: String,
+    /// Admin display name
+    #[arg(long, default_value = "Admin")]
+    pub admin_name: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgCmd {
+    /// Create the organization, its first department and an admin (permission level 10, org
+    /// admin), then mint an API key for the admin. Needs DATABASE_URL and operator mode.
+    Init {
+        #[command(flatten)]
+        spec: OrgSpec,
+        /// Write the API key (and --api-url) to the CLI config file
+        #[arg(long)]
+        save: bool,
+        /// Server URL stored with --save
+        #[arg(long)]
+        api_url: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BucketCmd {
+    /// Create a bucket
+    Create {
+        /// Bucket slug
+        slug: String,
+        /// Display name (default: the slug)
+        #[arg(long)]
+        name: Option<String>,
+        /// Who may read it
+        #[arg(long, value_enum, default_value_t = ScopeArg::Org)]
+        scope: ScopeArg,
+        /// Minimum permission level (1..10)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(i16).range(1..=10))]
+        auth_level: i16,
+        /// Owning department (default: the caller's first department)
+        #[arg(long)]
+        dept: Option<Uuid>,
+    },
+    /// List the buckets the caller can see
+    List,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpClient {
+    /// Claude Code (`claude mcp add`)
+    Claude,
+    /// Codex (`codex mcp add`)
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ClaudeScope {
+    /// Every project of this user
+    User,
+    /// `.mcp.json` in the current directory, shared with the repository
+    Project,
+    /// This project, this user only
+    Local,
+}
+
+impl ClaudeScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ConnectArgs {
+    /// MCP client to register the server with
+    #[arg(value_enum)]
+    pub client: McpClient,
+    /// Name of the MCP server entry
+    #[arg(long, default_value = "openrag")]
+    pub name: String,
+    /// Claude Code configuration scope
+    #[arg(long, value_enum, default_value_t = ClaudeScope::User)]
+    pub scope: ClaudeScope,
+    /// Print the command instead of running it (the key is masked)
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Server to set up; it must be running (`openrag up` or `openrag serve`)
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub api_url: String,
+    #[command(flatten)]
+    pub org: OrgSpec,
+    /// Bucket to create for the documents
+    #[arg(long, default_value = "docs")]
+    pub bucket: String,
+    /// Folder to ingest into the bucket (recursively)
+    #[arg(long)]
+    pub docs: Option<PathBuf>,
+    /// Register the server in these MCP clients (repeatable)
+    #[arg(long = "connect", value_enum)]
+    pub connect: Vec<McpClient>,
+    /// Claude Code configuration scope for --connect claude
+    #[arg(long, value_enum, default_value_t = ClaudeScope::User)]
+    pub mcp_scope: ClaudeScope,
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,7 +348,7 @@ impl OcrModeArg {
 
 #[derive(Debug, Args)]
 pub struct IngestArgs {
-    /// File to ingest
+    /// File to ingest, or a folder (every supported file in it, recursively)
     pub path: PathBuf,
     /// Bucket slug or id
     #[arg(long)]
@@ -660,13 +798,25 @@ fn readable_by_others(_meta: &std::fs::Metadata) -> bool {
 /// variables. Call before the async runtime starts and before argument parsing (clap reads
 /// `OPENRAG_API_KEY` from the environment). Returns the file used, if any.
 pub fn apply_config_file() -> Result<Option<PathBuf>, String> {
+    apply_config_file_inner(false)
+}
+
+/// `openrag init` and `openrag org init` write the config file, so it may not exist yet.
+fn creates_config(args: &[String]) -> bool {
+    let words: Vec<&str> = args.iter().skip(1).map(String::as_str).filter(|a| !a.starts_with('-')).take(2).collect();
+    matches!(words.as_slice(), ["init", ..] | ["org", "init"])
+}
+
+fn apply_config_file_inner(allow_missing: bool) -> Result<Option<PathBuf>, String> {
     let explicit = non_empty_env("OPENRAG_CONFIG").map(PathBuf::from);
     let Some(path) = explicit.clone().or_else(default_config_path) else {
         return Ok(None);
     };
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
-        Err(e) if explicit.is_none() && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if (explicit.is_none() || allow_missing) && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
         Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
     };
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
@@ -710,7 +860,8 @@ fn operator_enabled() -> bool {
 
 /// Binary entrypoint for `openrag`.
 pub fn main_entry() -> ExitCode {
-    if let Err(e) = apply_config_file() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Err(e) = apply_config_file_inner(creates_config(&args)) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
@@ -753,6 +904,10 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Pipeline(c) => cmd_pipeline(c).await,
         Command::Mcp(a) => cmd_mcp(a).await,
         Command::Auth(c) => cmd_auth(c).await,
+        Command::Org(OrgCmd::Init { spec, save, api_url }) => cmd_org_init(spec, save, api_url).await,
+        Command::Bucket(c) => cmd_bucket(c).await,
+        Command::Connect(a) => cmd_connect(a).await,
+        Command::Init(a) => cmd_init(a).await,
     }
 }
 
@@ -1040,7 +1195,12 @@ async fn cmd_up(a: UpArgs) -> Result<(), CliError> {
         }
         args.extend(["-f".into(), airgap.display().to_string()]);
     }
-    args.extend(["--profile".into(), "app".into(), "up".into()]);
+    args.extend(["--profile".into(), "app".into()]);
+    if a.profile == UpProfile::Airgap {
+        // local-embed only runs under the airgap profile
+        args.extend(["--profile".into(), "airgap".into()]);
+    }
+    args.push("up".into());
     if !a.foreground {
         args.push("-d".into());
     }
@@ -1140,17 +1300,53 @@ async fn apply_pipeline_file(state: &AppState, path: &Path) -> Result<(), CliErr
     Ok(())
 }
 
-async fn cmd_ingest(a: IngestArgs) -> Result<(), CliError> {
-    let bytes = tokio::fs::read(&a.path)
+/// File extensions `openrag ingest` picks up from a folder.
+const INGEST_EXTENSIONS: &[&str] = &[
+    "hwp", "hwpx", "hml", "pdf", "md", "markdown", "txt", "png", "jpg", "jpeg", "webp",
+];
+
+/// The file itself, or every supported file under a folder (sorted, hidden entries skipped).
+fn ingest_targets(path: &Path) -> Result<Vec<PathBuf>, CliError> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| CliError(format!("cannot read {}: {e}", dir.display())))? {
+            let p = entry?.path();
+            let hidden = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'));
+            if hidden {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| INGEST_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    if out.is_empty() {
+        return Err(CliError(format!("no supported files under {}", path.display())));
+    }
+    Ok(out)
+}
+
+async fn ingest_one(ex: &Exec, a: &IngestArgs, path: &Path) -> Result<Value, CliError> {
+    let bytes = tokio::fs::read(path)
         .await
-        .map_err(|e| CliError(format!("cannot read {}: {e}", a.path.display())))?;
+        .map_err(|e| CliError(format!("cannot read {}: {e}", path.display())))?;
     if bytes.is_empty() {
-        return Err(CliError(format!("{} is empty", a.path.display())));
+        return Err(CliError(format!("{} is empty", path.display())));
     }
     let groups = parse_uuid_list(&a.groups, "--groups")?;
     let tags: Vec<String> = a.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
-    let file_name = a
-        .path
+    let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("document")
@@ -1187,26 +1383,66 @@ async fn cmd_ingest(a: IngestArgs) -> Result<(), CliError> {
     }
     let (boundary, body) = build_multipart(&file_name, &bytes, &fields);
 
-    let out = match exec().await? {
+    match ex {
         Exec::Remote(r) => {
-            if a.pipeline.is_some() {
-                return Err(CliError::new("--pipeline applies to local ingestion only"));
-            }
             let path = format!("/v2/buckets/{}/documents", pct_encode(a.bucket.trim()));
-            r.call(Method::POST, &path, DispatchBody::Multipart { boundary, bytes: body }).await?
+            r.call(Method::POST, &path, DispatchBody::Multipart { boundary, bytes: body }).await
+        }
+        Exec::Local(l) => {
+            let (org, bucket_id, owner) = l.find_bucket(&a.bucket).await?;
+            let principal = l.user_principal(org, owner).await?;
+            let path = format!("/v2/buckets/{bucket_id}/documents");
+            local_call(&l.state, &principal, Method::POST, &path, DispatchBody::Multipart { boundary, bytes: body }).await
+        }
+    }
+}
+
+/// Ingests every file under `a.path`; one failure does not stop the rest.
+async fn ingest_many(ex: &Exec, a: &IngestArgs) -> Result<Value, CliError> {
+    let files = ingest_targets(&a.path)?;
+    let mut results = Vec::with_capacity(files.len());
+    let mut failed = 0usize;
+    for f in &files {
+        match ingest_one(ex, a, f).await {
+            Ok(v) => results.push(json!({
+                "file": f.display().to_string(),
+                "document_id": v.get("document_id").or_else(|| v.get("id")).cloned().unwrap_or(Value::Null),
+            })),
+            Err(e) => {
+                failed += 1;
+                results.push(json!({ "file": f.display().to_string(), "error": e.0 }));
+            }
+        }
+    }
+    Ok(json!({ "ingested": files.len() - failed, "failed": failed, "results": results }))
+}
+
+async fn cmd_ingest(a: IngestArgs) -> Result<(), CliError> {
+    let ex = exec().await?;
+    match &ex {
+        Exec::Remote(_) if a.pipeline.is_some() => {
+            return Err(CliError::new("--pipeline applies to local ingestion only"));
         }
         Exec::Local(l) => {
             if let Some(p) = a.pipeline.as_deref() {
                 apply_pipeline_file(&l.state, p).await?;
             }
-            let (org, bucket_id, owner) = l.find_bucket(&a.bucket).await?;
-            let principal = l.user_principal(org, owner).await?;
-            let path = format!("/v2/buckets/{bucket_id}/documents");
-            local_call(&l.state, &principal, Method::POST, &path, DispatchBody::Multipart { boundary, bytes: body }).await?
         }
-    };
+        Exec::Remote(_) => {}
+    }
+    if !a.path.is_dir() {
+        print_json(&ingest_one(&ex, &a, &a.path).await?);
+        return Ok(());
+    }
+    if a.title.is_some() {
+        return Err(CliError::new("--title applies to a single file, not a folder"));
+    }
+    let out = ingest_many(&ex, &a).await?;
     print_json(&out);
-    Ok(())
+    match out.get("failed").and_then(Value::as_u64) {
+        Some(n) if n > 0 => Err(CliError(format!("{n} file(s) failed"))),
+        _ => Ok(()),
+    }
 }
 
 // ============================================================================
@@ -2035,6 +2271,413 @@ async fn cmd_auth(c: AuthCmd) -> Result<(), CliError> {
     Ok(())
 }
 
+// ============================================================================
+// org / bucket / connect / init
+// ============================================================================
+
+fn valid_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn db_err(what: &'static str) -> impl Fn(sqlx::Error) -> CliError {
+    move |e| CliError(format!("{what}: {e}"))
+}
+
+/// Server state for operator-only bootstrap work; ignores any API key in the environment.
+async fn operator_state(what: &str) -> Result<Arc<AppState>, CliError> {
+    if non_empty_env("DATABASE_URL").is_none() {
+        return Err(CliError(format!(
+            "`{what}` needs DATABASE_URL (the server's database, e.g. postgres://openrag:…@127.0.0.1:5432/openrag)"
+        )));
+    }
+    if !operator_enabled() {
+        return Err(CliError(format!(
+            "`{what}` runs as the local operator: set OPENRAG_OPERATOR=1 (or `operator = true` in config.toml)"
+        )));
+    }
+    Ok(AppState::from_env().await?)
+}
+
+struct Bootstrapped {
+    org_id: Uuid,
+    dept_id: Option<Uuid>,
+    principal_id: Uuid,
+    api_key: String,
+    created: bool,
+}
+
+/// Creates the organization, its first department and an admin (or, with `reuse`, takes the
+/// existing organization's first admin), then mints an API key for that admin.
+async fn bootstrap_org(spec: &OrgSpec, reuse: bool, what: &str) -> Result<Bootstrapped, CliError> {
+    for (flag, v) in [("--slug", &spec.slug), ("--dept", &spec.dept)] {
+        if !valid_path_segment(v) {
+            return Err(CliError(format!("{flag} must use a-z, 0-9, '-' or '_' (got '{v}')")));
+        }
+    }
+    let state = operator_state(what).await?;
+    let worker = state.require_worker_pool()?;
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM iam.orgs WHERE slug = $1")
+        .bind(&spec.slug)
+        .fetch_optional(worker.inner())
+        .await
+        .map_err(db_err("lookup iam.orgs"))?;
+    let (org_id, dept_id, principal_id, created) = match existing {
+        Some(org_id) => {
+            if !reuse {
+                return Err(CliError(format!(
+                    "organization '{}' already exists; mint a key for one of its admins with `openrag auth code --principal <id>`",
+                    spec.slug
+                )));
+            }
+            let admin: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM iam.principals
+                 WHERE org_id = $1 AND is_org_admin AND status = 'active'
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(org_id)
+            .fetch_optional(worker.inner())
+            .await
+            .map_err(db_err("lookup org admin"))?;
+            let admin = admin.ok_or_else(|| {
+                CliError(format!("organization '{}' has no active admin", spec.slug))
+            })?;
+            (org_id, None, admin, false)
+        }
+        None => {
+            let (org_id, dept_id, admin_id) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+            let mut tx = worker.inner().begin().await.map_err(db_err("begin bootstrap"))?;
+            sqlx::query("INSERT INTO iam.orgs (id, slug, name) VALUES ($1, $2, $3)")
+                .bind(org_id)
+                .bind(&spec.slug)
+                .bind(spec.name.trim())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("insert iam.orgs"))?;
+            sqlx::query("INSERT INTO iam.departments (id, org_id, name, arn_path) VALUES ($1, $2, $3, $4)")
+                .bind(dept_id)
+                .bind(org_id)
+                .bind(spec.dept_name.as_deref().unwrap_or(&spec.dept).trim())
+                .bind(&spec.dept)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("insert iam.departments"))?;
+            sqlx::query(
+                "INSERT INTO iam.principals (id, org_id, email, display_name, auth_level, is_org_admin)
+                 VALUES ($1, $2, $3, $4, 10, true)",
+            )
+            .bind(admin_id)
+            .bind(org_id)
+            .bind(spec.admin_email.trim())
+            .bind(spec.admin_name.trim())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err("insert iam.principals"))?;
+            sqlx::query(
+                "INSERT INTO iam.dept_memberships (org_id, dept_id, principal_id, dept_role)
+                 VALUES ($1, $2, $3, 'dept_admin')",
+            )
+            .bind(org_id)
+            .bind(dept_id)
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err("insert iam.dept_memberships"))?;
+            tx.commit().await.map_err(db_err("commit bootstrap"))?;
+            (org_id, Some(dept_id), admin_id, true)
+        }
+    };
+    let issued = issue_cli_code(worker, org_id, principal_id, None, CliCodeCaps::default(), None).await?;
+    let (_, axum::Json(minted)) = crate::auth::cli_code_exchange(
+        axum::extract::State(Arc::clone(&state)),
+        axum::Json(crate::auth::CliCodeExchangeRequest {
+            code: issued.code,
+            org_id: None,
+            principal_id: None,
+            name: Some("openrag-init".into()),
+            max_auth_level: None,
+            scoped_arns: Vec::new(),
+            scoped_group_ids: Vec::new(),
+            ttl_seconds: None,
+        }),
+    )
+    .await
+    .map_err(|e| CliError(format!("mint API key: {} {}", e.code, e.message)))?;
+    Ok(Bootstrapped {
+        org_id,
+        dept_id,
+        principal_id,
+        api_key: minted.api_key,
+        created,
+    })
+}
+
+/// Sets keys in the CLI config file (OPENRAG_CONFIG, else ~/.config/openrag/config.toml),
+/// keeping the others, and leaves it readable by the owner only.
+fn save_cli_config(values: &[(&str, String)]) -> Result<PathBuf, CliError> {
+    let path = non_empty_env("OPENRAG_CONFIG")
+        .map(PathBuf::from)
+        .or_else(default_config_path)
+        .ok_or_else(|| CliError::new("no config path: set OPENRAG_CONFIG or HOME"))?;
+    let mut table: toml::Table = match std::fs::read_to_string(&path) {
+        Ok(raw) => toml::from_str(&raw).map_err(|e| CliError(format!("invalid config {}: {e}", path.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(CliError(format!("cannot read config {}: {e}", path.display()))),
+    };
+    for (k, v) in values {
+        table.insert((*k).to_string(), toml::Value::String(v.clone()));
+    }
+    let text = toml::to_string(&table).map_err(|e| CliError(format!("encode config: {e}")))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(text.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+fn mask_key(key: &str) -> String {
+    format!("{}…", key.chars().take(10).collect::<String>())
+}
+
+/// Calls the API as the caller: the API key's principal, or (operator mode) the only org's admin.
+async fn call_as_caller(ex: &Exec, method: Method, path: &str, body: DispatchBody) -> Result<Value, CliError> {
+    match ex {
+        Exec::Remote(r) => r.call(method, path, body).await,
+        Exec::Local(l) => {
+            let principal = match &l.key_principal {
+                Some(p) => p.clone(),
+                None => {
+                    let orgs = l.operator_orgs().await?;
+                    let [org] = orgs.as_slice() else {
+                        return Err(CliError::new("several organizations: set OPENRAG_ORG_ID or use an API key"));
+                    };
+                    l.admin_principal(*org, None).await?
+                }
+            };
+            local_call(&l.state, &principal, method, path, body).await
+        }
+    }
+}
+
+async fn cmd_org_init(spec: OrgSpec, save: bool, api_url: Option<String>) -> Result<(), CliError> {
+    let b = bootstrap_org(&spec, false, "org init").await?;
+    let mut out = json!({
+        "org_id": b.org_id,
+        "slug": spec.slug,
+        "dept_id": b.dept_id,
+        "admin_principal_id": b.principal_id,
+        "admin_email": spec.admin_email,
+        "api_key": b.api_key,
+    });
+    if save {
+        let mut values = vec![
+            ("api_key", b.api_key.clone()),
+            ("org_id", b.org_id.to_string()),
+            ("principal_id", b.principal_id.to_string()),
+        ];
+        if let Some(u) = api_url {
+            values.push(("api_url", u.trim_end_matches('/').to_string()));
+        }
+        let path = save_cli_config(&values)?;
+        out["config"] = json!(path.display().to_string());
+    }
+    print_json(&out);
+    Ok(())
+}
+
+async fn cmd_bucket(c: BucketCmd) -> Result<(), CliError> {
+    let ex = exec().await?;
+    let out = match c {
+        BucketCmd::Create { slug, name, scope, auth_level, dept } => {
+            let body = json!({
+                "name": name.unwrap_or_else(|| slug.clone()),
+                "slug": slug,
+                "access_scope": scope.as_str(),
+                "min_auth_level": auth_level,
+                "dept_id": dept,
+            });
+            call_as_caller(&ex, Method::POST, "/v2/buckets", DispatchBody::Json(body)).await?
+        }
+        BucketCmd::List => call_as_caller(&ex, Method::GET, "/v2/buckets", DispatchBody::Empty).await?,
+    };
+    print_json(&out);
+    Ok(())
+}
+
+/// Registers `base`/mcp in an MCP client under `name`.
+async fn connect_client(
+    client: McpClient,
+    name: &str,
+    scope: ClaudeScope,
+    base: &str,
+    key: &str,
+    dry_run: bool,
+) -> Result<Value, CliError> {
+    let mcp_url = format!("{}/mcp", base.trim_end_matches('/'));
+    let (program, args, note): (&str, Vec<String>, Option<&str>) = match client {
+        McpClient::Claude => (
+            "claude",
+            vec![
+                "mcp".into(),
+                "add".into(),
+                "--transport".into(),
+                "http".into(),
+                "--scope".into(),
+                scope.as_str().into(),
+                name.into(),
+                mcp_url.clone(),
+                "--header".into(),
+                format!("Authorization: Bearer {key}"),
+            ],
+            None,
+        ),
+        McpClient::Codex => (
+            "codex",
+            vec![
+                "mcp".into(),
+                "add".into(),
+                name.into(),
+                "--url".into(),
+                mcp_url.clone(),
+                "--bearer-token-env-var".into(),
+                "OPENRAG_API_KEY".into(),
+            ],
+            Some("Codex reads the key from $OPENRAG_API_KEY: export it (api_key in the CLI config) in the shell that starts codex"),
+        ),
+    };
+    let client_name = match client {
+        McpClient::Claude => "claude",
+        McpClient::Codex => "codex",
+    };
+    let shown: Vec<String> = std::iter::once(program.to_string())
+        .chain(args.iter().map(|a| a.replace(key, &mask_key(key))))
+        .collect();
+    if dry_run {
+        return Ok(json!({ "client": client_name, "command": shown, "note": note }));
+    }
+    let out = tokio::process::Command::new(program)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| CliError(format!("cannot run {program}: {e} (is it installed and on PATH?)")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = if err.trim().is_empty() { String::from_utf8_lossy(&out.stdout) } else { err };
+        return Err(CliError(format!("{program} mcp add failed: {}", msg.trim().replace(key, &mask_key(key)))));
+    }
+    Ok(json!({ "client": client_name, "registered": name, "url": mcp_url, "command": shown, "note": note }))
+}
+
+async fn cmd_connect(a: ConnectArgs) -> Result<(), CliError> {
+    let base = non_empty_env("OPENRAG_API_URL")
+        .ok_or_else(|| CliError::new("set api_url in config.toml (or OPENRAG_API_URL); `openrag init` writes it"))?;
+    let key = non_empty_env("OPENRAG_API_KEY")
+        .ok_or_else(|| CliError::new("set api_key in config.toml (or OPENRAG_API_KEY); `openrag init` writes it"))?;
+    print_json(&connect_client(a.client, &a.name, a.scope, &base, key.trim(), a.dry_run).await?);
+    Ok(())
+}
+
+async fn cmd_init(a: InitArgs) -> Result<(), CliError> {
+    let base = a.api_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| CliError(format!("http client: {e}")))?;
+    // 1. The server must answer.
+    let mut up = false;
+    for _ in 0..30 {
+        if let Ok(r) = http.get(format!("{base}/health")).send().await {
+            if r.status().is_success() {
+                up = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !up {
+        return Err(CliError(format!(
+            "no OpenRAG server answers at {base}/health; start it with `openrag up` (or `openrag serve`) first"
+        )));
+    }
+    // 2. Organization, department, admin and the admin's API key (reused on a second run).
+    let b = bootstrap_org(&a.org, true, "init").await?;
+    // 3. CLI config, so later commands (ingest, bucket, connect) need no flags.
+    let config = save_cli_config(&[
+        ("api_url", base.clone()),
+        ("api_key", b.api_key.clone()),
+        ("org_id", b.org_id.to_string()),
+        ("principal_id", b.principal_id.to_string()),
+    ])?;
+    let remote = Exec::Remote(Remote {
+        base: base.clone(),
+        key: b.api_key.clone(),
+        http,
+    });
+    // 4. A bucket for the documents.
+    let body = json!({ "slug": a.bucket, "name": a.bucket, "access_scope": "org", "min_auth_level": 1 });
+    let bucket = match call_as_caller(&remote, Method::POST, "/v2/buckets", DispatchBody::Json(body)).await {
+        Ok(v) => json!({ "slug": a.bucket, "id": v.get("id").cloned().unwrap_or(Value::Null), "created": true }),
+        Err(e) if e.0.contains("HTTP 409") => json!({ "slug": a.bucket, "created": false }),
+        Err(e) => return Err(e),
+    };
+    // 5. Documents.
+    let documents = match &a.docs {
+        Some(dir) => {
+            let args = IngestArgs {
+                path: dir.clone(),
+                bucket: a.bucket.clone(),
+                scope: Some(ScopeArg::Org),
+                auth_level: Some(1),
+                groups: Vec::new(),
+                tags: Vec::new(),
+                mode: None,
+                title: None,
+                pipeline: None,
+                valid_from: None,
+                valid_to: None,
+                revision: None,
+            };
+            ingest_many(&remote, &args).await?
+        }
+        None => Value::Null,
+    };
+    // 6. MCP clients.
+    let mut clients = Vec::new();
+    for c in &a.connect {
+        clients.push(match connect_client(*c, "openrag", a.mcp_scope, &base, &b.api_key, false).await {
+            Ok(v) => v,
+            Err(e) => json!({ "client": format!("{c:?}").to_lowercase(), "error": e.0 }),
+        });
+    }
+    print_json(&json!({
+        "server": base,
+        "org": { "id": b.org_id, "slug": a.org.slug, "created": b.created, "dept_id": b.dept_id },
+        "admin": { "principal_id": b.principal_id, "email": a.org.admin_email },
+        "api_key": mask_key(&b.api_key),
+        "config": config.display().to_string(),
+        "bucket": bucket,
+        "documents": documents,
+        "mcp_clients": clients,
+        "next": "Ask your MCP client about the documents; it searches them with rag_search. More files: openrag ingest <file or folder> --bucket <bucket>",
+    }));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2071,6 +2714,52 @@ mod tests {
         assert!(Cli::try_parse_from(["openrag", "index", "engine", "corpus.chunks", "--set", "elastic"]).is_err());
         assert!(Cli::try_parse_from(["openrag", "up", "--profile", "cloud"]).is_err());
         assert!(Cli::try_parse_from(["openrag", "index", "mirror", "corpus.chunks", "--to", "s3-vectors"]).is_ok());
+    }
+
+    #[test]
+    fn setup_commands_parse_with_defaults() {
+        match Cli::try_parse_from(["openrag", "init", "--docs", "./docs", "--connect", "claude", "--connect", "codex"]) {
+            Ok(Cli { command: Command::Init(a) }) => {
+                assert_eq!(a.api_url, "http://127.0.0.1:8080");
+                assert_eq!(a.org.slug, "default");
+                assert_eq!(a.bucket, "docs");
+                assert_eq!(a.connect, vec![McpClient::Claude, McpClient::Codex]);
+                assert_eq!(a.mcp_scope, ClaudeScope::User);
+            }
+            other => assert!(other.is_ok(), "init parse failed: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["openrag", "org", "init", "--slug", "acme", "--save"]).is_ok());
+        assert!(Cli::try_parse_from(["openrag", "bucket", "create", "handbook", "--scope", "dept", "--auth-level", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["openrag", "bucket", "create", "x", "--auth-level", "11"]).is_err());
+        assert!(Cli::try_parse_from(["openrag", "connect", "claude", "--scope", "project", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["openrag", "connect", "cursor"]).is_err());
+        let argv = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(creates_config(&argv(&["openrag", "init", "--docs", "d"])));
+        assert!(creates_config(&argv(&["openrag", "org", "init", "--save"])));
+        assert!(!creates_config(&argv(&["openrag", "concept", "list"])));
+        assert!(!creates_config(&argv(&["openrag", "--help"])));
+    }
+
+    #[test]
+    fn org_slugs_and_ingest_folders() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(valid_path_segment("acme-01_hq"));
+        for bad in ["", "ACME", "a:b", "경영지원", "a b"] {
+            assert!(!valid_path_segment(bad), "{bad:?}");
+        }
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("sub"))?;
+        for f in ["b.md", "sub/c.PDF", "skip.exe", ".hidden.md"] {
+            std::fs::write(dir.path().join(f), "x")?;
+        }
+        let found: Vec<String> = ingest_targets(dir.path())
+            .map_err(|e| e.0)?
+            .iter()
+            .filter_map(|p| p.strip_prefix(dir.path()).ok().map(|r| r.display().to_string()))
+            .collect();
+        assert_eq!(found, ["b.md", "sub/c.PDF"]);
+        let empty = tempfile::tempdir()?;
+        assert!(ingest_targets(empty.path()).is_err());
+        Ok(())
     }
 
     #[test]

@@ -65,6 +65,19 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
   up -d postgres local-embed openrag-api
 ```
 
+### Then: one command from a running server to asking questions
+```bash
+# the stack's database, needed once to create the first organization and admin
+export DATABASE_URL=postgres://openrag:openrag_dev_pass@127.0.0.1:5432/openrag OPENRAG_OPERATOR=1
+openrag init --slug acme --name "ACME" --docs ./my-docs --connect claude
+```
+`openrag init` creates the organization, a department and an admin (permission level 10), mints
+the admin's API key into `~/.config/openrag/config.toml` (mode 600), creates the bucket `docs`,
+ingests every supported file under `./my-docs` and registers the server's `/mcp` in Claude Code
+(`claude mcp add --scope user`). Then ask Claude Code about the documents: it searches them with
+`rag_search` and answers with the sources. Running it again reuses the organization and bucket.
+`--connect codex` registers Codex instead (it reads the key from `$OPENRAG_API_KEY`).
+
 The API runs as one process (it drains the indexing outbox inline; there is no worker service).
 Page thumbnails and figure crops are off by default (`thumbnail.enabled: false`): nothing shows them
 yet. When enabled they go to an S3-compatible bucket (AWS S3, RustFS, …) set through
@@ -101,7 +114,11 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 
 ### `openrag` CLI
 - `openrag up --profile <standard|airgap>` — Start platform stack
-- `openrag ingest <path> --bucket <slug> [--scope private|dept|group|org] [--auth-level 1..10]`
+- `openrag init [--docs <folder>] [--connect claude|codex]` — One-step setup: first organization and admin key, CLI config, a bucket, documents, MCP clients
+- `openrag org init` — First organization, department and admin plus an API key (local operator, `DATABASE_URL`)
+- `openrag bucket {create|list}` — Buckets
+- `openrag connect {claude|codex}` — Register this server's `/mcp` in Claude Code or Codex
+- `openrag ingest <file or folder> --bucket <slug> [--scope private|dept|group|org] [--auth-level 1..10]`
 - `openrag index {engine|mirror|status|retry}` — Switch `pg_pinecone` engines, mirror S3 Vectors/OSS, inspect outbox/quarantine
 - `openrag memory {patch|promote}` — Append CCLG patches or promote `private -> dept -> wiki`
 - `openrag redact run` — Execute full-layer Cascade Redaction (including thumbnail black-box masking)
@@ -170,7 +187,6 @@ text is not.
       "args": ["mcp", "--stdio"],
       "env": {
         "OPENRAG_API_KEY": "orag_your_api_key_here",
-        "OPENRAG_URL": "http://localhost:8080",
         "DATABASE_URL": "postgres://openrag_app@127.0.0.1:5432/openrag"
       }
     }
@@ -178,13 +194,14 @@ text is not.
 }
 ```
 
+`openrag connect claude` and `openrag connect codex` register the HTTP endpoint with the key from the
+CLI config. The stdio server (`openrag mcp --stdio`, `openrag-mcp`) talks to the database directly,
+so it only runs on the server host with `DATABASE_URL` set.
+
 ### Claude Code
 ```bash
-# Local stdio transport
-claude mcp add openrag -- openrag mcp --stdio
-
-# Or Streamable HTTP transport
-claude mcp add --transport http openrag http://localhost:8080/mcp \
+openrag connect claude    # same as:
+claude mcp add --transport http --scope user openrag http://localhost:8080/mcp \
   --header "Authorization: Bearer ${OPENRAG_API_KEY}"
 ```
 
@@ -192,13 +209,6 @@ claude mcp add --transport http openrag http://localhost:8080/mcp \
 ```json
 {
   "mcpServers": {
-    "openrag-local": {
-      "command": "openrag-mcp",
-      "env": {
-        "OPENRAG_API_KEY": "${OPENRAG_API_KEY}",
-        "OPENRAG_URL": "http://localhost:8080"
-      }
-    },
     "openrag-http": {
       "url": "http://localhost:8080/mcp",
       "headers": {
@@ -209,15 +219,11 @@ claude mcp add --transport http openrag http://localhost:8080/mcp \
 }
 ```
 
-### Codex (`~/.codex/config.toml`)
-```toml
-[mcp_servers.openrag]
-command = "openrag"
-args = ["mcp", "--stdio"]
-
-[mcp_servers.openrag.env]
-OPENRAG_API_KEY = "orag_your_api_key_here"
-OPENRAG_URL = "http://localhost:8080"
+### Codex
+```bash
+openrag connect codex     # same as:
+codex mcp add openrag --url http://localhost:8080/mcp --bearer-token-env-var OPENRAG_API_KEY
+export OPENRAG_API_KEY=orag_…   # Codex reads the key from this variable
 ```
 
 ---
