@@ -181,6 +181,9 @@ pub struct PipelineConfig {
     pub store: StoreConfig,
     pub retrieve: RetrieveConfig,
     pub llm: LlmConfig,
+    /// Air-gapped profile only: extra hosts the server may call (see [`crate::egress`]).
+    #[serde(default)]
+    pub egress: crate::egress::EgressConfig,
 }
 
 impl PipelineConfig {
@@ -205,6 +208,7 @@ impl PipelineConfig {
         if self.version == 0 {
             return Err(OpenRagError::Config("pipeline version must be >= 1".into()));
         }
+        self.egress.targets()?;
         if self.store.dim != 256 {
             return Err(OpenRagError::Config(format!(
                 "store.dim must be 256, got {}",

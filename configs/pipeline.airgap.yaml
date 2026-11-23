@@ -87,3 +87,9 @@ llm:
   local_model: ""
   local_only_min_auth_level: 1
   require_pii_masked_for_external: true
+
+# Outbound HTTP in this profile goes only to the endpoints configured through the environment
+# (OPENRAG_LOCAL_LLM_URL, OPENRAG_TEXT_EMBED_URL, OPENRAG_SCHIFT_OCR_URL, OPENRAG_S3_ENDPOINT).
+# List any other host the server must reach: "host" (any port), "host:port" or a URL.
+egress:
+  allow: []

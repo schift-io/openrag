@@ -17,6 +17,7 @@ pub mod api_app;
 pub mod api_core;
 pub mod api_studio;
 pub mod auth;
+pub mod egress;
 pub mod cli;
 pub mod error;
 pub mod llm_cli;

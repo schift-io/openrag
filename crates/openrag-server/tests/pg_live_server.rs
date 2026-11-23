@@ -924,8 +924,26 @@ async fn pg_live_m4c1_end_to_end_core_http_router() -> anyhow::Result<()> {
     .await?;
     assert_eq!(ag_status, StatusCode::OK);
     assert_eq!(ag_json["provider"], "vllm_local");
+
+    // Air-gapped egress: a live call to a provider host outside the allowlist never leaves,
+    // and goes through once egress.allow names it.
+    let egress_app = build_router(state.with_mode_and_transport(
+        OpenRagMode::Live,
+        Arc::new(EchoVllmTransport) as Arc<dyn LlmHttpTransport>,
+    ));
+    let ask = json!({"model": "openrag-auto", "bucket_id": bid7, "messages": [{"role": "user", "content": "망분리"}]});
+    let (eg_status, _, eg_txt) =
+        send_json(&egress_app, Method::POST, "/v1/chat/completions", Some(&l7_key), Some(ask.clone())).await?;
+    assert_eq!(eg_status, StatusCode::FORBIDDEN, "{eg_txt}");
+    assert!(eg_txt.contains("egress to 127.0.0.1:8000 is not allowed"), "{eg_txt}");
+    state.pipeline_config.write().await.egress.allow = vec!["127.0.0.1:8000".into()];
+    let (eg_ok_status, eg_ok_json, eg_ok_txt) =
+        send_json(&egress_app, Method::POST, "/v1/chat/completions", Some(&l7_key), Some(ask)).await?;
+    assert_eq!(eg_ok_status, StatusCode::OK, "{eg_ok_txt}");
+    assert_eq!(eg_ok_json["provider"], "vllm_local");
     {
         let mut cfg = state.pipeline_config.write().await;
+        cfg.egress.allow.clear();
         cfg.profile = PipelineProfile::Standard;
     }
 

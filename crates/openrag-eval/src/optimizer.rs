@@ -131,6 +131,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             local_only_min_auth_level: AuthLevel::try_from(8_u8).unwrap_or(AuthLevel::MAX),
             require_pii_masked_for_external: true,
         },
+        egress: Default::default(),
     }
 }
 

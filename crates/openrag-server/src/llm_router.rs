@@ -1036,7 +1036,13 @@ async fn execute_provider_completion(
     prompt: &str,
     hits: &[SearchHit],
 ) -> Result<String, OpenRagError> {
+    let airgap = state.pipeline_config.read().await.profile == PipelineProfile::Airgap;
     if matches!(provider_type, "claude_cli" | "codex_cli") && state.mode != OpenRagMode::Offline {
+        if airgap {
+            return Err(OpenRagError::Forbidden(format!(
+                "{provider_type} sends the prompt to Anthropic / OpenAI; not available in the air-gapped profile"
+            )));
+        }
         return crate::llm_cli::run_cli_completion(
             provider_type,
             model_id,
@@ -1103,6 +1109,9 @@ async fn execute_provider_completion(
             ],
             "temperature": 0.1
         });
+        if airgap {
+            crate::egress::check(&*state.pipeline_config.read().await, &url)?;
+        }
         let (status, body_text) = state
             .llm_transport
             .post_json(&url, api_key.as_deref(), &req_body)

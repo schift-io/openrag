@@ -13,8 +13,8 @@
 ```text
 User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
    │
-   ├─► Tier 1 User Console (/app) ──► Zero-jargon workspace (Chat, Upload, Wiki, Memory, Connect)
-   ├─► Tier 2 Ops Studio (/studio) ─► Pipeline YAML, Engine Switcher, IAM Simulator, Guard, Bench
+   ├─► App API (/api/app) ──► Chat, Upload, Wiki, Memory, Connect (backend for a user console)
+   ├─► Studio API (/api/studio) ─► Pipeline YAML, Engine Switcher, IAM Simulator, Guard, Bench
    ├─► HTTP API (/v2/buckets, /v1/chat/completions, /v1/eval/ab-search, /mcp)
    └─► Local Stdio MCP (openrag mcp --stdio / openrag-mcp)
                                      │
@@ -27,7 +27,7 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
    │  • M4 CCLG Memory Patch Ledger & DB-Native Wiki (KoParaRel + .md)  │
    │  • M5 Incremental Outbox (SHA-256 No-Op, Watermarks, Quarantine)   │
    │  • M6 256d Multi-Space Hybrid Retriever (RRF/Convex) & Admission   │
-   │  • M7 Policy LLM Router (L8+ -> Local vLLM; Masked -> OpenRouter)  │
+   │  • M7 Policy LLM Router (no bundled LLM; L8+ -> on-prem only)      │
    │  • M8 4-Axis Golden Set, 3-Track Bench & AutoRAG Greedy Optimizer  │
    └─────────────────────────────────┬──────────────────────────────────┘
                                      ▼
@@ -42,7 +42,7 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
    - Unified authorization across **ARN** (`arn:openrag:<org>:<dept_path>:<scope>:<type>:L<1..10>/<id>`), **Permission Groups** (`iam.groups`, `iam.group_members`, `iam.resource_group_bindings`), and **Permission Levels** (`auth_level 1..10`), enforcing Explicit Deny > Allow and strict `dept_admin` vs `peer` isolation on `private` resources in PostgreSQL Fail-Closed RLS (`FORCE ROW LEVEL SECURITY`) and Rust `openrag-iam`.
    - 2-Stage AES-256-GCM PII Capsule (`schift-ko-pii-v7`, optional `ko-pii`, custom dictionaries), **Configurable PII & Safe-Word Guard** (`allow` | `warn` | `mask` | `block` across `inbound_query`, `llm_egress`, `mcp_egress`, `ingestion_gate`), and **Cascade Redaction** (text + thumbnail BBox black-box pixel masking + immutable audit trail).
 4. **Living Knowledge & Incremental Outbox**: CCLG-style immutable `memory.episodes` + `memory.entries` + `memory.patches` (`amend`/`supersede`/`retract`/`redact`/`promote_scope`/`promote_wiki`), DB-Native LLM Wiki with KoParaRel 6-label edges and `.md`/Obsidian bidirectional sync, and `indexing.outbox` SHA-256 No-Op skip, watermarks, and 3-attempt quarantine.
-5. **AutoRAG Greedy Optimizer & 2-Tier Console**: Declarative `search_space.yaml` greedy node optimization with mandatory hard security gates (`0 PII leak`, `0 ARN/Group/Level violation`) and strict separation between Tier 1 `/app` (zero technical jargon) and Tier 2 `/studio`.
+5. **AutoRAG Greedy Optimizer & 2-Tier API**: Declarative `search_space.yaml` greedy node optimization with mandatory hard security gates (`0 PII leak`, `0 ARN/Group/Level violation`) and strict separation between the user-facing `/api/app` and the operator-only `/api/studio`.
 
 ---
 
@@ -96,7 +96,7 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 
 ## CLI & API Overview
 
-> Note: Core data models, database migrations/RLS, and 3-axis IAM engine (`openrag-core`, `openrag-db`, `openrag-iam`) are implemented in Milestone 1; the `openrag` CLI binary, HTTP API, MCP server, plugins, and Next.js 2-Tier Console are wired in subsequent milestones.
+> Note: OpenRAG ships no graphical console. Users reach it through MCP clients and the HTTP API; `/api/app` and `/api/studio` are the backends a console would call.
 
 ### `openrag` CLI
 - `openrag up --profile <standard|airgap>` — Start platform stack
@@ -108,10 +108,10 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 - `openrag bench {run|optimize}` & `openrag pipeline promote` — 3-Track Bench & AutoRAG optimizer
 - `openrag mcp --stdio` (or `openrag-mcp`) — Start local stdio MCP server
 
-### HTTP API & 2-Tier Console
+### HTTP API
 - **Core API**: `/v2/buckets` (CRUD, ingest, search), `/v1/chat/completions` (OpenAI & Docufinder Anything compatible), `/v1/eval/ab-search`, `/mcp` (Streamable HTTP JSON-RPC 2.0)
-- **Tier 1 User Console (`/app`)**: `/app/chat`, `/app/upload`, `/app/wiki`, `/app/memory`, `/app/connect`
-- **Tier 2 Admin/Ops Studio (`/studio`)**: Pipeline Studio, Index & Engine Ops, IAM/Groups/Levels/ARN Simulator, PII/Safe-Word Guard Sandbox & Cascade Redaction, Golden Set & AutoRAG Bench, Wiki/Plugins Ops
+- **App API (`/api/app`)**: `chat`, `upload`, `pages/{id}/thumbnail`, `wiki`, `memory`, `concepts`, `connect`, `feedback`
+- **Studio API (`/api/studio`, org admins)**: `pipeline`, `index`, `iam`, `pii` (guard sandbox, cascade redaction), `gateway`, `eval`, `wiki`, `knowledge`, `concepts`, `plugins`
 
 ---
 
@@ -134,7 +134,10 @@ provider is configured (otherwise HTTP 503):
   Anthropic / OpenAI, so it is an external provider: masked PII only, up to L7.
 
 These seed an org's providers the first time it asks for an answer; change them later in
-`gateway.providers`.
+`gateway.providers`. In the air-gapped profile the server calls only the hosts it is configured
+with (`OPENRAG_LOCAL_LLM_URL`, `OPENRAG_TEXT_EMBED_URL`, `OPENRAG_SCHIFT_OCR_URL`,
+`OPENRAG_S3_ENDPOINT`) plus `egress.allow` in `configs/pipeline.airgap.yaml`; a provider pointed
+anywhere else is refused with 403, and the CLI providers are off.
 
 ### Exposed MCP Tools (9)
 - `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)

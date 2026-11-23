@@ -1,6 +1,7 @@
 pub mod access;
 pub mod arn;
 pub mod config;
+pub mod egress;
 pub mod error;
 pub mod geometry;
 pub mod guard;
@@ -14,6 +15,7 @@ pub use config::{
     PipelineProfile, RetrieveConfig, SearchSpaceConfig, SecurityGateConfig, StoreConfig,
     ThumbnailConfig,
 };
+pub use egress::{EgressConfig, EgressTarget};
 pub use error::{OpenRagError, Result};
 pub use geometry::BBoxNorm1000;
 pub use guard::{

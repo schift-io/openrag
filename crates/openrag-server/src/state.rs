@@ -191,6 +191,17 @@ impl AppState {
         };
 
         let pipeline = load_pipeline_config_from_env()?;
+        if pipeline.profile == openrag_core::PipelineProfile::Airgap {
+            let allowed: Vec<String> = crate::egress::configured_targets()
+                .into_iter()
+                .chain(pipeline.egress.targets()?)
+                .map(|t| match t.port {
+                    Some(p) => format!("{}:{p}", t.host),
+                    None => t.host,
+                })
+                .collect();
+            tracing::info!(?allowed, "air-gapped profile: outbound HTTP limited to these hosts");
+        }
         let search_space_config = load_search_space_config_from_env()?;
         let master_kek = resolve_master_kek()?;
 
@@ -661,6 +672,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             local_only_min_auth_level: AuthLevel::new(8).unwrap_or(AuthLevel::MAX),
             require_pii_masked_for_external: true,
         },
+        egress: Default::default(),
     }
 }
 
