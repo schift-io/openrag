@@ -66,7 +66,8 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
 ```
 
 The API runs as one process (it drains the indexing outbox inline; there is no worker service).
-Page thumbnails and figure crops go to an S3 bucket: the bundled `object-store` service (RustFS) by default, or any
+Page thumbnails and figure crops are off by default (`thumbnail.enabled: false`): nothing shows them
+yet. When enabled they go to an S3 bucket: the bundled `object-store` service (RustFS), or any
 S3-compatible store through `OPENRAG_S3_ENDPOINT`, `OPENRAG_S3_BUCKET`, `OPENRAG_S3_REGION`,
 `OPENRAG_S3_ACCESS_KEY_ID`, `OPENRAG_S3_SECRET_ACCESS_KEY` and `OPENRAG_S3_URL_STYLE` (`path` | `virtual`).
 
@@ -110,7 +111,7 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 
 ### HTTP API
 - **Core API**: `/v2/buckets` (CRUD, ingest, search), `/v1/chat/completions` (OpenAI & Docufinder Anything compatible), `/v1/eval/ab-search`, `/mcp` (Streamable HTTP JSON-RPC 2.0)
-- **App API (`/api/app`)**: `chat`, `upload`, `pages/{id}/thumbnail`, `wiki`, `memory`, `concepts`, `connect`, `feedback`
+- **App API (`/api/app`)**: `chat`, `upload`, `pages/{id}/thumbnail` (404 while thumbnails are off), `wiki`, `memory`, `concepts`, `connect`, `feedback`
 - **Studio API (`/api/studio`, org admins)**: `pipeline`, `index`, `iam`, `pii` (guard sandbox, cascade redaction), `gateway`, `eval`, `wiki`, `knowledge`, `concepts`, `plugins`
 
 ---

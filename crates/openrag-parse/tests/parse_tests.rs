@@ -37,6 +37,7 @@ fn default_parse_cfg() -> ParseConfig {
 
 fn default_thumb_cfg() -> ThumbnailConfig {
     ThumbnailConfig {
+        enabled: true,
         format: "webp".into(),
         max_edge_px: 1280,
         figure_max_edge_px: 1280,

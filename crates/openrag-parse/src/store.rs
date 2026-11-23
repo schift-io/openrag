@@ -43,7 +43,7 @@ impl ParsePersister {
         thumbs: &[RenderedPageThumbnail],
         blob_store: &dyn ThumbnailBlobStore,
     ) -> Result<PersistedDocumentIds, OpenRagError> {
-        if doc.pages.len() != thumbs.len() {
+        if !thumbs.is_empty() && doc.pages.len() != thumbs.len() {
             return Err(OpenRagError::Validation(format!(
                 "pages count ({}) must match thumbnails count ({})",
                 doc.pages.len(),
@@ -124,7 +124,9 @@ impl ParsePersister {
         let mut thumb_uris = Vec::with_capacity(doc.pages.len());
         let mut figure_uris = Vec::new();
 
-        for (page, thumb) in doc.pages.iter().zip(thumbs.iter()) {
+        // `thumbs` is empty when thumbnails are off: pages are stored without them.
+        for (idx, page) in doc.pages.iter().enumerate() {
+            let thumb = thumbs.get(idx);
             let page_id = Uuid::now_v7();
             let page_arn = Arn::new(
                 &input.org_slug,
@@ -136,8 +138,13 @@ impl ParsePersister {
             )?
             .to_canonical();
 
-            let thumb_key = format!("{}/{doc_id}/page-{:03}.webp", input.org_id, page.page_no);
-            let thumb_uri = blob_store.put_bytes(&thumb_key, &thumb.webp_bytes).await?;
+            let thumb_uri = match thumb {
+                Some(t) => {
+                    let key = format!("{}/{doc_id}/page-{:03}.webp", input.org_id, page.page_no);
+                    Some(blob_store.put_bytes(&key, &t.webp_bytes).await?)
+                }
+                None => None,
+            };
 
             let page_state = serde_json::json!({
                 "tables_html": page.tables_html,
@@ -183,9 +190,9 @@ impl ParsePersister {
             })?;
 
             page_ids.push(page_id);
-            thumb_uris.push(thumb_uri);
+            thumb_uris.extend(thumb_uri);
 
-            for fig in &thumb.figures {
+            for fig in thumb.map(|t| t.figures.as_slice()).unwrap_or_default() {
                 let fig_id = Uuid::now_v7();
                 let fig_arn = Arn::new(
                     &input.org_slug,

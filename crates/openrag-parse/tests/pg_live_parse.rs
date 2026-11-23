@@ -108,6 +108,7 @@ async fn live_parse_persist_under_rls_and_peer_isolation() -> Result<(), Box<dyn
         reject_zdr_with_batch: true,
     };
     let thumb_cfg = ThumbnailConfig {
+        enabled: true,
         format: "webp".into(),
         max_edge_px: 1280,
         figure_max_edge_px: 1280,

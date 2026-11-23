@@ -3979,6 +3979,8 @@ async fn pg_live_m4c2_app_console_upload_chat_thumb_feedback_wiki_memory_and_con
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("WORKER_DATABASE_URL / DATABASE_URL required"))?
         .clone();
+    // This test covers page thumbnails, which are off by default.
+    state.pipeline_config.write().await.thumbnail.enabled = true;
     let app = build_router(Arc::clone(&state));
     let seeded = seed_org(&worker_pool).await?;
     let admin_key = mint_key(&app, &worker_pool, seeded.org_id, seeded.admin_id, None, vec![]).await?;
@@ -4346,6 +4348,8 @@ async fn pg_live_m4c2_studio_admin_gate_pipeline_index_iam_sim_pii_guard_and_cas
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("WORKER_DATABASE_URL / DATABASE_URL required"))?
         .clone();
+    // This test covers page thumbnails, which are off by default.
+    state.pipeline_config.write().await.thumbnail.enabled = true;
     let app = build_router(Arc::clone(&state));
     let seeded = seed_org(&worker_pool).await?;
     let admin_key = mint_key(&app, &worker_pool, seeded.org_id, seeded.admin_id, None, vec![]).await?;

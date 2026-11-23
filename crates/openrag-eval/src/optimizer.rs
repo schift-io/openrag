@@ -50,6 +50,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             reject_zdr_with_batch: true,
         },
         thumbnail: ThumbnailConfig {
+            enabled: false,
             format: "webp".into(),
             max_edge_px: 1600,
             figure_max_edge_px: 1280,
@@ -283,6 +284,7 @@ struct TolerantParseConfig {
 
 #[derive(Debug, Deserialize)]
 struct TolerantThumbnailConfig {
+    enabled: Option<bool>,
     format: Option<String>,
     max_edge_px: Option<u32>,
     figure_max_edge_px: Option<u32>,
@@ -446,6 +448,9 @@ pub fn parse_pipeline_yaml_with_profile(
         }
         if let Some(v) = t.figure_max_edge_px {
             cfg.thumbnail.figure_max_edge_px = v;
+        }
+        if let Some(v) = t.enabled {
+            cfg.thumbnail.enabled = v;
         }
         if let Some(v) = t.figure_max_bytes {
             cfg.thumbnail.figure_max_bytes = v;

@@ -784,10 +784,13 @@ pub(crate) async fn ingest_document_into_bucket(
         page.raw_markdown = neutralize_literal_pii_tokens(&page.raw_markdown);
     }
 
-    let thumbs =
+    let thumbs = if pipeline.thumbnail.enabled {
         state
             .thumbnailer
-            .render(&parsed, source_bytes_opt.as_deref(), &pipeline.thumbnail)?;
+            .render(&parsed, source_bytes_opt.as_deref(), &pipeline.thumbnail)?
+    } else {
+        Vec::new()
+    };
 
     let worker_pool = state.require_worker_pool()?;
     let app_pool = state.require_app_pool()?;

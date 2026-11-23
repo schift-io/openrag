@@ -14,7 +14,10 @@ parse:
       required_mode: private
   reject_zdr_with_batch: true
 
+# Page thumbnails and figure crops are for a UI; nothing shows them yet. When enabled they are
+# written to the object store (OPENRAG_S3_* / OPENRAG_BLOB_DIR).
 thumbnail:
+  enabled: false
   format: webp
   max_edge_px: 1600
   figure_max_edge_px: 1280

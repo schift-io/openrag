@@ -597,6 +597,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             reject_zdr_with_batch: true,
         },
         thumbnail: ThumbnailConfig {
+            enabled: false,
             format: "webp".into(),
             max_edge_px: 1600,
             figure_max_edge_px: 1280,

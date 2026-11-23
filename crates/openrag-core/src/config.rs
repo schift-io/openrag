@@ -37,8 +37,12 @@ pub struct ParseConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// Page thumbnails and figure crops kept for display and PII masking; they are not embedded.
+/// Page thumbnails and figure crops, kept only for display; they are not embedded.
 pub struct ThumbnailConfig {
+    /// Render and store them at ingest. Off by default: nothing in the first release shows
+    /// them, and they are the only thing written to the object store.
+    #[serde(default)]
+    pub enabled: bool,
     pub format: String,
     pub max_edge_px: u32,
     pub figure_max_edge_px: u32,
