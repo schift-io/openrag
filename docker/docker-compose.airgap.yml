@@ -1,16 +1,21 @@
 # Air-gapped overlay: docker compose -f docker-compose.yml -f docker-compose.airgap.yml \
-#   --profile app --profile airgap up -d postgres vllm local-embed openrag-api
+#   --profile app --profile airgap up -d postgres minio local-embed openrag-api
 # (openrag-web is left out: its build context ../web is not in this repository.)
-# Every service sits on an internal network with no route out. Model weights come from a
-# Hugging Face hub cache mounted read-only at /models (AIRGAP_MODEL_DIR), filled beforehand with
+#
+# postgres, minio and local-embed sit on an internal network with no route out. openrag-api is
+# also on openrag_edge so clients can reach its port and it can reach the site's own LLM / OCR
+# servers. The embedding weights come from a Hugging Face hub cache mounted read-only at /models
+# (AIRGAP_MODEL_DIR), filled beforehand on a connected machine with
 #   hf download google/embeddinggemma-2 --cache-dir ./models
-#   hf download Qwen/Qwen2.5-32B-Instruct --cache-dir ./models
-# The LLM and the embeddings can be any OpenAI-compatible server: point AIRGAP_LLM_URL /
-# AIRGAP_EMBED_URL elsewhere and leave out the bundled vllm / local-embed services.
+# No LLM is bundled. Point AIRGAP_LLM_URL / AIRGAP_LLM_MODEL at the site's vLLM (or any
+# OpenAI-compatible chat completions server); left empty, /v1/chat/completions answers 503 and
+# MCP clients answer from rag_search. AIRGAP_EMBED_URL can likewise replace local-embed.
 networks:
   openrag_airgap:
     driver: bridge
     internal: true
+  openrag_edge:
+    driver: bridge
 
 services:
   postgres:
@@ -18,27 +23,6 @@ services:
 
   minio:
     networks: [openrag_airgap]
-
-  minio-init:
-    networks: [openrag_airgap]
-
-  vllm:
-    profiles: ["airgap"]
-    image: ${AIRGAP_VLLM_IMAGE:-vllm/vllm-openai:latest}
-    restart: unless-stopped
-    networks: [openrag_airgap]
-    environment:
-      HF_HUB_OFFLINE: "1"
-      HF_HUB_CACHE: /models
-    command:
-      - --model
-      - ${AIRGAP_LLM_MODEL:-Qwen/Qwen2.5-32B-Instruct}
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    volumes:
-      - ${AIRGAP_MODEL_DIR:-./models}:/models:ro
 
   local-embed:
     profiles: ["airgap"]
@@ -56,15 +40,14 @@ services:
       - ${AIRGAP_MODEL_DIR:-./models}:/models:ro
 
   openrag-api:
-    networks: [openrag_airgap]
+    networks: [openrag_airgap, openrag_edge]
     environment:
       OPENRAG_PIPELINE_CONFIG: /app/configs/pipeline.airgap.yaml
       OPENRAG_TEXT_EMBED_URL: ${AIRGAP_EMBED_URL:-http://local-embed:8082/v1/embeddings}
       OPENRAG_TEXT_EMBED_MODEL: ${AIRGAP_EMBED_MODEL:-google/embeddinggemma-2}
-      # On-prem LLM: vLLM or any OpenAI-compatible chat completions server
-      OPENRAG_LOCAL_LLM_URL: ${AIRGAP_LLM_URL:-http://vllm:8000/v1}
-      OPENRAG_LOCAL_LLM_MODEL: ${AIRGAP_LLM_MODEL:-Qwen/Qwen2.5-32B-Instruct}
-      OPENRAG_VLLM_LIVE: "1"
+      # The site's LLM server; both empty = no server-side LLM
+      OPENRAG_LOCAL_LLM_URL: ${AIRGAP_LLM_URL:-}
+      OPENRAG_LOCAL_LLM_MODEL: ${AIRGAP_LLM_MODEL:-}
       # OCR: a Schift OCR endpoint reachable from inside (on-prem Schift or a compatible server); empty = no OCR
       OPENRAG_SCHIFT_OCR_URL: ${AIRGAP_OCR_URL:-}
       SCHIFT_OCR_API_KEY: ${SCHIFT_OCR_API_KEY:-}

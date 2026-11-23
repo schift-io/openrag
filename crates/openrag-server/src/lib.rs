@@ -19,6 +19,7 @@ pub mod api_studio;
 pub mod auth;
 pub mod cli;
 pub mod error;
+pub mod llm_cli;
 pub mod llm_router;
 pub mod mcp;
 pub mod state;

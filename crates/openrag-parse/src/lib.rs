@@ -11,6 +11,7 @@ pub mod hwp;
 pub mod model;
 pub mod ocr;
 pub mod pdf;
+pub mod s3;
 pub mod store;
 pub mod thumbnail;
 
@@ -27,6 +28,7 @@ pub use ocr::{
     DEFAULT_SHARE_DAILY_LIMIT,
 };
 pub use pdf::parse_pdf_native;
+pub use s3::{S3BlobConfig, S3BlobStore};
 pub use store::{ParsePersister, PersistParsedDocumentInput, PersistedDocumentIds};
 pub use thumbnail::{
     encode_png_bounded, encode_webp, InMemoryBlobStore, LocalFsBlobStore, ThumbnailBlobStore,

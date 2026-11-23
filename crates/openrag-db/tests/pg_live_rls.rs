@@ -50,11 +50,11 @@ async fn live_run_migrations_on_fresh_database() -> Result<(), Box<dyn std::erro
 
     let fresh_pool = DbPool::connect(&fresh_url, 4).await?;
     let first = fresh_pool.run_migrations().await?;
-    assert_eq!(first.len(), 13);
+    assert_eq!(first.len(), 14);
 
     // Idempotent second run
     let second = fresh_pool.run_migrations().await?;
-    assert_eq!(second.len(), 13);
+    assert_eq!(second.len(), 14);
     assert_eq!(first, second);
 
     // Verify all 10 schemas exist

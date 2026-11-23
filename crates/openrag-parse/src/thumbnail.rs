@@ -10,9 +10,14 @@ use openrag_core::{BBoxNorm1000, OpenRagError, ThumbnailConfig};
 use crate::model::{ParsedDocument, ParsedFigure, ParsedPage, RenderedPageThumbnail};
 use crate::ocr::detect_foreground_blocks;
 
+/// Where page thumbnails and figure crops are kept: local files, memory (tests) or an S3 bucket.
+#[async_trait::async_trait]
 pub trait ThumbnailBlobStore: Send + Sync {
-    fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError>;
-    fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError>;
+    /// Store `bytes` under `key` and return the URI to keep in the database.
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError>;
+    /// Write `bytes` at a URI this store handed out, or one derived from it (`*.redacted.webp`).
+    async fn put_uri(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError>;
+    async fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError>;
 }
 
 #[derive(Debug, Clone)]
@@ -37,30 +42,39 @@ impl LocalFsBlobStore {
     }
 }
 
-impl ThumbnailBlobStore for LocalFsBlobStore {
-    fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError> {
-        let clean = key.trim_start_matches('/').replace("..", "_");
-        let path = self.root_dir.join(clean);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                OpenRagError::Internal(format!(
-                    "failed to create thumbnail dir '{}': {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-        std::fs::write(&path, bytes).map_err(|e| {
+async fn write_file(path: &Path, bytes: &[u8]) -> Result<(), OpenRagError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
             OpenRagError::Internal(format!(
-                "failed to write thumbnail '{}': {e}",
-                path.display()
+                "failed to create thumbnail dir '{}': {e}",
+                parent.display()
             ))
         })?;
+    }
+    tokio::fs::write(path, bytes).await.map_err(|e| {
+        OpenRagError::Internal(format!(
+            "failed to write thumbnail '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+#[async_trait::async_trait]
+impl ThumbnailBlobStore for LocalFsBlobStore {
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError> {
+        let clean = key.trim_start_matches('/').replace("..", "_");
+        let path = self.root_dir.join(clean);
+        write_file(&path, bytes).await?;
         Ok(path.to_string_lossy().into_owned())
     }
 
-    fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
+    async fn put_uri(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
+        write_file(Path::new(uri.strip_prefix("file://").unwrap_or(uri)), bytes).await
+    }
+
+    async fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
         let path_str = uri.strip_prefix("file://").unwrap_or(uri);
-        std::fs::read(path_str).map_err(|e| {
+        tokio::fs::read(path_str).await.map_err(|e| {
             OpenRagError::NotFound(format!("failed to read thumbnail '{uri}': {e}"))
         })
     }
@@ -77,17 +91,28 @@ impl InMemoryBlobStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ThumbnailBlobStore for InMemoryBlobStore {
-    fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError> {
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<String, OpenRagError> {
         let uri = format!("mem://{}", key.trim_start_matches('/'));
-        let mut guard = self.inner.lock().map_err(|_| {
-            OpenRagError::Internal("InMemoryBlobStore mutex poisoned".into())
-        })?;
-        guard.insert(uri.clone(), bytes.to_vec());
+        self.put_uri(&uri, bytes).await?;
         Ok(uri)
     }
 
-    fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
+    async fn put_uri(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
+        if !uri.starts_with("mem://") {
+            return Err(OpenRagError::Validation(format!(
+                "InMemoryBlobStore cannot write '{uri}'"
+            )));
+        }
+        let mut guard = self.inner.lock().map_err(|_| {
+            OpenRagError::Internal("InMemoryBlobStore mutex poisoned".into())
+        })?;
+        guard.insert(uri.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn get_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
         let guard = self.inner.lock().map_err(|_| {
             OpenRagError::Internal("InMemoryBlobStore mutex poisoned".into())
         })?;

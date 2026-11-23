@@ -87,6 +87,11 @@ pub const EMBEDDED_MIGRATIONS: &[MigrationSpec] = &[
         filename: "012_drop_page_figure_vectors.sql",
         sql: include_str!("../../../migrations/012_drop_page_figure_vectors.sql"),
     },
+    MigrationSpec {
+        version: "013",
+        filename: "013_llm_cli_providers.sql",
+        sql: include_str!("../../../migrations/013_llm_cli_providers.sql"),
+    },
 ];
 
 pub fn sha256_hex(input: &str) -> String {

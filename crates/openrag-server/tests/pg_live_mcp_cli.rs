@@ -64,6 +64,40 @@ struct Seed {
     denied_group_id: Uuid,
 }
 
+/// The two gateway providers these tests route between. OpenRAG seeds none on its own: providers
+/// come from the environment (`OPENRAG_LOCAL_LLM_*`, `OPENRAG_LLM_CLI`).
+async fn seed_test_providers(worker: &DbPool, org_id: Uuid) -> anyhow::Result<()> {
+    use openrag_server::llm_router::{seed_providers, ProviderSeed};
+    seed_providers(
+        worker,
+        org_id,
+        &[
+            ProviderSeed {
+                name: "openrouter".into(),
+                provider_type: "openrouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                model_id: "anthropic/claude-3.5-sonnet".into(),
+                is_on_premise: false,
+                max_auth_level: 7,
+                allow_unmasked_pii: false,
+                config: json!({ "api_key_env": "OPENROUTER_API_KEY" }),
+            },
+            ProviderSeed {
+                name: "vllm_local".into(),
+                provider_type: "vllm_local".into(),
+                base_url: "http://127.0.0.1:8000/v1".into(),
+                model_id: "Qwen/Qwen2.5-32B-Instruct".into(),
+                is_on_premise: true,
+                max_auth_level: 10,
+                allow_unmasked_pii: true,
+                config: json!({ "api_key_env": "VLLM_API_KEY" }),
+            },
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn seed(worker: &DbPool) -> anyhow::Result<Seed> {
     let org_id = Uuid::new_v4();
     let slug = format!("m4c3-{}", &org_id.simple().to_string()[..8]);
@@ -79,6 +113,7 @@ async fn seed(worker: &DbPool) -> anyhow::Result<Seed> {
         .bind(format!("Org {slug}"))
         .execute(worker.inner())
         .await?;
+    seed_test_providers(worker, org_id).await?;
     sqlx::query(
         "INSERT INTO iam.departments (id, org_id, name, arn_path) VALUES ($1, $2, 'Dept1', 'dept1'), ($3, $2, 'Dept2', 'dept2')",
     )

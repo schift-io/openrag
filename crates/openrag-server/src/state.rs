@@ -19,7 +19,8 @@ use openrag_memory::{
     MemoryBackend, MemoryGuardHook, MemoryRouter, PostgresMemoryBackend,
 };
 use openrag_parse::{
-    DocumentParser, InMemoryBlobStore, LocalFsBlobStore, SchiftOcrClient, ThumbnailBlobStore,
+    DocumentParser, InMemoryBlobStore, LocalFsBlobStore, S3BlobConfig, S3BlobStore, SchiftOcrClient,
+    ThumbnailBlobStore,
     Thumbnailer,
 };
 use openrag_pii::{
@@ -193,10 +194,7 @@ impl AppState {
         let search_space_config = load_search_space_config_from_env()?;
         let master_kek = resolve_master_kek()?;
 
-        let blob_store: Arc<dyn ThumbnailBlobStore> = match non_empty_env("OPENRAG_BLOB_DIR") {
-            Some(dir) => Arc::new(LocalFsBlobStore::new(Path::new(&dir))?),
-            None => Arc::new(InMemoryBlobStore::new()),
-        };
+        let blob_store = blob_store_from_env().await?;
 
         Self::build_with_parts(AppStateParts {
             mode,
@@ -429,6 +427,42 @@ impl AppState {
 /// OCR goes to a Schift OCR endpoint when `OPENRAG_SCHIFT_OCR_URL` is set: Schift's service, an
 /// on-prem Schift, or any server speaking its `/v1/run` API (key in `SCHIFT_OCR_API_KEY`).
 /// Unset, images fall back to local foreground-block detection.
+/// Thumbnail/figure storage: an S3 bucket when `OPENRAG_S3_BUCKET` is set (MinIO next to OpenRAG,
+/// or AWS S3 and other S3-compatible services), else files under `OPENRAG_BLOB_DIR`, else memory.
+async fn blob_store_from_env() -> Result<Arc<dyn ThumbnailBlobStore>, OpenRagError> {
+    if let Some(bucket) = non_empty_env("OPENRAG_S3_BUCKET") {
+        let require = |name: &str| {
+            non_empty_env(name).ok_or_else(|| {
+                OpenRagError::Config(format!("OPENRAG_S3_BUCKET is set, so {name} is required"))
+            })
+        };
+        let path_style = match non_empty_env("OPENRAG_S3_URL_STYLE").as_deref() {
+            None | Some("path") => true,
+            Some("virtual") => false,
+            Some(other) => {
+                return Err(OpenRagError::Config(format!(
+                    "OPENRAG_S3_URL_STYLE must be path or virtual, got '{other}'"
+                )))
+            }
+        };
+        let store = S3BlobStore::new(S3BlobConfig {
+            endpoint: require("OPENRAG_S3_ENDPOINT")?,
+            bucket,
+            region: non_empty_env("OPENRAG_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+            access_key_id: require("OPENRAG_S3_ACCESS_KEY_ID")?,
+            secret_access_key: require("OPENRAG_S3_SECRET_ACCESS_KEY")?,
+            path_style,
+        })?;
+        store.ensure_bucket().await?;
+        tracing::info!(bucket = store.bucket_name(), "thumbnails go to S3");
+        return Ok(Arc::new(store));
+    }
+    Ok(match non_empty_env("OPENRAG_BLOB_DIR") {
+        Some(dir) => Arc::new(LocalFsBlobStore::new(Path::new(&dir))?),
+        None => Arc::new(InMemoryBlobStore::new()),
+    })
+}
+
 fn document_parser_from_env() -> Result<DocumentParser, OpenRagError> {
     let mut parser = DocumentParser::new();
     if let Some(url) = non_empty_env("OPENRAG_SCHIFT_OCR_URL") {
@@ -445,8 +479,13 @@ pub fn non_empty_env(name: &str) -> Option<String> {
 }
 
 pub async fn ensure_migrations_if_needed(pool: &DbPool) -> Result<bool, OpenRagError> {
-    let (already_migrated, has_cli_codes, has_128d_vectors, has_page_vectors): (bool, bool, bool, bool) =
-        sqlx::query_as(
+    let (already_migrated, has_cli_codes, has_128d_vectors, has_page_vectors, has_cli_llm_types): (
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    ) = sqlx::query_as(
         "SELECT to_regclass('iam.orgs') IS NOT NULL AND to_regclass('wiki.concepts') IS NOT NULL,
                 to_regclass('iam.cli_auth_codes') IS NOT NULL,
                 EXISTS (SELECT 1 FROM pg_attribute
@@ -455,7 +494,11 @@ pub async fn ensure_migrations_if_needed(pool: &DbPool) -> Result<bool, OpenRagE
                           AND format_type(atttypid, atttypmod) = 'vector(128)'),
                 EXISTS (SELECT 1 FROM pg_attribute
                         WHERE attrelid = to_regclass('corpus.pages')
-                          AND attname = 'thumb_embedding' AND NOT attisdropped)",
+                          AND attname = 'thumb_embedding' AND NOT attisdropped),
+                EXISTS (SELECT 1 FROM pg_constraint
+                        WHERE conrelid = to_regclass('gateway.providers')
+                          AND conname = 'providers_provider_type_check'
+                          AND pg_get_constraintdef(oid) LIKE '%claude_cli%')",
     )
     .fetch_one(pool.inner())
     .await
@@ -483,6 +526,11 @@ pub async fn ensure_migrations_if_needed(pool: &DbPool) -> Result<bool, OpenRagE
     if has_page_vectors {
         // 012 drops the page thumbnail / figure vector columns: those are no longer embedded.
         apply_embedded_migration(pool, "012").await?;
+        applied = true;
+    }
+    if !has_cli_llm_types {
+        // 013 lets gateway.providers hold the claude_cli / codex_cli provider types.
+        apply_embedded_migration(pool, "013").await?;
         applied = true;
     }
     Ok(applied)

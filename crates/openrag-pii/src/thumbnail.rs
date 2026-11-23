@@ -3,9 +3,10 @@ use std::io::Cursor;
 use image::{DynamicImage, ImageFormat, Rgba};
 use openrag_core::{BBoxNorm1000, OpenRagError};
 
+#[async_trait::async_trait]
 pub trait ThumbnailStore: Send + Sync {
-    fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError>;
-    fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError>;
+    async fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError>;
+    async fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,20 +34,21 @@ impl LocalThumbnailStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ThumbnailStore for LocalThumbnailStore {
-    fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
+    async fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
         let path = Self::resolve_path(uri);
-        std::fs::read(path).map_err(|e| {
+        tokio::fs::read(path).await.map_err(|e| {
             OpenRagError::NotFound(format!("failed to read thumbnail '{uri}': {e}"))
         })
     }
 
-    fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
+    async fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
         let path_str = Self::resolve_path(uri);
         let path = std::path::Path::new(path_str);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     OpenRagError::Internal(format!(
                         "failed creating thumbnail directory '{}': {e}",
                         parent.display()
@@ -54,7 +56,7 @@ impl ThumbnailStore for LocalThumbnailStore {
                 })?;
             }
         }
-        std::fs::write(path, bytes).map_err(|e| {
+        tokio::fs::write(path, bytes).await.map_err(|e| {
             OpenRagError::Internal(format!("failed writing thumbnail '{uri}': {e}"))
         })
     }

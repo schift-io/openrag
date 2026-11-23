@@ -804,11 +804,11 @@ impl CascadeRedactor {
                     }
 
                     if !bboxes.is_empty() {
-                        let orig_bytes = thumb_store.read_bytes(src_uri)?;
+                        let orig_bytes = thumb_store.read_bytes(src_uri).await?;
                         let masked_bytes = mask_image_bboxes(&orig_bytes, &bboxes)?;
                         let out_uri = if is_hard_purge {
                             if let Some(orig) = thumb_uri.as_deref() {
-                                thumb_store.write_bytes(orig, &masked_bytes)?;
+                                thumb_store.write_bytes(orig, &masked_bytes).await?;
                             }
                             redacted_thumb_uri
                                 .clone()
@@ -818,7 +818,7 @@ impl CascadeRedactor {
                                 .clone()
                                 .unwrap_or_else(|| LocalThumbnailStore::derive_redacted_uri(src_uri))
                         };
-                        thumb_store.write_bytes(&out_uri, &masked_bytes)?;
+                        thumb_store.write_bytes(&out_uri, &masked_bytes).await?;
 
                         sqlx::query(
                             "UPDATE corpus.pages

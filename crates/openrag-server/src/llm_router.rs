@@ -180,28 +180,103 @@ pub async fn ensure_default_providers(
     if count > 0 {
         return Ok(());
     }
+    seed_providers(worker_pool, org_id, &configured_provider_seeds()).await
+}
 
-    // The on-prem provider speaks the OpenAI chat completions API: vLLM or any compatible server.
-    let local_url = crate::state::non_empty_env("OPENRAG_LOCAL_LLM_URL")
-        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
-    let local_model = crate::state::non_empty_env("OPENRAG_LOCAL_LLM_MODEL")
-        .unwrap_or_else(|| "Qwen/Qwen2.5-32B-Instruct".to_string());
-    sqlx::query(
-        "INSERT INTO gateway.providers (
-            org_id, name, provider_type, base_url, model_id,
-            is_on_premise, max_auth_level, allow_unmasked_pii, config, enabled
-         ) VALUES
-         ($1, 'openrouter', 'openrouter', 'https://openrouter.ai/api/v1', 'anthropic/claude-3.5-sonnet', false, 7, false, '{\"api_key_env\": \"OPENROUTER_API_KEY\"}'::jsonb, true),
-         ($1, 'vllm_local', 'vllm_local', $2, $3, true, 10, true, '{\"api_key_env\": \"VLLM_API_KEY\"}'::jsonb, true)
-         ON CONFLICT (org_id, name) DO NOTHING",
-    )
-    .bind(org_id)
-    .bind(&local_url)
-    .bind(&local_model)
-    .execute(worker_pool.inner())
-    .await
-    .map_err(|e| OpenRagError::Database(format!("failed seeding gateway.providers: {e}")))?;
+/// One `gateway.providers` row to create for an org.
+#[derive(Debug, Clone)]
+pub struct ProviderSeed {
+    pub name: String,
+    pub provider_type: String,
+    pub base_url: String,
+    pub model_id: String,
+    pub is_on_premise: bool,
+    pub max_auth_level: u8,
+    pub allow_unmasked_pii: bool,
+    pub config: Value,
+}
 
+/// Providers the environment configures. OpenRAG ships no default LLM: without these variables an
+/// org gets no provider, `/v1/chat/completions` and `rag_ask` answer 503, and answers come from the
+/// MCP client (Claude Code, Codex, ...) calling `rag_search`.
+///
+/// - `OPENRAG_LOCAL_LLM_URL` + `OPENRAG_LOCAL_LLM_MODEL`: an on-prem OpenAI-compatible chat
+///   completions server (vLLM or any compatible one).
+/// - `OPENRAG_LLM_CLI=claude|codex` (optional `OPENRAG_LLM_CLI_MODEL`, `OPENRAG_LLM_CLI_COMMAND`):
+///   the Claude Code or Codex CLI on this host, already logged in. It sends the prompt to
+///   Anthropic or OpenAI, so it counts as an external provider.
+pub fn configured_provider_seeds() -> Vec<ProviderSeed> {
+    let mut seeds = Vec::new();
+    match (
+        non_empty_env("OPENRAG_LOCAL_LLM_URL"),
+        non_empty_env("OPENRAG_LOCAL_LLM_MODEL"),
+    ) {
+        (Some(url), Some(model)) => seeds.push(ProviderSeed {
+            name: "vllm_local".into(),
+            provider_type: "vllm_local".into(),
+            base_url: url,
+            model_id: model,
+            is_on_premise: true,
+            max_auth_level: 10,
+            allow_unmasked_pii: true,
+            config: json!({ "api_key_env": "VLLM_API_KEY" }),
+        }),
+        (None, None) => {}
+        _ => tracing::warn!(
+            "OPENRAG_LOCAL_LLM_URL and OPENRAG_LOCAL_LLM_MODEL must be set together; no local LLM provider"
+        ),
+    }
+    if let Some(cli) = non_empty_env("OPENRAG_LLM_CLI") {
+        match cli.trim() {
+            kind @ ("claude" | "codex") => {
+                let mut config = json!({});
+                if let Some(command) = non_empty_env("OPENRAG_LLM_CLI_COMMAND") {
+                    config["command"] = json!(command);
+                }
+                seeds.push(ProviderSeed {
+                    name: format!("{kind}_cli"),
+                    provider_type: format!("{kind}_cli"),
+                    base_url: String::new(),
+                    model_id: non_empty_env("OPENRAG_LLM_CLI_MODEL").unwrap_or_default(),
+                    is_on_premise: false,
+                    max_auth_level: 7,
+                    allow_unmasked_pii: false,
+                    config,
+                });
+            }
+            other => tracing::warn!("OPENRAG_LLM_CLI={other} is not claude or codex; ignored"),
+        }
+    }
+    seeds
+}
+
+/// Insert `seeds` for `org_id`, skipping names the org already has.
+pub async fn seed_providers(
+    worker_pool: &DbPool,
+    org_id: Uuid,
+    seeds: &[ProviderSeed],
+) -> Result<(), OpenRagError> {
+    for seed in seeds {
+        sqlx::query(
+            "INSERT INTO gateway.providers (
+                org_id, name, provider_type, base_url, model_id,
+                is_on_premise, max_auth_level, allow_unmasked_pii, config, enabled
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+             ON CONFLICT (org_id, name) DO NOTHING",
+        )
+        .bind(org_id)
+        .bind(&seed.name)
+        .bind(&seed.provider_type)
+        .bind(&seed.base_url)
+        .bind(&seed.model_id)
+        .bind(seed.is_on_premise)
+        .bind(i16::from(seed.max_auth_level))
+        .bind(seed.allow_unmasked_pii)
+        .bind(&seed.config)
+        .execute(worker_pool.inner())
+        .await
+        .map_err(|e| OpenRagError::Database(format!("failed seeding gateway.providers: {e}")))?;
+    }
     Ok(())
 }
 
@@ -961,6 +1036,17 @@ async fn execute_provider_completion(
     prompt: &str,
     hits: &[SearchHit],
 ) -> Result<String, OpenRagError> {
+    if matches!(provider_type, "claude_cli" | "codex_cli") && state.mode != OpenRagMode::Offline {
+        return crate::llm_cli::run_cli_completion(
+            provider_type,
+            model_id,
+            cfg_json,
+            &grounded_system_prompt(hits),
+            prompt,
+        )
+        .await;
+    }
+
     let api_key_env = cfg_json
         .get("api_key_env")
         .and_then(|v| v.as_str())
@@ -1002,20 +1088,7 @@ async fn execute_provider_completion(
                 ),
             });
         }
-        let context_summary: String = hits
-            .iter()
-            .take(5)
-            .enumerate()
-            .map(|(i, h)| format!("[{}] {}", i + 1, h.text))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let sys_content = if context_summary.is_empty() {
-            "You are OpenRAG enterprise assistant. Answer concisely and accurately.".to_string()
-        } else {
-            format!(
-                "You are OpenRAG enterprise assistant. Answer using only the provided context:\n\n{context_summary}"
-            )
-        };
+        let sys_content = grounded_system_prompt(hits);
         let trimmed_base = base_url.trim_end_matches('/');
         let url = if trimmed_base.ends_with("/chat/completions") {
             trimmed_base.to_string()
@@ -1082,6 +1155,24 @@ async fn execute_provider_completion(
         lines.push(format!("[{}] {}: {}", idx + 1, label, excerpt));
     }
     Ok(lines.join("\n"))
+}
+
+/// System prompt carrying the top retrieved passages the answer must stay within.
+fn grounded_system_prompt(hits: &[SearchHit]) -> String {
+    let context_summary: String = hits
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(i, h)| format!("[{}] {}", i + 1, h.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if context_summary.is_empty() {
+        "You are OpenRAG enterprise assistant. Answer concisely and accurately.".to_string()
+    } else {
+        format!(
+            "You are OpenRAG enterprise assistant. Answer using only the provided context:\n\n{context_summary}"
+        )
+    }
 }
 
 fn rebuild_assembled_context(hits: &[SearchHit]) -> String {

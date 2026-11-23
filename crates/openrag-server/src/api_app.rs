@@ -414,16 +414,13 @@ async fn app_page_thumbnail_handler(
         .or(thumb_uri.as_deref())
         .ok_or_else(|| ApiError::not_found(format!("thumbnail for page {page_id} not found")))?;
 
-    let bytes = match state.blob_store.get_bytes(target_uri) {
+    let bytes = match state.blob_store.get_bytes(target_uri).await {
         Ok(b) => b,
-        Err(err) => {
-            if target_uri.starts_with("mem://") {
-                return Err(ApiError::from(err));
-            }
-            LocalThumbnailStore::new()
-                .read_bytes(target_uri)
-                .map_err(ApiError::from)?
-        }
+        Err(err) if crate::api_studio::is_store_uri(target_uri) => return Err(ApiError::from(err)),
+        Err(_) => LocalThumbnailStore::new()
+            .read_bytes(target_uri)
+            .await
+            .map_err(ApiError::from)?,
     };
 
     let mime = detect_image_mime(&bytes);

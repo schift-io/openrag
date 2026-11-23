@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 #[test]
 fn embedded_migrations_are_ordered_and_clean() {
-    assert_eq!(EMBEDDED_MIGRATIONS.len(), 13);
+    assert_eq!(EMBEDDED_MIGRATIONS.len(), 14);
     let expected = [
         ("000", "000_init.sql"),
         ("001", "001_iam_arn.sql"),
@@ -18,6 +18,7 @@ fn embedded_migrations_are_ordered_and_clean() {
         ("010", "010_guard_sk_key_pattern.sql"),
         ("011", "011_vector_dim_256.sql"),
         ("012", "012_drop_page_figure_vectors.sql"),
+        ("013", "013_llm_cli_providers.sql"),
     ];
 
     let excluded_db = ["schift", "db"].join("-");

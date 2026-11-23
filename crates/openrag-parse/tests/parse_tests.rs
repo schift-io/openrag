@@ -396,8 +396,8 @@ async fn f12_f13_image_ocr_webp_thumbnail_figure_crop_and_256d_embed() -> Result
 
     // Store in InMemoryBlobStore roundtrip
     let blob_store = InMemoryBlobStore::new();
-    let uri = blob_store.put_bytes("org/doc/page-001.webp", &t.webp_bytes)?;
-    assert_eq!(blob_store.get_bytes(&uri)?, t.webp_bytes);
+    let uri = blob_store.put_bytes("org/doc/page-001.webp", &t.webp_bytes).await?;
+    assert_eq!(blob_store.get_bytes(&uri).await?, t.webp_bytes);
     Ok(())
 }
 

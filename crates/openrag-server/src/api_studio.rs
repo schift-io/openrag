@@ -297,26 +297,26 @@ fn require_org_admin(principal: &PrincipalContext) -> Result<(), ApiError> {
 
 pub struct BlobThumbnailStoreAdapter(pub Arc<dyn ThumbnailBlobStore>);
 
+/// URIs only the configured blob store can serve; anything else is a local file path.
+pub fn is_store_uri(uri: &str) -> bool {
+    uri.starts_with("mem://") || uri.starts_with("s3://")
+}
+
+#[async_trait::async_trait]
 impl PiiThumbnailStore for BlobThumbnailStoreAdapter {
-    fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
-        match self.0.get_bytes(uri) {
+    async fn read_bytes(&self, uri: &str) -> Result<Vec<u8>, OpenRagError> {
+        match self.0.get_bytes(uri).await {
             Ok(bytes) => Ok(bytes),
-            Err(err) => {
-                if uri.starts_with("mem://") {
-                    Err(err)
-                } else {
-                    LocalThumbnailStore::new().read_bytes(uri)
-                }
-            }
+            Err(err) if is_store_uri(uri) => Err(err),
+            Err(_) => LocalThumbnailStore::new().read_bytes(uri).await,
         }
     }
 
-    fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
-        if let Some(key) = uri.strip_prefix("mem://") {
-            let _ = self.0.put_bytes(key, bytes)?;
-            Ok(())
+    async fn write_bytes(&self, uri: &str, bytes: &[u8]) -> Result<(), OpenRagError> {
+        if is_store_uri(uri) {
+            self.0.put_uri(uri, bytes).await
         } else {
-            LocalThumbnailStore::new().write_bytes(uri, bytes)
+            LocalThumbnailStore::new().write_bytes(uri, bytes).await
         }
     }
 }

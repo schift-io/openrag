@@ -78,10 +78,12 @@ retrieve:
   latest_revision_boost: 0.2
   admission_threshold: 0.4
 
+# No bundled LLM. The model is whatever OPENRAG_LOCAL_LLM_URL / OPENRAG_LOCAL_LLM_MODEL point at
+# (vLLM or any OpenAI-compatible server); without them answers come from the MCP client.
 llm:
   external_provider: vllm_local
-  external_model: "Qwen/Qwen2.5-32B-Instruct"
+  external_model: ""
   local_provider: vllm_local
-  local_model: "Qwen/Qwen2.5-32B-Instruct"
+  local_model: ""
   local_only_min_auth_level: 1
   require_pii_masked_for_external: true

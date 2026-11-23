@@ -427,8 +427,8 @@ async fn thumbnail_store_adapter_roundtrip_and_mask() -> anyhow::Result<()> {
         .map(|t| t.webp_bytes.clone())
         .ok_or_else(|| anyhow::anyhow!("missing rendered thumbnail"))?;
 
-    let orig_uri = blob_store.put_bytes("org/doc/page_1.webp", &orig_bytes)?;
-    let loaded = adapter.read_bytes(&orig_uri)?;
+    let orig_uri = blob_store.put_bytes("org/doc/page_1.webp", &orig_bytes).await?;
+    let loaded = adapter.read_bytes(&orig_uri).await?;
     assert_eq!(loaded, orig_bytes);
 
     let masked = mask_image_bboxes(
@@ -442,8 +442,8 @@ async fn thumbnail_store_adapter_roundtrip_and_mask() -> anyhow::Result<()> {
     )?;
     let redacted_uri = LocalThumbnailStore::derive_redacted_uri(&orig_uri);
     assert!(redacted_uri.ends_with(".redacted.webp"));
-    adapter.write_bytes(&redacted_uri, &masked)?;
-    assert_eq!(blob_store.get_bytes(&redacted_uri)?, masked);
+    adapter.write_bytes(&redacted_uri, &masked).await?;
+    assert_eq!(blob_store.get_bytes(&redacted_uri).await?, masked);
     assert_ne!(masked, orig_bytes, "full blackout must change the image");
 
     Ok(())

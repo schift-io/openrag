@@ -137,7 +137,7 @@ impl ParsePersister {
             .to_canonical();
 
             let thumb_key = format!("{}/{doc_id}/page-{:03}.webp", input.org_id, page.page_no);
-            let thumb_uri = blob_store.put_bytes(&thumb_key, &thumb.webp_bytes)?;
+            let thumb_uri = blob_store.put_bytes(&thumb_key, &thumb.webp_bytes).await?;
 
             let page_state = serde_json::json!({
                 "tables_html": page.tables_html,
@@ -198,7 +198,7 @@ impl ParsePersister {
                 .to_canonical();
 
                 let fig_key = format!("{}/{doc_id}/{}", input.org_id, fig.filename);
-                let fig_uri = blob_store.put_bytes(&fig_key, &fig.png_bytes)?;
+                let fig_uri = blob_store.put_bytes(&fig_key, &fig.png_bytes).await?;
                 let bbox_arr: Option<Vec<i32>> =
                     fig.bbox_norm_1000.map(|b| b.to_array().to_vec());
 

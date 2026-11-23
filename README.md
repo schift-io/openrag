@@ -50,13 +50,25 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
 
 ### Option A: Standard Docker Stack
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # keep it: it wraps the PII vault keys
+docker compose -f docker/docker-compose.yml --profile app up -d postgres minio openrag-api
 ```
 
 ### Option B: Air-Gapped On-Premises Docker Stack
 ```bash
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.airgap.yml up -d
+# on a connected machine, from docker/: fetch the embedding weights into ./models
+hf download google/embeddinggemma-2 --cache-dir ./models
+# on the air-gapped host, from docker/
+export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
+export AIRGAP_LLM_URL=http://<vllm-host>:8000/v1 AIRGAP_LLM_MODEL=<served model>   # optional
+docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app --profile airgap \
+  up -d postgres minio local-embed openrag-api
 ```
+
+The API runs as one process (it drains the indexing outbox inline; there is no worker service).
+Page thumbnails and figure crops go to an S3 bucket: the bundled `minio` service by default, or any
+S3-compatible store through `OPENRAG_S3_ENDPOINT`, `OPENRAG_S3_BUCKET`, `OPENRAG_S3_REGION`,
+`OPENRAG_S3_ACCESS_KEY_ID`, `OPENRAG_S3_SECRET_ACCESS_KEY` and `OPENRAG_S3_URL_STYLE` (`path` | `virtual`).
 
 ### Option C: Local Rust & PostgreSQL 17 Verification
 Run all offline unit tests and strict lints:
@@ -106,6 +118,23 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 ## Connect External AI Clients via MCP
 
 OpenRAG exposes identical RAG, Wiki, Memory, and Guard capabilities over both **Local Stdio MCP** (`openrag mcp --stdio` / `openrag-mcp`) and **Streamable HTTP MCP** (`/mcp`). Every tool call enforces the caller's ARN, Permission Group, Permission Level, PostgreSQL RLS, and PII/Safe-Word Guard.
+
+### LLM
+
+OpenRAG bundles no LLM. By default the MCP client is the LLM: Claude Code, Codex or Cursor calls
+`rag_search` and writes the answer itself. `/v1/chat/completions` and `rag_ask` answer only when a
+provider is configured (otherwise HTTP 503):
+
+- `OPENRAG_LOCAL_LLM_URL` + `OPENRAG_LOCAL_LLM_MODEL` — an on-prem OpenAI-compatible chat completions
+  server (vLLM or any compatible one). Requests that must stay on-prem (all of them in the
+  air-gapped profile; L8+ or unmasked-PII ones in the standard profile) can only use this one.
+- `OPENRAG_LLM_CLI=claude` or `codex` (optional `OPENRAG_LLM_CLI_MODEL`, `OPENRAG_LLM_CLI_COMMAND`) —
+  runs the Claude Code (`claude -p`, no tools, no MCP servers) or Codex (`codex exec`, read-only
+  sandbox) CLI on the server host, logged in as the user the server runs as. The prompt leaves for
+  Anthropic / OpenAI, so it is an external provider: masked PII only, up to L7.
+
+These seed an org's providers the first time it asks for an answer; change them later in
+`gateway.providers`.
 
 ### Exposed MCP Tools (9)
 - `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)
