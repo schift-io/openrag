@@ -154,6 +154,7 @@ async fn app_chat_handler(
         include_citations: req.include_citations.unwrap_or(true),
         unmask_pii: req.unmask_pii,
         allow_unmasked_pii: req.allow_unmasked_pii,
+        keep_pii_tokens: false,
         admission_threshold: req.admission_threshold,
         top_k: req.top_k,
         latest_revision_only: false,

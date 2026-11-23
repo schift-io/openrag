@@ -31,17 +31,19 @@ pii:
     enabled: true
     default_action: mask
     allowlist: []
+    # PII category rules apply only on the way to an AI (llm_egress, mcp_egress), where the
+    # PII is replaced with tokens; stored data, search and the user's own query keep it.
     rules:
       - kind: pii_category
         pattern_or_category: rrn_kr
-        action: block
+        action: mask
         surfaces: [llm_egress, mcp_egress]
         enabled: true
         priority: 10
       - kind: pii_category
         pattern_or_category: phone_kr
         action: mask
-        surfaces: [inbound_query, llm_egress, mcp_egress, ingestion_gate]
+        surfaces: [llm_egress, mcp_egress]
         enabled: true
         priority: 20
       - kind: pii_category

@@ -142,6 +142,15 @@ with (`OPENRAG_LOCAL_LLM_URL`, `OPENRAG_TEXT_EMBED_URL`, `OPENRAG_SCHIFT_OCR_URL
 `OPENRAG_S3_ENDPOINT`) plus `egress.allow` in `configs/pipeline.airgap.yaml`; a provider pointed
 anywhere else is refused with 403, and the CLI providers are off.
 
+### PII
+
+Stored text, search, embeddings and the HTTP API keep PII as written: whoever may read a document
+sees it. PII is replaced with `[PII:<TYPE>:<hash>]` tokens only where text goes to an AI — the
+prompt and context sent to an LLM provider, and every MCP tool result. `/v1/chat/completions`
+answers come back with the original values; MCP `rag_ask` keeps the tokens. Names are detected
+after a label (`성명:`, `담당자:`, …) or an attached title (`김민준과장`); a bare name in running
+text is not.
+
 ### Exposed MCP Tools (9)
 - `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)
 - `rag_ask` — Grounded RAG Q&A through the policy-enforced LLM router

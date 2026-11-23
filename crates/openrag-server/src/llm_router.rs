@@ -111,6 +111,10 @@ pub struct LlmCompletionInput<'a> {
     pub include_citations: bool,
     pub unmask_pii: bool,
     pub allow_unmasked_pii: bool,
+    /// Return the answer and citations with the `[PII:…]` tokens the LLM saw instead of the
+    /// original values. Set when the caller is itself an AI (MCP `rag_ask`); a person asking
+    /// over HTTP gets the original values back.
+    pub keep_pii_tokens: bool,
     pub admission_threshold: Option<f32>,
     pub top_k: Option<usize>,
     /// Retrieve only documents in force at the reference time (`as_of`, default now).
@@ -536,6 +540,8 @@ pub async fn run_chat_completion(
         .iter()
         .map(extract_hit_pii_tokens)
         .collect();
+    // Token -> original value for everything sealed on the way to the LLM in this request.
+    let mut pii_restore: Vec<(String, String)> = Vec::new();
     let (mut effective_prompt, mut effective_context, pii_masked) =
         if pipeline.pii.capsule_enabled && !input.allow_unmasked_pii {
             let masked_prompt = seal_text_for_llm(
@@ -543,6 +549,7 @@ pub async fn run_chat_completion(
                 input.principal.org_id,
                 &pii_engine,
                 &sanitized_prompt,
+                &mut pii_restore,
             )
             .await?;
             for hit in &mut effective_hits {
@@ -551,6 +558,7 @@ pub async fn run_chat_completion(
                     input.principal.org_id,
                     &pii_engine,
                     &hit.text,
+                    &mut pii_restore,
                 )
                 .await?;
                 hit.snippet = seal_text_for_llm(
@@ -558,6 +566,7 @@ pub async fn run_chat_completion(
                     input.principal.org_id,
                     &pii_engine,
                     &hit.snippet,
+                    &mut pii_restore,
                 )
                 .await?;
             }
@@ -741,10 +750,12 @@ pub async fn run_chat_completion(
         };
 
     // Stage 6: Execute LLM call (live or deterministic offline mock)
-    let citations = if input.include_citations {
+    let citations = if !input.include_citations {
+        Vec::new()
+    } else if input.keep_pii_tokens {
         build_citations(&effective_hits)
     } else {
-        Vec::new()
+        build_citations(&search_resp.hits)
     };
 
     let mut answer = execute_provider_completion(
@@ -782,8 +793,13 @@ pub async fn run_chat_completion(
     if let Some(sanitized_out) = post_eval.sanitized_text {
         answer = sanitized_out;
     }
+    if !input.keep_pii_tokens {
+        answer = restore_pii_tokens(&answer, &pii_restore);
+    }
 
-    if input.unmask_pii {
+    // Tokens sealed in this request are already back to their values; the vault unmask
+    // below handles only tokens that came in some other way.
+    if input.unmask_pii && contains_pii_tokens(&answer) {
         if effective_hits.is_empty() || authorized_hit_tokens.is_empty() {
             if contains_pii_tokens(&answer) {
                 let reason = if effective_hits.is_empty() {
@@ -938,11 +954,16 @@ async fn resolve_bucket_meta(
     Ok((id, u8::try_from(min_level).unwrap_or(1).clamp(1, 10), arn))
 }
 
-async fn seal_text_for_llm(
+/// Replace the PII in `text` with `[PII:…]` tokens before it goes to an AI (LLM provider or
+/// MCP client). Stored data keeps its PII; this is the only place it is masked. Each
+/// (token, original) pair is appended to `restore` so the answer can be given back to the
+/// person with the original values.
+pub(crate) async fn seal_text_for_llm(
     state: &AppState,
     org_id: Uuid,
     pii_engine: &PiiEngine,
     text: &str,
+    restore: &mut Vec<(String, String)>,
 ) -> Result<String, OpenRagError> {
     if text.is_empty() {
         return Ok(String::new());
@@ -951,26 +972,65 @@ async fn seal_text_for_llm(
     if spans.is_empty() {
         return Ok(text.to_string());
     }
-    if let Some(worker_pool) = state.worker_pool.as_ref() {
-        let sealed = Capsule::mask_and_seal_pg(
+    let sealed = if let Some(worker_pool) = state.worker_pool.as_ref() {
+        Capsule::mask_and_seal_pg(
             worker_pool.inner(),
             text,
             &spans,
             org_id,
             &state.master_kek,
         )
-        .await?;
-        Ok(sealed.masked_text)
+        .await?
     } else {
-        let sealed = Capsule::mask_and_seal_in_memory(
+        Capsule::mask_and_seal_in_memory(
             text,
             &spans,
             org_id,
             &state.master_kek,
             &state.in_memory_vault,
-        )?;
-        Ok(sealed.masked_text)
+        )?
+    };
+    restore.extend(token_originals(text, &spans, &sealed));
+    Ok(sealed.masked_text)
+}
+
+/// (token, original) for each span `Capsule` replaced. It sorts spans by start and skips any
+/// that overlap an earlier one, emitting tokens in that order; this walks the spans the same way.
+fn token_originals(
+    text: &str,
+    spans: &[openrag_pii::PiiSpan],
+    sealed: &openrag_pii::SealedText,
+) -> Vec<(String, String)> {
+    let mut sorted: Vec<&openrag_pii::PiiSpan> = spans.iter().collect();
+    sorted.sort_by_key(|s| s.start_byte);
+    let mut cursor = 0usize;
+    let mut originals = Vec::with_capacity(sorted.len());
+    for span in sorted {
+        if span.start_byte < cursor || span.end_byte > text.len() {
+            continue;
+        }
+        if let Some(raw) = text.get(span.start_byte..span.end_byte) {
+            originals.push(raw.to_string());
+        }
+        cursor = span.end_byte;
     }
+    sealed
+        .tokens
+        .iter()
+        .map(|t| t.token.clone())
+        .zip(originals)
+        .collect()
+}
+
+/// Put the original values back for tokens sealed in this request; other tokens stay.
+pub(crate) fn restore_pii_tokens(text: &str, restore: &[(String, String)]) -> String {
+    let mut out = text.to_string();
+    for (token, original) in restore {
+        if out.contains(token.as_str()) {
+            out = out.replace(token.as_str(), original);
+        }
+    }
+    out
 }
 
 pub(crate) async fn persist_guard_event(
@@ -3066,6 +3126,7 @@ mod tests {
             include_citations: true,
             unmask_pii: false,
             allow_unmasked_pii: true,
+            keep_pii_tokens: false,
             admission_threshold: Some(0.0),
             top_k: Some(5),
             latest_revision_only: false,
@@ -3076,9 +3137,9 @@ mod tests {
         assert!(!res.answer.contains("bob@acme.test"));
         assert!(!res.answer.contains("ALPHA-MASK-TOKEN"));
         assert!(res.answer.contains("[REDACTED:EMAIL]") || res.answer.contains("[SAFE_MASKED]"));
+        // Citations go back to the person, not to the LLM: they carry the stored text.
         assert!(!res.citations.is_empty());
-        assert!(!res.citations[0].snippet.contains("bob@acme.test"));
-        assert!(!res.citations[0].snippet.contains("ALPHA-MASK-TOKEN"));
+        assert!(res.citations[0].snippet.contains("bob@acme.test"));
         Ok(())
     }
 
@@ -3599,6 +3660,7 @@ mod tests {
             include_citations: true,
             unmask_pii: true,
             allow_unmasked_pii: false,
+            keep_pii_tokens: false,
             admission_threshold: Some(0.0),
             top_k: Some(5),
             latest_revision_only: false,
@@ -3655,6 +3717,7 @@ mod tests {
             include_citations: true,
             unmask_pii: true,
             allow_unmasked_pii: false,
+            keep_pii_tokens: false,
             admission_threshold: Some(0.0),
             top_k: Some(5),
             latest_revision_only: false,

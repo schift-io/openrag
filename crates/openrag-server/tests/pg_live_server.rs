@@ -798,7 +798,8 @@ async fn pg_live_m4c1_end_to_end_core_http_router() -> anyhow::Result<()> {
     assert_eq!(c7_status, StatusCode::OK, "L7 chat failed: {c7_txt}");
     assert_eq!(c7_json["provider"], "openrouter");
     assert_eq!(c7_json["pii_masked"], true);
-    assert!(!c7_txt.contains("010-1234-5678"));
+    // The LLM saw a token; the answer comes back to the person with the stored value.
+    assert!(c7_txt.contains("010-1234-5678"));
 
     let (c8_status, c8_json, c8_txt) = send_json(
         &app,
@@ -1316,7 +1317,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing bucket id: {b_txt}"))?;
 
-    // 1a. L8 owner uploads dept doc -> unmask_pii: true succeeds and writes allowed=true audit log
+    // 1a. L8 owner uploads dept doc -> the answer carries the original values
     let (up8_status, _, up8_txt) = send_json(
         &app,
         Method::POST,
@@ -1352,17 +1353,10 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     assert!(u8_ans.contains("secret.ceo@acme.test"), "expected unmasked email in {u8_ans}");
     assert!(u8_ans.contains("010-5555-1212"), "expected unmasked phone in {u8_ans}");
 
-    let allowed_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pii.audit_logs
-         WHERE org_id = $1 AND principal_id = $2 AND allowed = true AND resource_arn IS NOT NULL",
-    )
-    .bind(seeded.org_id)
-    .bind(seeded.l8_id)
-    .fetch_one(worker_pool.inner())
-    .await?;
-    assert!(allowed_audits >= 1);
+    // Stored data keeps its PII; the LLM saw tokens sealed in this request and the answer comes
+    // back to the person with the original values, without a vault unmask.
 
-    // 1b. Dave (can_unmask_pii=true, IAM policy Deny pii:unmask) -> PII stays masked + allowed=false audit log
+    // 1b. Dave (IAM policy Deny pii:unmask) can read the doc -> original values; pii:unmask no longer gates answers
     let (dave_status, dave_json, _) = send_json(
         &app,
         Method::POST,
@@ -1380,8 +1374,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     let dave_ans = dave_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("");
-    assert!(!dave_ans.contains("secret.ceo@acme.test"));
-    assert!(dave_ans.contains("[PII:EMAIL:"));
+    assert!(dave_ans.contains("secret.ceo@acme.test"), "a reader gets the original values back: {dave_ans}");
 
     let dave_denied: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pii.audit_logs
@@ -1391,9 +1384,9 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(dave_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(dave_denied, 1);
+    assert_eq!(dave_denied, 0, "no vault unmask is attempted for tokens sealed in the request");
 
-    // 1c. L7 (can_unmask_pii=false) -> PII stays masked + principal_cannot_unmask_pii audit log
+    // 1c. L7 (can_unmask_pii=false) can read the doc -> original values
     let (l7u_status, l7u_json, _) = send_json(
         &app,
         Method::POST,
@@ -1411,7 +1404,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     let l7u_ans = l7u_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("");
-    assert!(!l7u_ans.contains("secret.ceo@acme.test"));
+    assert!(l7u_ans.contains("secret.ceo@acme.test"), "a reader gets the original values back: {l7u_ans}");
     let l7_denied: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pii.audit_logs
          WHERE org_id = $1 AND principal_id = $2 AND allowed = false AND reason = 'principal_cannot_unmask_pii'",
@@ -1420,7 +1413,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(seeded.l7_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(l7_denied, 1);
+    assert_eq!(l7_denied, 0);
 
     // 1d. Eve (can_unmask_pii=true) on group-scoped doc in its own bucket where resource_group_bindings lacks pii:unmask -> stays masked
     let (_, gb_json, _) = send_json(
@@ -1496,8 +1489,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     let eve1_ans = eve1_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("");
-    assert!(!eve1_ans.contains("group.owner@acme.test"));
-    assert!(eve1_ans.contains("[PII:EMAIL:"));
+    assert!(eve1_ans.contains("group.owner@acme.test"), "a reader gets the original values back: {eve1_ans}");
 
     let eve_denied: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pii.audit_logs
@@ -1507,7 +1499,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(eve_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(eve_denied, 1);
+    assert_eq!(eve_denied, 0);
 
     // Now add pii:unmask on document binding -> Eve unmasks
     sqlx::query(
@@ -1644,12 +1636,8 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
             .as_str()
             .unwrap_or("");
         assert!(
-            !oa_ans.contains("org.group@acme.test"),
-            "org_admin leaked PII on group-scoped doc in org bucket: {oa_ans}"
-        );
-        assert!(
-            oa_ans.contains("[PII:EMAIL:"),
-            "expected masked email token for org_admin in {oa_ans}"
+            oa_ans.contains("org.group@acme.test"),
+            "a reader gets the original values back: {oa_ans}"
         );
     }
 
@@ -1661,7 +1649,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(org_admin_only_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(org_admin_denied, 2);
+    assert_eq!(org_admin_denied, 0);
 
     // 1f. org_admin (is_org_admin=true, can_unmask_pii=true, dept_role='member', NOT dept_admin, NOT owner)
     // on Dept-scoped document AND Dept-scoped wiki page inside an Org-scoped bucket -> must NOT unmask via bucket scope_org_admin
@@ -1761,12 +1749,8 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
             .as_str()
             .unwrap_or("");
         assert!(
-            !oa_ans.contains(secret_email),
-            "org_admin leaked PII on dept-scoped resource in org bucket ({tag}): {oa_ans}"
-        );
-        assert!(
-            oa_ans.contains("[PII:EMAIL:"),
-            "expected masked email token for org_admin on dept-scoped resource ({tag}) in {oa_ans}"
+            oa_ans.contains(secret_email),
+            "a reader gets the original values back ({tag}): {oa_ans}"
         );
     }
 
@@ -1778,7 +1762,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(org_admin_dept_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(org_admin_dept_denied, 2);
+    assert_eq!(org_admin_dept_denied, 0);
 
     let org_admin_dept_allowed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pii.audit_logs
@@ -1837,6 +1821,8 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
             "model": "openrag-auto",
             "bucket_id": bid,
             "unmask_pii": true,
+            // As an AI caller (MCP rag_ask) would: the answer keeps the tokens the LLM saw.
+            "keep_pii_tokens": true,
             "messages": [{"role": "user", "content": "PAYROLLORACLE001"}],
         })),
     )
@@ -2007,6 +1993,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
             "model": "openrag-auto",
             "bucket_id": org_bid,
             "unmask_pii": false,
+            "keep_pii_tokens": true,
             "messages": [{"role": "user", "content": "OrgBucketGroupTag888"}],
         })),
     )
@@ -2079,7 +2066,7 @@ async fn pg_live_unmask_pii_and_llm_egress_guard_and_allow_unmasked() -> anyhow:
     .bind(org_admin_only_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert_eq!(oa_ro_denied_audits, 4, "expected 2 from 1e + 2 from 1g oracle attempts");
+    assert_eq!(oa_ro_denied_audits, 2, "expected 0 from 1e (readers get values back) + 2 from 1g oracle attempts");
 
     let oa_ro_allowed_audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pii.audit_logs
@@ -2783,11 +2770,11 @@ async fn pg_live_multipage_mask_sync_guard_rls_concepts_and_concurrency() -> any
     .bind(synced_doc_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert!(!p1_chunk_txt.contains("010-9876-5432"));
-    assert!(!p1_chunk_txt.contains("sync.user@acme.test"));
+    // PII is stored as is (it is masked only on the way to an AI); the ingestion-gate safe
+    // word rule still applies.
+    assert!(p1_chunk_txt.contains("010-9876-5432"));
+    assert!(p1_chunk_txt.contains("sync.user@acme.test"));
     assert!(!p1_chunk_txt.contains("MASK-PAGE2-SECRET"));
-    assert!(p1_chunk_txt.contains("[PII:PHONE:"));
-    assert!(p1_chunk_txt.contains("[PII:EMAIL:"));
     assert!(p1_chunk_txt.contains("[MASKED-SW]"));
 
     let chunk_spans_cnt: i64 = sqlx::query_scalar(
@@ -2799,7 +2786,7 @@ async fn pg_live_multipage_mask_sync_guard_rls_concepts_and_concurrency() -> any
     .bind(synced_doc_id)
     .fetch_one(worker_pool.inner())
     .await?;
-    assert!(chunk_spans_cnt >= 2);
+    assert_eq!(chunk_spans_cnt, 0, "nothing is sealed at ingest");
 
     // Repeat No-Op preserves indexing.watermarks.indexed_count
     let wm_before: i64 = sqlx::query_scalar(

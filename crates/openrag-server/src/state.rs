@@ -617,7 +617,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
                     GuardRuleConfig {
                         kind: GuardRuleKind::PiiCategory,
                         pattern_or_category: "rrn_kr".into(),
-                        action: GuardAction::Block,
+                        action: GuardAction::Mask,
                         surfaces: vec![GuardSurface::LlmEgress, GuardSurface::McpEgress],
                         replacement_text: None,
                         enabled: true,
@@ -627,12 +627,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
                         kind: GuardRuleKind::PiiCategory,
                         pattern_or_category: "phone_kr".into(),
                         action: GuardAction::Mask,
-                        surfaces: vec![
-                            GuardSurface::InboundQuery,
-                            GuardSurface::LlmEgress,
-                            GuardSurface::McpEgress,
-                            GuardSurface::IngestionGate,
-                        ],
+                        surfaces: vec![GuardSurface::LlmEgress, GuardSurface::McpEgress],
                         replacement_text: None,
                         enabled: true,
                         priority: 20,

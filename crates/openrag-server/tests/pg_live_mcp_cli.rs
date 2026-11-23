@@ -1010,3 +1010,94 @@ async fn pg_live_m4c3_migration_010_widens_seeded_sk_rule_only() -> anyhow::Resu
     assert_eq!(pattern_of(ids[1]).await?, custom_pattern);
     Ok(())
 }
+
+/// Records every request body sent to the LLM and answers with its system message, so the
+/// reply carries whatever context the LLM was given.
+struct RecordingTransport(tokio::sync::Mutex<Vec<String>>);
+
+#[async_trait]
+impl LlmHttpTransport for RecordingTransport {
+    async fn post_json(
+        &self,
+        _url: &str,
+        _bearer: Option<&str>,
+        body: &Value,
+    ) -> Result<(u16, String), OpenRagError> {
+        self.0.lock().await.push(body.to_string());
+        let sys = body["messages"][0]["content"].as_str().unwrap_or_default();
+        let reply = json!({"choices": [{"message": {"role": "assistant", "content": format!("ECHO {sys}")}}]});
+        Ok((200, reply.to_string()))
+    }
+}
+
+/// Stored data keeps its PII; it is masked only where it goes to an AI: the LLM request and
+/// every MCP tool result. A person asking over HTTP gets the original values back.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL"]
+async fn pg_live_pii_is_masked_only_on_the_way_to_an_ai() -> anyhow::Result<()> {
+    let base = AppState::from_env().await?;
+    let rec = Arc::new(RecordingTransport(tokio::sync::Mutex::new(Vec::new())));
+    let state = base.with_mode_and_transport(OpenRagMode::Live, Arc::clone(&rec) as Arc<dyn LlmHttpTransport>);
+    let worker = state.worker_pool.as_ref().ok_or_else(|| anyhow::anyhow!("worker pool required"))?.clone();
+    let app = build_router(Arc::clone(&state));
+    let s = seed(&worker).await?;
+    // Route to the on-prem provider through the recording transport.
+    sqlx::query("UPDATE gateway.providers SET enabled = false WHERE org_id = $1 AND name = 'openrouter'")
+        .bind(s.org_id)
+        .execute(worker.inner())
+        .await?;
+    let owner_key = mint(&app, &worker, s.org_id, s.owner_id, json!({})).await?;
+    let (email, phone, name) = ("hong.probe@acme.test", "010-2222-3333", "홍길동");
+
+    let bslug = format!("pii-{}", Uuid::new_v4().simple());
+    let r = send(&app, Method::POST, "/v2/buckets", Some(&owner_key), Some(json!({"slug": bslug, "name": "PII", "access_scope": "dept", "min_auth_level": 1, "dept_id": s.dept_id})), &[]).await?;
+    assert!(r.status.is_success(), "{}", r.text);
+    let bid = r.json["id"].as_str().unwrap_or_default().to_string();
+    let r = send(&app, Method::POST, &format!("/v2/buckets/{bid}/documents"), Some(&owner_key), Some(json!({"title": "PIIPROBE77 카드", "text": format!("PIIPROBE77 인사 기록\n성명: {name}\n이메일: {email}\n휴대전화: {phone}"), "access_scope": "dept", "min_auth_level": 1})), &[]).await?;
+    assert!(r.status.is_success(), "{}", r.text);
+    let doc_id = Uuid::parse_str(r.json["document_id"].as_str().or_else(|| r.json["id"].as_str()).unwrap_or_default())?;
+
+    let stored: String = sqlx::query_scalar("SELECT string_agg(redacted_text || ' ' || bm25_text, ' ') FROM corpus.chunks WHERE document_id = $1")
+        .bind(doc_id)
+        .fetch_one(worker.inner())
+        .await?;
+    for v in [email, phone, name] {
+        assert!(stored.contains(v), "stored text keeps {v}: {stored}");
+    }
+
+    // HTTP search: the person sees the stored text.
+    let r = send(&app, Method::POST, &format!("/v2/buckets/{bid}/search"), Some(&owner_key), Some(json!({"query": "PIIPROBE77 인사 기록"})), &[]).await?;
+    assert!(r.status.is_success() && r.text.contains(email), "{}", r.text);
+
+    // MCP rag_search: the AI gets tokens.
+    let mcp = engine(&state, &owner_key);
+    let out = call(&mcp, "rag_search", json!({"query": "PIIPROBE77 인사 기록", "bucket": bslug})).await?;
+    assert!(!out.is_error && out.text.contains("PIIPROBE77"), "{}", out.text);
+    for v in [email, phone, name] {
+        assert!(!out.text.contains(v), "MCP result leaked {v}: {}", out.text);
+    }
+    assert!(out.text.contains("[PII:EMAIL:"), "{}", out.text);
+
+    // HTTP chat: the LLM gets tokens, the person gets the values back.
+    let r = send(&app, Method::POST, "/v1/chat/completions", Some(&owner_key), Some(json!({"bucket_id": bid, "messages": [{"role": "user", "content": "PIIPROBE77 인사 기록"}]})), &[]).await?;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let sent = rec.0.lock().await.join("\n");
+    assert!(sent.contains("PIIPROBE77") && sent.contains("[PII:EMAIL:"), "LLM request: {sent}");
+    for v in [email, phone, name] {
+        assert!(!sent.contains(v), "LLM request leaked {v}: {sent}");
+    }
+    let answer = r.json["choices"][0]["message"]["content"].as_str().unwrap_or_default();
+    assert!(answer.contains(email) && !answer.contains("[PII:EMAIL:"), "answer: {answer}");
+
+    // MCP rag_ask: the AI caller keeps the tokens the LLM saw.
+    rec.0.lock().await.clear();
+    let out = call(&mcp, "rag_ask", json!({"query": "PIIPROBE77 인사 기록", "bucket": bslug})).await?;
+    assert!(!out.is_error, "{}", out.text);
+    for v in [email, phone, name] {
+        assert!(!out.text.contains(v), "rag_ask leaked {v}: {}", out.text);
+    }
+    assert!(out.text.contains("[PII:EMAIL:"), "{}", out.text);
+    let sent = rec.0.lock().await.join("\n");
+    assert!(!sent.is_empty() && !sent.contains(email), "LLM request: {sent}");
+    Ok(())
+}

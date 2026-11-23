@@ -28,8 +28,7 @@ use openrag_parse::{
     ParsePolicyCtx, ParsePersister, ParsedDocument, ParsedPage, PersistParsedDocumentInput,
 };
 use openrag_pii::{
-    Capsule, GuardEngine, GuardPolicyRuntime, GuardRepo, InMemoryConceptAliasLookup, PiiEngine,
-    PiiVaultRepo, StoredChunkSpanInput,
+    GuardEngine, GuardPolicyRuntime, GuardRepo, InMemoryConceptAliasLookup, PiiEngine,
 };
 use openrag_retrieve::{RetrieveSpace, SearchRequest};
 use openrag_store::{
@@ -951,7 +950,6 @@ pub(crate) async fn ingest_document_into_bucket(
     );
 
     let mut chunk_ids = Vec::new();
-    let mut pending_spans: Vec<(Uuid, Option<Uuid>, Vec<StoredChunkSpanInput>)> = Vec::new();
     let mut global_chunk_idx: i32 = 0;
 
     let mask_entire_doc = guard_decision.action == GuardAction::Mask;
@@ -1017,20 +1015,9 @@ pub(crate) async fn ingest_document_into_bucket(
             page.raw_markdown.clone()
         };
 
-        let page_spans = pii_engine.detect(&page_raw_text);
-        let final_page_redacted = if !page_spans.is_empty() {
-            let sealed_page = Capsule::mask_and_seal_pg(
-                worker_pool.inner(),
-                &page_raw_text,
-                &page_spans,
-                principal.org_id,
-                &state.master_kek,
-            )
-            .await?;
-            sealed_page.masked_text
-        } else {
-            page_raw_text.clone()
-        };
+        // PII is kept: stored text, BM25 and embeddings stay local. It is masked only on the
+        // way to an AI (LLM provider, MCP client); see llm_router::seal_text_for_llm.
+        let final_page_redacted = page_raw_text.clone();
         if final_page_redacted != page.raw_markdown {
             if let Some(pid) = page_id {
                 sqlx::query(
@@ -1055,18 +1042,8 @@ pub(crate) async fn ingest_document_into_bucket(
 
         let page_chunks = split_text_chunks(&page_raw_text, 1000, &doc_title);
         for chunk_text in page_chunks {
-            let spans = pii_engine.detect(&chunk_text);
-            let sealed = Capsule::mask_and_seal_pg(
-                worker_pool.inner(),
-                &chunk_text,
-                &spans,
-                principal.org_id,
-                &state.master_kek,
-            )
-            .await?;
-
-            let emb = state.text_embedder.embed_text(&sealed.masked_text).await?;
-            let text_hash = sha256_hex_str(&sealed.masked_text);
+            let emb = state.text_embedder.embed_text(&chunk_text).await?;
+            let text_hash = sha256_hex_str(&chunk_text);
             let chunk_id = Uuid::now_v7();
             let chunk_arn = Arn::new(
                 &org_slug,
@@ -1106,8 +1083,8 @@ pub(crate) async fn ingest_document_into_bucket(
             .bind(&chunk_arn)
             .bind(&acl_scope_key)
             .bind(global_chunk_idx)
-            .bind(&sealed.masked_text)
-            .bind(&sealed.masked_text)
+            .bind(&chunk_text)
+            .bind(&chunk_text)
             .bind(&table_html)
             .bind(&text_hash)
             .bind(Vector::from(emb))
@@ -1136,21 +1113,6 @@ pub(crate) async fn ingest_document_into_bucket(
             )
             .await?;
 
-            if !sealed.tokens.is_empty() {
-                let stored: Vec<StoredChunkSpanInput> = sealed
-                    .tokens
-                    .iter()
-                    .map(|tok| StoredChunkSpanInput {
-                        vault_entry_id: tok.vault_entry_id,
-                        entity_type: tok.entity_type.clone(),
-                        start_offset: tok.start_offset as i32,
-                        end_offset: tok.end_offset as i32,
-                        bbox_norm_1000: None,
-                    })
-                    .collect();
-                pending_spans.push((chunk_id, page_id, stored));
-            }
-
             chunk_ids.push(chunk_id);
             global_chunk_idx += 1;
         }
@@ -1167,17 +1129,6 @@ pub(crate) async fn ingest_document_into_bucket(
     tx.commit()
         .await
         .map_err(|e| OpenRagError::Database(format!("commit document ingestion tx: {e}")))?;
-
-    for (chunk_id, page_id, spans) in pending_spans {
-        PiiVaultRepo::record_chunk_spans(
-            worker_pool.inner(),
-            principal.org_id,
-            chunk_id,
-            page_id,
-            &spans,
-        )
-        .await?;
-    }
 
     let _ = OutboxWorker::default()
         .drain_for_org(
@@ -1582,12 +1533,10 @@ async fn sync_documents_handler(
         .await
         .map_err(ApiError::from)?;
 
-    let mut pending_spans: Vec<(Uuid, Option<Uuid>, Vec<StoredChunkSpanInput>)> = Vec::new();
     let mut pending_wiki_archives: Vec<(Uuid, String)> = Vec::new();
     let mut ctx = SyncContext {
         state: &state,
         app_pool,
-        worker_pool,
         principal: &principal,
         bucket: &bucket,
         org_slug: &org_slug,
@@ -1596,7 +1545,6 @@ async fn sync_documents_handler(
         policy: &policy,
         concept_lookup: &concept_lookup,
         uses_s3_vectors,
-        pending_spans: &mut pending_spans,
         pending_wiki_archives: &mut pending_wiki_archives,
     };
 
@@ -1682,18 +1630,6 @@ async fn sync_documents_handler(
         .map_err(|e| ApiError::from(OpenRagError::Database(format!("archive wiki.pages: {e}"))))?;
     }
 
-    for (chunk_id, page_id, spans) in pending_spans {
-        PiiVaultRepo::record_chunk_spans(
-            worker_pool.inner(),
-            principal.org_id,
-            chunk_id,
-            page_id,
-            &spans,
-        )
-        .await
-        .map_err(ApiError::from)?;
-    }
-
     if enqueued_any {
         let _ = OutboxWorker::default()
             .drain_for_org(
@@ -1719,7 +1655,6 @@ async fn sync_documents_handler(
 struct SyncContext<'a> {
     state: &'a AppState,
     app_pool: &'a DbPool,
-    worker_pool: &'a DbPool,
     principal: &'a PrincipalContext,
     bucket: &'a BucketRecord,
     org_slug: &'a str,
@@ -1728,7 +1663,6 @@ struct SyncContext<'a> {
     policy: &'a GuardPolicyRuntime,
     concept_lookup: &'a InMemoryConceptAliasLookup,
     uses_s3_vectors: bool,
-    pending_spans: &'a mut Vec<(Uuid, Option<Uuid>, Vec<StoredChunkSpanInput>)>,
     pending_wiki_archives: &'a mut Vec<(Uuid, String)>,
 }
 
@@ -1939,20 +1873,7 @@ async fn sync_wiki_item(
     } else {
         sanitized_body_md
     };
-    let pii_spans = ctx.pii_engine.detect(&guarded_body);
-    let effective_body = if pii_spans.is_empty() {
-        guarded_body
-    } else {
-        Capsule::mask_and_seal_pg(
-            ctx.worker_pool.inner(),
-            &guarded_body,
-            &pii_spans,
-            principal.org_id,
-            &state.master_kek,
-        )
-        .await?
-        .masked_text
-    };
+    let effective_body = guarded_body;
 
     let title = neutralize_literal_pii_tokens(
         item.title
@@ -2089,20 +2010,7 @@ async fn guard_and_seal_sync_page(
     } else {
         sanitized_raw
     };
-    let page_spans = ctx.pii_engine.detect(&guarded_page_text);
-    let final_page_redacted = if page_spans.is_empty() {
-        guarded_page_text.clone()
-    } else {
-        Capsule::mask_and_seal_pg(
-            ctx.worker_pool.inner(),
-            &guarded_page_text,
-            &page_spans,
-            ctx.principal.org_id,
-            &ctx.state.master_kek,
-        )
-        .await?
-        .masked_text
-    };
+    let final_page_redacted = guarded_page_text.clone();
     Ok((guarded_page_text, final_page_redacted))
 }
 
@@ -2390,7 +2298,6 @@ async fn sync_corpus_item(
                 .map_err(|e| OpenRagError::Database(format!("delete stale page chunks: {e}")))?;
 
                 let inserted = insert_sync_page_chunks(
-                    ctx,
                     tx,
                     SyncChunkInsertCtx {
                         principal,
@@ -2436,7 +2343,6 @@ async fn sync_corpus_item(
                 )
                 .await?;
                 let inserted = insert_sync_page_chunks(
-                    ctx,
                     tx,
                     SyncChunkInsertCtx {
                         principal,
@@ -2634,7 +2540,6 @@ async fn sync_corpus_item(
         )
         .await?;
         upserted_chunks += insert_sync_page_chunks(
-            ctx,
             tx,
             SyncChunkInsertCtx {
                 principal,
@@ -2753,7 +2658,6 @@ async fn insert_sync_page(
 }
 
 async fn insert_sync_page_chunks(
-    sync_ctx: &mut SyncContext<'_>,
     tx: &mut RlsTransaction<'_>,
     ctx: SyncChunkInsertCtx<'_>,
     guarded_page_text: &str,
@@ -2763,15 +2667,6 @@ async fn insert_sync_page_chunks(
     let chunks = split_text_chunks(&sanitized_page_text, 1000, ctx.title);
     let mut inserted = 0usize;
     for chunk_text in chunks {
-        let spans = sync_ctx.pii_engine.detect(&chunk_text);
-        let sealed = Capsule::mask_and_seal_pg(
-            sync_ctx.worker_pool.inner(),
-            &chunk_text,
-            &spans,
-            ctx.principal.org_id,
-            &sync_ctx.state.master_kek,
-        )
-        .await?;
 
         let chunk_id = Uuid::now_v7();
         let chunk_arn = Arn::new(
@@ -2783,8 +2678,8 @@ async fn insert_sync_page_chunks(
             chunk_id.to_string(),
         )?
         .to_canonical();
-        let text_hash = sha256_hex_str(&sealed.masked_text);
-        let emb = ctx.embedder.embed_text(&sealed.masked_text).await?;
+        let text_hash = sha256_hex_str(&chunk_text);
+        let emb = ctx.embedder.embed_text(&chunk_text).await?;
 
         sqlx::query(
             "INSERT INTO corpus.chunks (
@@ -2810,7 +2705,7 @@ async fn insert_sync_page_chunks(
         .bind(&chunk_arn)
         .bind(ctx.acl_scope_key)
         .bind(*next_chunk_idx)
-        .bind(&sealed.masked_text)
+        .bind(&chunk_text)
         .bind(&text_hash)
         .bind(Vector::from(emb))
         .bind(ctx.embed_model)
@@ -2835,23 +2730,6 @@ async fn insert_sync_page_chunks(
             false,
         )
         .await?;
-
-        if !sealed.tokens.is_empty() {
-            let stored: Vec<StoredChunkSpanInput> = sealed
-                .tokens
-                .iter()
-                .map(|tok| StoredChunkSpanInput {
-                    vault_entry_id: tok.vault_entry_id,
-                    entity_type: tok.entity_type.clone(),
-                    start_offset: tok.start_offset as i32,
-                    end_offset: tok.end_offset as i32,
-                    bbox_norm_1000: None,
-                })
-                .collect();
-            sync_ctx
-                .pending_spans
-                .push((chunk_id, Some(ctx.page_id), stored));
-        }
 
         *next_chunk_idx += 1;
         inserted += 1;
@@ -2880,6 +2758,9 @@ struct ChatCompletionsRequest {
     unmask_pii: bool,
     #[serde(default)]
     allow_unmasked_pii: bool,
+    /// Keep `[PII:…]` tokens in the answer (set by MCP `rag_ask`, whose caller is an AI).
+    #[serde(default)]
+    keep_pii_tokens: bool,
     admission_threshold: Option<f32>,
     top_k: Option<usize>,
     #[serde(default)]
@@ -2943,6 +2824,7 @@ async fn chat_completions_handler(
         include_citations: req.include_citations.unwrap_or(true),
         unmask_pii: req.unmask_pii,
         allow_unmasked_pii: req.allow_unmasked_pii,
+        keep_pii_tokens: req.keep_pii_tokens,
         admission_threshold: req.admission_threshold,
         top_k: req.top_k,
         latest_revision_only: req.latest_revision_only,

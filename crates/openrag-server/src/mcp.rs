@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::api_core::{resolve_bucket_rls, resolve_org_and_dept_paths};
 use crate::auth::{authenticate_bearer_token, enforce_api_key_arn_scope, AuthPrincipal, TrustedPrincipal};
-use crate::llm_router::neutralize_literal_pii_tokens;
+use crate::llm_router::{neutralize_literal_pii_tokens, seal_text_for_llm};
 use crate::state::AppState;
 
 /// The exact, ordered MCP tool registry.
@@ -315,7 +315,10 @@ impl McpEngine {
         };
 
         let outcome = match self.resolve_ctx().await {
-            Ok(ctx) => call_tool(&ctx, name, &args).await,
+            Ok(ctx) => match call_tool(&ctx, name, &args).await {
+                Ok(value) => seal_for_ai(&ctx, value).await,
+                Err(fail) => Err(fail),
+            },
             Err(fail) => Err(fail),
         };
         Ok(match outcome {
@@ -534,7 +537,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "rag_ingest",
             "Add a document",
-            "Ingest text (or, over local stdio only, a file path) into a bucket. Content passes the ingestion guard; PII is sealed into the vault.",
+            "Ingest text (or, over local stdio only, a file path) into a bucket. Content passes the ingestion guard and is stored as is; PII is masked whenever it is sent to an AI.",
             schema(
                 json!({
                     "bucket": str_prop("Bucket slug or id"),
@@ -979,6 +982,54 @@ pub(crate) fn build_multipart(
 }
 
 // ============================================================================
+// PII on the way out
+// ============================================================================
+
+/// Tool results go to the MCP client, which is an AI: mask the PII in every string value,
+/// the same way as on the way to an LLM provider (`seal_text_for_llm`). Stored data keeps it.
+async fn seal_for_ai(ctx: &ToolCtx, mut value: Value) -> Result<Value, ToolFailure> {
+    let mut strings = Vec::new();
+    collect_strings(&value, &mut strings);
+    if strings.is_empty() {
+        return Ok(value);
+    }
+    let pii = ctx.state.pii_engine.read().await.clone();
+    let mut unused_restore = Vec::new();
+    let mut sealed = Vec::with_capacity(strings.len());
+    for s in &strings {
+        sealed.push(
+            seal_text_for_llm(&ctx.state, ctx.principal.org_id, &pii, s, &mut unused_restore)
+                .await?,
+        );
+    }
+    replace_strings(&mut value, &mut sealed.into_iter());
+    Ok(value)
+}
+
+fn collect_strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => items.iter().for_each(|x| collect_strings(x, out)),
+        Value::Object(map) => map.values().for_each(|x| collect_strings(x, out)),
+        _ => {}
+    }
+}
+
+/// Walks `v` in the same order as `collect_strings`.
+fn replace_strings(v: &mut Value, next: &mut impl Iterator<Item = String>) {
+    match v {
+        Value::String(s) => {
+            if let Some(new) = next.next() {
+                *s = new;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|x| replace_strings(x, next)),
+        Value::Object(map) => map.values_mut().for_each(|x| replace_strings(x, next)),
+        _ => {}
+    }
+}
+
+// ============================================================================
 // Tools
 // ============================================================================
 
@@ -1145,6 +1196,8 @@ async fn rag_ask(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, Tool
     body.insert("messages".into(), json!([{ "role": "user", "content": query }]));
     body.insert("include_citations".into(), json!(true));
     body.insert("stream".into(), json!(false));
+    // The caller is an AI: keep the answer in the tokens the LLM saw.
+    body.insert("keep_pii_tokens".into(), json!(true));
     if let Some(bucket) = arg_str_opt(args, "bucket")?.filter(|b| !b.trim().is_empty()) {
         body.insert("bucket".into(), json!(bucket.trim()));
     }
