@@ -548,7 +548,7 @@ async fn upload_or_create_document_handler(
         .await
         .map_err(ApiError::from)?;
 
-    Ok((StatusCode::CREATED, Json(result)))
+    Ok((ingest_status(&result), Json(result)))
 }
 
 pub(crate) async fn parse_multipart_ingest(mut multipart: Multipart) -> Result<IngestPayload, ApiError> {
@@ -719,6 +719,90 @@ pub(crate) async fn ingest_document_into_bucket(
         if sensitivity == Sensitivity::Share {
             sensitivity = Sensitivity::Private;
         }
+    }
+
+    // Re-ingesting what is already there changes nothing: the same content with the same access
+    // settings returns the document in force. The same external_key with new content becomes
+    // that document's next revision, and the previous one goes out of force.
+    let incoming_sha = match (&payload.file_bytes, &payload.text) {
+        (Some(b), _) if !b.is_empty() => Some(sha256_hex_bytes(b)),
+        (None, Some(t)) => Some(sha256_hex_bytes(t.as_bytes())),
+        _ => None,
+    };
+    let doc_key = payload
+        .external_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+    // A changed file with the same external_key replaces the in-force copy: the old document is
+    // closed (valid_to) and the new one records `supersedes`. The revision number is left to the
+    // caller, because retrieval boosts higher revisions across all hits, not per document.
+    let mut superseded: Option<Uuid> = None;
+    if let Some(sha) = incoming_sha.as_deref() {
+        let app_pool = state.require_app_pool()?;
+        let mut tx = app_pool.begin_rls_tx(principal).await?;
+        let same = sqlx::query(
+            "SELECT id, title, revision FROM corpus.documents
+             WHERE org_id = $1 AND bucket_id = $2 AND content_sha256 = $3
+               AND access_scope = $4 AND min_auth_level = $5
+               AND allowed_group_ids = $6 AND denied_group_ids = $7
+               AND status IN ('indexed', 'pending')
+               AND (valid_to IS NULL OR valid_to > now())
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(principal.org_id)
+        .bind(bucket.id)
+        .bind(sha)
+        .bind(access_scope.as_str())
+        .bind(i16::from(doc_level.as_u8()))
+        .bind(&payload.allowed_group_ids)
+        .bind(&payload.denied_group_ids)
+        .fetch_optional(&mut **tx.tx_mut())
+        .await
+        .map_err(|e| OpenRagError::Database(format!("lookup identical document: {e}")))?;
+        if let Some(row) = same {
+            let id: Uuid = row.try_get("id").map_err(|e| OpenRagError::Database(e.to_string()))?;
+            let title: String = row.try_get("title").map_err(|e| OpenRagError::Database(e.to_string()))?;
+            let revision: i32 = row.try_get("revision").map_err(|e| OpenRagError::Database(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| OpenRagError::Database(format!("commit identical lookup: {e}")))?;
+            return Ok(json!({
+                "id": id,
+                "document_id": id,
+                "bucket_id": bucket.id,
+                "title": title,
+                "revision": revision,
+                "min_auth_level": doc_level.as_u8(),
+                "access_scope": access_scope.as_str(),
+                "unchanged": true,
+            }));
+        }
+        if let Some(key) = doc_key.as_deref() {
+            let prior = sqlx::query(
+                "SELECT id FROM corpus.documents
+                 WHERE org_id = $1 AND bucket_id = $2 AND metadata->>'external_key' = $3
+                   AND status IN ('indexed', 'pending')
+                   AND (valid_to IS NULL OR valid_to > now())
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+            )
+            .bind(principal.org_id)
+            .bind(bucket.id)
+            .bind(key)
+            .fetch_optional(&mut **tx.tx_mut())
+            .await
+            .map_err(|e| OpenRagError::Database(format!("lookup document by external_key: {e}")))?;
+            if let Some(row) = prior {
+                let id: Uuid = row.try_get("id").map_err(|e| OpenRagError::Database(e.to_string()))?;
+                superseded = Some(id);
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| OpenRagError::Database(format!("commit document lookup: {e}")))?;
     }
 
     let (mut parsed, source_bytes_opt) = if let Some(bytes) = payload.file_bytes {
@@ -917,6 +1001,19 @@ pub(crate) async fn ingest_document_into_bucket(
 
     let revision = payload.revision.unwrap_or(1);
     let valid_from = payload.valid_from.unwrap_or_else(Utc::now);
+    if let Some(old_id) = superseded {
+        sqlx::query(
+            "UPDATE corpus.documents
+             SET valid_to = $1, updated_at = now()
+             WHERE org_id = $2 AND id = $3 AND (valid_to IS NULL OR valid_to > $1)",
+        )
+        .bind(valid_from)
+        .bind(principal.org_id)
+        .bind(old_id)
+        .execute(&mut **tx.tx_mut())
+        .await
+        .map_err(|e| OpenRagError::Database(format!("close previous revision: {e}")))?;
+    }
     let doc_extra_meta = json!({
         "ocr_mode": ocr_decision.effective_mode.as_str(),
         "slug": payload.slug,
@@ -1174,8 +1271,18 @@ pub(crate) async fn ingest_document_into_bucket(
         "min_auth_level": doc_level.as_u8(),
         "access_scope": access_scope.as_str(),
         "revision": revision,
+        "supersedes": superseded,
         "extracted_aliases": extracted_pairs,
     }))
+}
+
+/// 201 for a new document or revision, 200 when the same content was already there.
+pub(crate) fn ingest_status(result: &Value) -> StatusCode {
+    if result.get("unchanged").and_then(Value::as_bool) == Some(true) {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    }
 }
 
 async fn delete_document_handler(

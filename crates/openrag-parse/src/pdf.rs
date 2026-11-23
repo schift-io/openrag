@@ -22,6 +22,16 @@ pub async fn parse_pdf_native(
     filename: Option<&str>,
     cfg: &ParseConfig,
 ) -> Result<ParsedDocument, OpenRagError> {
+    parse_pdf_with_scan_pages(bytes, filename, cfg).await.map(|(doc, _)| doc)
+}
+
+/// Like [`parse_pdf_native`], plus the pages (0-based) that need OCR: pages without a text
+/// layer that draw an image (a scan or a photo), or every page when none has any text.
+pub async fn parse_pdf_with_scan_pages(
+    bytes: &[u8],
+    filename: Option<&str>,
+    cfg: &ParseConfig,
+) -> Result<(ParsedDocument, Vec<usize>), OpenRagError> {
     if !cfg.pdf_native_enabled {
         return Err(OpenRagError::Config(
             "pdf_native parser is disabled in ParseConfig".into(),
@@ -58,6 +68,8 @@ pub async fn parse_pdf_native(
 
     let ordered_page_ids = collect_page_object_ids(&objects);
     let mut pages = Vec::new();
+    let mut empty_pages = Vec::new();
+    let mut scan_pages = Vec::new();
 
     for (idx, page_id) in ordered_page_ids.iter().enumerate() {
         let Some(page_obj) = objects.get(page_id) else {
@@ -67,6 +79,12 @@ pub async fn parse_pdf_native(
         if page_text.trim().is_empty() {
             if let Some(fallback_text) = try_pdftotext_page(bytes, idx + 1).await {
                 page_text = fallback_text;
+            }
+        }
+        if page_text.trim().is_empty() {
+            empty_pages.push(pages.len());
+            if page_draws_image(page_obj, &objects) {
+                scan_pages.push(pages.len());
             }
         }
         let aliases = extract_parenthetical_aliases(&page_text);
@@ -101,7 +119,10 @@ pub async fn parse_pdf_native(
         .unwrap_or("Untitled PDF")
         .to_string();
 
-    Ok(ParsedDocument {
+    if empty_pages.len() == pages.len() {
+        scan_pages = empty_pages;
+    }
+    let doc = ParsedDocument {
         title,
         format: DocumentFormat::Pdf,
         mime_type: DocumentFormat::Pdf.default_mime().to_string(),
@@ -111,7 +132,64 @@ pub async fn parse_pdf_native(
         extracted_aliases,
         ocr_policy: None,
         parser_engine: "pdf_native".to_string(),
-    })
+    };
+    Ok((doc, scan_pages))
+}
+
+/// Whether a page's resources hold an image XObject (`/Subtype /Image`), the mark of a scanned
+/// or photographed page. Resources may sit on the page, behind a reference, or on a parent.
+fn page_draws_image(page_obj: &PdfObj<'_>, objects: &HashMap<u32, PdfObj<'_>>) -> bool {
+    let mut dict: Cow<'_, str> = page_obj.dict.clone();
+    for _ in 0..4 {
+        let resources = match parse_ref_list(&dict, "/Resources").first() {
+            Some(id) if !inline_dict_follows(&dict, "/Resources") => {
+                objects.get(id).map(|o| o.dict.clone())
+            }
+            _ => dict.find("/Resources").map(|p| Cow::Owned(dict[p..].to_string())),
+        };
+        if let Some(res) = resources {
+            let Some(xo_pos) = res.find("/XObject") else {
+                return false;
+            };
+            let xobjects: Cow<'_, str> = match parse_ref_list(&res, "/XObject").first() {
+                Some(id) if !inline_dict_follows(&res, "/XObject") => {
+                    objects.get(id).map_or(Cow::Borrowed(""), |o| o.dict.clone())
+                }
+                _ => {
+                    let rest = &res[xo_pos + "/XObject".len()..];
+                    Cow::Owned(rest.split(">>").next().unwrap_or("").to_string())
+                }
+            };
+            return refs_in(&xobjects).into_iter().any(|id| {
+                objects.get(&id).is_some_and(|o| {
+                    o.dict.contains("/Subtype /Image") || o.dict.contains("/Subtype/Image")
+                })
+            });
+        }
+        match parse_ref_list(&dict, "/Parent").first().and_then(|id| objects.get(id)) {
+            Some(parent) => dict = parent.dict.clone(),
+            None => return false,
+        }
+    }
+    false
+}
+
+fn inline_dict_follows(dict: &str, key: &str) -> bool {
+    dict.find(key)
+        .is_some_and(|p| dict[p + key.len()..].trim_start().starts_with("<<"))
+}
+
+/// Every `N G R` reference in a dictionary fragment.
+fn refs_in(fragment: &str) -> Vec<u32> {
+    let tokens: Vec<&str> = fragment
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '<' || c == '>' || c == '[' || c == ']')
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens
+        .windows(3)
+        .filter(|w| w[2] == "R" && w[1].parse::<u32>().is_ok())
+        .filter_map(|w| w[0].parse::<u32>().ok())
+        .collect()
 }
 
 fn parse_pdf_objects(bytes: &[u8]) -> HashMap<u32, PdfObj<'_>> {
@@ -551,5 +629,75 @@ async fn try_pdftotext_page(bytes: &[u8], page_no: usize) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use openrag_core::Sensitivity;
+
+    pub(crate) fn test_parse_cfg() -> ParseConfig {
+        ParseConfig {
+            hwp_engine: "kordoc".into(),
+            ocr_engine: "schift_ocr".into(),
+            dewarp_enabled: false,
+            pdf_native_enabled: true,
+            default_ocr_mode: Sensitivity::Share,
+            ocr_mode_by_auth_level: Vec::new(),
+            reject_zdr_with_batch: true,
+        }
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A PDF whose pages either show text (`Some`) or only draw an image (`None`), the way a
+    /// scanner writes them.
+    pub(crate) fn pdf_with_pages(pages: &[Option<&str>]) -> Vec<u8> {
+        let mut objs: Vec<String> = vec![String::new()]; // 1: Pages, filled in below
+        objs.push("<< /Type /Catalog /Pages 1 0 R >>".into()); // 2
+        let mut kids = Vec::new();
+        for page in pages {
+            let (resources, content) = match page {
+                Some(text) => (
+                    "<< /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >>".to_string(),
+                    format!("BT /F1 12 Tf 72 700 Td ({text}) Tj ET"),
+                ),
+                None => {
+                    objs.push("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\u{0}\nendstream".into());
+                    (format!("<< /XObject << /Im0 {} 0 R >> >>", objs.len()), "q 595 0 0 842 0 0 cm /Im0 Do Q".to_string())
+                }
+            };
+            objs.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+            let contents = objs.len();
+            objs.push(format!(
+                "<< /Type /Page /Parent 1 0 R /MediaBox [0 0 595 842] /Resources {resources} /Contents {contents} 0 R >>"
+            ));
+            kids.push(format!("{} 0 R", objs.len()));
+        }
+        objs[0] = format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), kids.len());
+        let mut out = String::from("%PDF-1.4\n");
+        for (i, o) in objs.iter().enumerate() {
+            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        out.push_str("trailer\n<< /Root 2 0 R >>\n%%EOF\n");
+        out.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn scanned_pages_are_the_image_pages_without_text() -> TestResult {
+        let cfg = test_parse_cfg();
+        let (doc, scan) =
+            parse_pdf_with_scan_pages(&pdf_with_pages(&[Some("Hello"), None]), Some("mixed.pdf"), &cfg).await?;
+        assert_eq!(doc.pages.len(), 2);
+        assert!(doc.pages[0].raw_markdown.contains("Hello"));
+        assert_eq!(scan, [1]);
+
+        let (_, scan) = parse_pdf_with_scan_pages(&pdf_with_pages(&[None, None]), None, &cfg).await?;
+        assert_eq!(scan, [0, 1]);
+
+        let (_, scan) = parse_pdf_with_scan_pages(&pdf_with_pages(&[Some("A"), Some("B")]), None, &cfg).await?;
+        assert!(scan.is_empty());
+        Ok(())
     }
 }

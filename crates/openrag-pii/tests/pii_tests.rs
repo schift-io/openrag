@@ -729,6 +729,36 @@ fn f16_f36_semantic_threshold_respects_allowlist_with_whitespace_and_surrounding
 }
 
 #[test]
+fn korean_bank_accounts_in_each_banks_shape() {
+    let engine = PiiEngine::default();
+    let accounts = |text: &str| -> Vec<String> {
+        engine
+            .detect(text)
+            .into_iter()
+            .filter(|s| s.category == PiiCategory::BankAccount)
+            .map(|s| s.matched_text)
+            .collect()
+    };
+    for (text, want) in [
+        ("결제 계좌 국민은행 계좌번호 123456-01-234567", "123456-01-234567"),
+        ("결제 계좌: 신한은행 110-234-567890", "110-234-567890"),
+        ("농협 계좌 301-0123-4567-11로 보내 주세요", "301-0123-4567-11"),
+        ("기업은행 계좌 123-456789-01-012", "123-456789-01-012"),
+        ("입금 계좌 1002345678901", "1002345678901"),
+    ] {
+        assert_eq!(accounts(text), [want], "{text}");
+    }
+    for text in [
+        "입금 문의 010-1234-5678",
+        "은행 방문일 2026-11-23",
+        "법인카드 계좌 연결 4111-1111-1111-1111",
+        "계좌 없음",
+    ] {
+        assert!(accounts(text).is_empty(), "{text}: {:?}", accounts(text));
+    }
+}
+
+#[test]
 fn korean_names_followed_by_a_spaced_job_title() {
     let engine = PiiEngine::default();
     let names = |text: &str| -> Vec<String> {

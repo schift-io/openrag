@@ -523,10 +523,16 @@ fn detect_passport(text: &str, source: &str, out: &mut Vec<(u8, PiiSpan)>) {
     }
 }
 
+/// Korean account numbers vary by bank (국민 6-2-6, 신한 3-3-6, 우리 4-3-6, 하나 3-6-5,
+/// 농협 3-4-4-2, 기업 3-6-2-3) and are often written without hyphens, so the rule takes 2–4
+/// digit groups (or one run) of 10–14 digits after a nearby 계좌 / 입금 / 은행 / account.
+/// Phone numbers (leading 0, at most 11 digits) are left to the phone rule.
 fn detect_bank_account(text: &str, source: &str, out: &mut Vec<(u8, PiiSpan)>) {
     static RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
-        Regex::new(r"(?:계좌|입금|은행|account)[^\r\n0-9]{0,16}([0-9]{2,4}-[0-9]{2,6}-[0-9]{4,7})")
-            .ok()
+        Regex::new(
+            r"(?i)(?:계좌|입금|은행|account)[^\r\n0-9]{0,16}([0-9]{2,6}(?:-[0-9]{2,7}){1,3}|[0-9]{10,14})",
+        )
+        .ok()
     });
     let Some(re) = RE.as_ref() else {
         return;
@@ -536,6 +542,10 @@ fn detect_bank_account(text: &str, source: &str, out: &mut Vec<(u8, PiiSpan)>) {
             continue;
         };
         if !has_ascii_digit_boundary(text, m.start(), m.end()) {
+            continue;
+        }
+        let digits = m.as_str().bytes().filter(u8::is_ascii_digit).count();
+        if !(10..=14).contains(&digits) || (m.as_str().starts_with('0') && digits <= 11) {
             continue;
         }
         out.push((

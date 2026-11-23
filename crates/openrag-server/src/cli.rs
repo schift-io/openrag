@@ -1199,11 +1199,9 @@ async fn cmd_up(a: UpArgs) -> Result<(), CliError> {
         }
         args.extend(["-f".into(), airgap.display().to_string()]);
     }
+    // postgres, local-embed (embeddings) and openrag-api; the airgap overlay keeps local-embed
+    // offline and points the API at the site's own servers.
     args.extend(["--profile".into(), "app".into()]);
-    if a.profile == UpProfile::Airgap {
-        // local-embed only runs under the airgap profile
-        args.extend(["--profile".into(), "airgap".into()]);
-    }
     args.push("up".into());
     if !a.foreground {
         args.push("-d".into());
@@ -1341,6 +1339,18 @@ fn ingest_targets(path: &Path) -> Result<Vec<PathBuf>, CliError> {
     Ok(out)
 }
 
+/// The document key of a file: its path below the folder being ingested (`/` separated), or the
+/// file name for a single file. Ingesting the same key again with new content replaces the
+/// in-force copy (the server closes it and returns `supersedes`) instead of adding a second one.
+fn document_key(root: &Path, file: &Path) -> String {
+    let rel = file.strip_prefix(root).ok().filter(|r| !r.as_os_str().is_empty());
+    let rel = rel.unwrap_or_else(|| Path::new(file.file_name().unwrap_or(file.as_os_str())));
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn ingest_one(ex: &Exec, a: &IngestArgs, path: &Path) -> Result<Value, CliError> {
     let bytes = tokio::fs::read(path)
         .await
@@ -1385,6 +1395,7 @@ async fn ingest_one(ex: &Exec, a: &IngestArgs, path: &Path) -> Result<Value, Cli
     if let Some(r) = a.revision {
         fields.push(("revision", r.to_string()));
     }
+    fields.push(("external_key", document_key(&a.path, path)));
     let (boundary, body) = build_multipart(&file_name, &bytes, &fields);
 
     match ex {
@@ -1405,20 +1416,39 @@ async fn ingest_one(ex: &Exec, a: &IngestArgs, path: &Path) -> Result<Value, Cli
 async fn ingest_many(ex: &Exec, a: &IngestArgs) -> Result<Value, CliError> {
     let files = ingest_targets(&a.path)?;
     let mut results = Vec::with_capacity(files.len());
-    let mut failed = 0usize;
+    let (mut failed, mut unchanged) = (0usize, 0usize);
     for f in &files {
         match ingest_one(ex, a, f).await {
-            Ok(v) => results.push(json!({
-                "file": f.display().to_string(),
-                "document_id": v.get("document_id").or_else(|| v.get("id")).cloned().unwrap_or(Value::Null),
-            })),
+            Ok(v) => {
+                let same = v.get("unchanged").and_then(Value::as_bool) == Some(true);
+                if same {
+                    unchanged += 1;
+                }
+                let mut r = json!({
+                    "file": f.display().to_string(),
+                    "document_id": v.get("document_id").or_else(|| v.get("id")).cloned().unwrap_or(Value::Null),
+                    "revision": v.get("revision").cloned().unwrap_or(Value::Null),
+                });
+                if same {
+                    r["unchanged"] = json!(true);
+                }
+                if let Some(old) = v.get("supersedes").filter(|o| !o.is_null()) {
+                    r["supersedes"] = old.clone();
+                }
+                results.push(r);
+            }
             Err(e) => {
                 failed += 1;
                 results.push(json!({ "file": f.display().to_string(), "error": e.0 }));
             }
         }
     }
-    Ok(json!({ "ingested": files.len() - failed, "failed": failed, "results": results }))
+    Ok(json!({
+        "ingested": files.len() - failed - unchanged,
+        "unchanged": unchanged,
+        "failed": failed,
+        "results": results,
+    }))
 }
 
 async fn cmd_ingest(a: IngestArgs) -> Result<(), CliError> {
@@ -2794,6 +2824,11 @@ mod tests {
         assert_eq!(found, ["b.md", "sub/c.PDF"]);
         let empty = tempfile::tempdir()?;
         assert!(ingest_targets(empty.path()).is_err());
+        // Document keys: the path below the ingested folder, or the file name for one file.
+        assert_eq!(document_key(dir.path(), &dir.path().join("sub/c.PDF")), "sub/c.PDF");
+        assert_eq!(document_key(dir.path(), &dir.path().join("b.md")), "b.md");
+        let one = dir.path().join("b.md");
+        assert_eq!(document_key(&one, &one), "b.md");
         Ok(())
     }
 

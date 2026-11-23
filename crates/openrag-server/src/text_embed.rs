@@ -93,8 +93,10 @@ impl HttpTextEmbedder {
             url,
             env_opt("OPENRAG_TEXT_EMBED_MODEL").unwrap_or_default(),
             env_opt("OPENRAG_TEXT_EMBED_API_KEY"),
-            std::env::var("OPENRAG_TEXT_EMBED_QUERY_PREFIX").ok(),
-            std::env::var("OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX").ok(),
+            // Empty means unset (compose passes the variables through), so the model's own
+            // prefixes apply.
+            std::env::var("OPENRAG_TEXT_EMBED_QUERY_PREFIX").ok().filter(|p| !p.is_empty()),
+            std::env::var("OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX").ok().filter(|p| !p.is_empty()),
         )
         .map(Some)
     }

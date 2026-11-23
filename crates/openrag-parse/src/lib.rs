@@ -23,11 +23,11 @@ pub use model::{
     RenderedPageThumbnail,
 };
 pub use ocr::{
-    detect_foreground_blocks, dewarp_image, parse_image_with_ocr, resolve_ocr_policy,
-    resolve_ocr_policy_with_target, SchiftOcrClient, SchiftOcrResponse, ShareQuotaTracker,
-    DEFAULT_SHARE_DAILY_LIMIT,
+    detect_foreground_blocks, dewarp_image, ocr_pdf_pages, ocr_whole_pdf, parse_image_with_ocr,
+    resolve_ocr_policy, resolve_ocr_policy_with_target, SchiftOcrClient, SchiftOcrResponse,
+    ShareQuotaTracker, DEFAULT_SHARE_DAILY_LIMIT,
 };
-pub use pdf::parse_pdf_native;
+pub use pdf::{parse_pdf_native, parse_pdf_with_scan_pages};
 pub use s3::{S3BlobConfig, S3BlobStore};
 pub use store::{ParsePersister, PersistParsedDocumentInput, PersistedDocumentIds};
 pub use thumbnail::{
@@ -51,6 +51,50 @@ impl DocumentParser {
         Self::default()
     }
 
+    /// The OCR endpoint, when the policy would send this document to one.
+    fn remote_ocr(&self, cfg: &ParseConfig, ctx: &ParsePolicyCtx) -> Option<&SchiftOcrClient> {
+        let client = self.ocr_client.as_ref()?;
+        let policy = resolve_ocr_policy_with_target(cfg, ctx, true).ok()?;
+        (policy.execution_target == OcrExecutionTarget::SchiftCloud).then_some(client)
+    }
+
+    /// PDFs keep their text layer; scanned pages (no text, an image) go to OCR. Without OCR a
+    /// PDF with no text at all is refused instead of being stored empty.
+    async fn parse_pdf(
+        &self,
+        bytes: &[u8],
+        filename: Option<&str>,
+        cfg: &ParseConfig,
+        ctx: &ParsePolicyCtx,
+    ) -> Result<ParsedDocument, OpenRagError> {
+        let ocr = self.remote_ocr(cfg, ctx);
+        let (mut doc, scan_pages) = match parse_pdf_with_scan_pages(bytes, filename, cfg).await {
+            Ok(v) => v,
+            // The native parser cannot walk every PDF (e.g. compressed object streams).
+            Err(OpenRagError::Validation(msg)) if msg.starts_with("corrupt PDF") => match ocr {
+                Some(client) => {
+                    return ocr_whole_pdf(bytes, filename, cfg, ctx, Some(&self.share_quota), client).await
+                }
+                None => return Err(OpenRagError::Validation(msg)),
+            },
+            Err(e) => return Err(e),
+        };
+        if scan_pages.is_empty() {
+            return Ok(doc);
+        }
+        if let Some(client) = ocr {
+            ocr_pdf_pages(&mut doc, bytes, filename, &scan_pages, cfg, ctx, Some(&self.share_quota), client)
+                .await?;
+            return Ok(doc);
+        }
+        if scan_pages.len() == doc.pages.len() {
+            return Err(OpenRagError::Validation(
+                "this PDF has no text layer (a scan?) and OCR is not configured: set OPENRAG_SCHIFT_OCR_URL and SCHIFT_OCR_API_KEY".into(),
+            ));
+        }
+        Ok(doc)
+    }
+
     pub async fn parse(
         &self,
         bytes: &[u8],
@@ -68,7 +112,7 @@ impl DocumentParser {
             DocumentFormat::Hwpx | DocumentFormat::Hml | DocumentFormat::Hwp => {
                 parse_hwp_family(bytes, filename, cfg, self.kordoc.as_ref()).await
             }
-            DocumentFormat::Pdf => parse_pdf_native(bytes, filename, cfg).await,
+            DocumentFormat::Pdf => self.parse_pdf(bytes, filename, cfg, ctx).await,
             DocumentFormat::Png | DocumentFormat::Jpeg | DocumentFormat::Webp => {
                 parse_image_with_ocr(
                     bytes,
@@ -114,5 +158,28 @@ impl DocumentParser {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scanned_pdf_without_ocr_is_refused_not_stored_empty() {
+        let parser = DocumentParser::new();
+        let scan = crate::pdf::tests::pdf_with_pages(&[None]);
+        let r = parser
+            .parse(&scan, Some("application/pdf"), Some("scan.pdf"), &crate::pdf::tests::test_parse_cfg(), &ParsePolicyCtx::default())
+            .await;
+        assert!(
+            matches!(&r, Err(OpenRagError::Validation(m)) if m.contains("no text layer")),
+            "{r:?}"
+        );
+        let mixed = crate::pdf::tests::pdf_with_pages(&[Some("Hello"), None]);
+        let doc = parser
+            .parse(&mixed, Some("application/pdf"), Some("mixed.pdf"), &crate::pdf::tests::test_parse_cfg(), &ParsePolicyCtx::default())
+            .await;
+        assert!(doc.is_ok_and(|d| d.pages.len() == 2), "a PDF with some text is kept");
     }
 }

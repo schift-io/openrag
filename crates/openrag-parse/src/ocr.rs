@@ -112,10 +112,14 @@ pub fn resolve_ocr_policy_with_target(
     let upgraded_from_share =
         ctx.requested_ocr_mode == Some(Sensitivity::Share) && effective_mode != Sensitivity::Share;
 
-    let execution_target = if cfg.ocr_engine == "local_vllm" {
-        OcrExecutionTarget::LocalVllm
-    } else if has_remote_ocr_endpoint && cfg.ocr_engine == "schift_ocr" {
+    // A configured endpoint speaks Schift's /v1/run API: Schift's service, or an on-prem Schift
+    // (or compatible) server in the air-gapped profile, where local_vllm only rules out `share`.
+    let execution_target = if has_remote_ocr_endpoint
+        && (cfg.ocr_engine == "schift_ocr" || cfg.ocr_engine == "local_vllm")
+    {
         OcrExecutionTarget::SchiftCloud
+    } else if cfg.ocr_engine == "local_vllm" {
+        OcrExecutionTarget::LocalVllm
     } else {
         OcrExecutionTarget::OfflineFallback
     };
@@ -358,8 +362,9 @@ impl SchiftOcrClient {
                 "Schift OCR endpoint_url must not be empty".into(),
             ));
         }
+        // Whole PDFs go in one request, so allow for a long document.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| {
                 OpenRagError::Internal(format!("failed to construct Schift OCR HTTP client: {e}"))
@@ -392,23 +397,42 @@ impl SchiftOcrClient {
         }
 
         let url = format!("{}/v1/run", self.endpoint_url);
-        let file_part = multipart::Part::bytes(image_bytes.to_vec())
-            .file_name(filename.to_string());
-        let form = multipart::Form::new()
-            .part("image", file_part)
-            .text("task", task.as_str().to_string())
-            .text("mode", normalize_ocr_mode(mode).as_str().to_string())
-            .text("batch", if batch { "true" } else { "false" }.to_string());
+        let mime = ocr_upload_mime(filename);
+        // 429 (too many concurrent jobs) is waited out: up to 8 retries, each wait retry_after_sec or
+        // the backoff (1, 2, 4, 8, 16 s), capped at 20 s; about 80 s in all without hints, 160 s at most.
+        let mut attempt = 0u32;
+        let resp = loop {
+            let file_part = multipart::Part::bytes(image_bytes.to_vec())
+                .file_name(filename.to_string())
+                .mime_str(mime)
+                .map_err(|e| OpenRagError::Internal(format!("OCR upload mime: {e}")))?;
+            let form = multipart::Form::new()
+                .part("image", file_part)
+                .text("task", task.as_str().to_string())
+                .text("mode", normalize_ocr_mode(mode).as_str().to_string())
+                .text("batch", if batch { "true" } else { "false" }.to_string());
 
-        let mut req = self.client.post(&url).multipart(form);
-        if let Some(key) = self.api_key.as_deref() {
-            req = req.bearer_auth(key);
-        }
+            let mut req = self.client.post(&url).multipart(form);
+            if let Some(key) = self.api_key.as_deref() {
+                req = req.bearer_auth(key);
+            }
 
-        let resp = req.send().await.map_err(|e| OpenRagError::ExternalAdapter {
-            adapter: "schift_ocr".into(),
-            message: format!("HTTP request failed: {e}"),
-        })?;
+            let resp = req.send().await.map_err(|e| OpenRagError::ExternalAdapter {
+                adapter: "schift_ocr".into(),
+                message: format!("HTTP request failed: {e}"),
+            })?;
+            if resp.status().as_u16() != 429 || attempt >= OCR_BUSY_RETRIES {
+                break resp;
+            }
+            let body = resp.text().await.unwrap_or_default();
+            let hinted = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("retry_after_sec").and_then(serde_json::Value::as_u64))
+                .unwrap_or(1);
+            let wait = hinted.max(1u64 << attempt.min(4)).min(20);
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            attempt += 1;
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -431,6 +455,151 @@ impl SchiftOcrClient {
         })?;
         decode_ocr_body(body)
     }
+}
+
+/// How many times a 429 from the OCR endpoint is retried (waits of 1, 2, 4, 8, 16, 20, 20, 20 s).
+const OCR_BUSY_RETRIES: u32 = 8;
+
+fn ocr_upload_mime(filename: &str) -> &'static str {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    }
+}
+
+/// OCR text per page index (0-based) of a `/v1/run` reply: `pages[]` for a multi-page PDF,
+/// otherwise the single `result`.
+fn ocr_pages_by_index(
+    resp: &SchiftOcrResponse,
+) -> Result<HashMap<usize, (String, Vec<OcrBlock>)>, OpenRagError> {
+    let mut out = HashMap::new();
+    if resp.pages.is_empty() {
+        let md = resp.page_markdown().unwrap_or_default().to_string();
+        out.insert(0, (md, convert_ocr_blocks(resp.page_blocks())?));
+    } else {
+        for (idx, p) in resp.pages.iter().enumerate() {
+            let at = p
+                .page_no
+                .and_then(|n| usize::try_from(n).ok())
+                .and_then(|n| n.checked_sub(1))
+                .unwrap_or(idx);
+            out.insert(at, (p.page_markdown().to_string(), convert_ocr_blocks(p.page_blocks())?));
+        }
+    }
+    Ok(out)
+}
+
+/// Sends a PDF to the OCR endpoint once and fills the listed pages (0-based) with its text.
+/// Used for scanned pages, which have no text layer; pages that have one keep it.
+#[allow(clippy::too_many_arguments)]
+pub async fn ocr_pdf_pages(
+    doc: &mut ParsedDocument,
+    bytes: &[u8],
+    filename: Option<&str>,
+    pages: &[usize],
+    cfg: &ParseConfig,
+    ctx: &ParsePolicyCtx,
+    quota: Option<&ShareQuotaTracker>,
+    client: &SchiftOcrClient,
+) -> Result<(), OpenRagError> {
+    let policy = resolve_ocr_policy_with_target(cfg, ctx, true)?;
+    if policy.effective_mode == Sensitivity::Share {
+        if let Some(q) = quota {
+            let tenant = ctx.tenant_key.as_deref().unwrap_or("default");
+            q.try_consume(tenant, u32::try_from(doc.pages.len()).unwrap_or(u32::MAX))?;
+        }
+    }
+    let fname = filename.unwrap_or("document.pdf");
+    let resp = client
+        .run_ocr(bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
+        .await?;
+    let by_index = ocr_pages_by_index(&resp)?;
+    for &i in pages {
+        let (Some(page), Some((md, blocks))) = (doc.pages.get_mut(i), by_index.get(&i)) else {
+            continue;
+        };
+        page.raw_markdown = md.clone();
+        page.blocks = blocks.clone();
+        page.extracted_aliases = extract_parenthetical_aliases(md);
+        page.content_sha256 = sha256_hex_str(md);
+    }
+    doc.full_markdown = doc
+        .pages
+        .iter()
+        .map(|p| p.raw_markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    doc.extracted_aliases = extract_parenthetical_aliases(&doc.full_markdown);
+    doc.ocr_policy = Some(policy);
+    doc.parser_engine = "pdf_native+schift_ocr".to_string();
+    Ok(())
+}
+
+/// Reads a whole PDF with OCR, for PDFs whose structure the native parser cannot walk.
+pub async fn ocr_whole_pdf(
+    bytes: &[u8],
+    filename: Option<&str>,
+    cfg: &ParseConfig,
+    ctx: &ParsePolicyCtx,
+    quota: Option<&ShareQuotaTracker>,
+    client: &SchiftOcrClient,
+) -> Result<ParsedDocument, OpenRagError> {
+    let policy = resolve_ocr_policy_with_target(cfg, ctx, true)?;
+    let fname = filename.unwrap_or("document.pdf");
+    let resp = client
+        .run_ocr(bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
+        .await?;
+    let by_index = ocr_pages_by_index(&resp)?;
+    if policy.effective_mode == Sensitivity::Share {
+        if let Some(q) = quota {
+            let tenant = ctx.tenant_key.as_deref().unwrap_or("default");
+            q.try_consume(tenant, u32::try_from(by_index.len()).unwrap_or(u32::MAX))?;
+        }
+    }
+    let mut idx: Vec<usize> = by_index.keys().copied().collect();
+    idx.sort_unstable();
+    let pages: Vec<ParsedPage> = idx
+        .iter()
+        .filter_map(|i| by_index.get(i).map(|v| (*i, v)))
+        .map(|(i, (md, blocks))| ParsedPage {
+            page_no: i32::try_from(i + 1).unwrap_or(i32::MAX),
+            raw_markdown: md.clone(),
+            tables_html: Vec::new(),
+            formulas: Vec::new(),
+            fields: Vec::new(),
+            blocks: blocks.clone(),
+            extracted_aliases: extract_parenthetical_aliases(md),
+            page_image_rgb: None,
+            content_sha256: sha256_hex_str(md),
+        })
+        .collect();
+    let full_markdown = pages
+        .iter()
+        .map(|p| p.raw_markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let extracted_aliases = extract_parenthetical_aliases(&full_markdown);
+    let title = filename
+        .and_then(|f| Path::new(f).file_stem().and_then(|s| s.to_str()))
+        .unwrap_or("Untitled PDF")
+        .to_string();
+    Ok(ParsedDocument {
+        title,
+        format: DocumentFormat::Pdf,
+        mime_type: DocumentFormat::Pdf.default_mime().to_string(),
+        content_sha256: sha256_hex_bytes(bytes),
+        pages,
+        full_markdown,
+        extracted_aliases,
+        ocr_policy: Some(policy),
+        parser_engine: "schift_ocr".to_string(),
+    })
 }
 
 /// Deterministic skew estimator (`-5..=+5` degrees) + bilinear rotation when `dewarp_enabled` is true.
@@ -940,6 +1109,47 @@ mod tests {
         ]}))?;
         let texts: Vec<&str> = doc.pages.iter().map(|p| p.raw_markdown.as_str()).collect();
         assert_eq!(texts, ["one", "two"]);
+        Ok(())
+    }
+
+    /// Shape of a real reply to a 2-page scanned PDF (2026-11-23, private): the top-level
+    /// `result` is page 1 and `pages[]` holds every page in order, without page numbers.
+    #[test]
+    fn pdf_reply_maps_pages_in_order() -> TestResult {
+        let resp = decode_ocr_body(json!({
+            "id": "1d9ac0658287", "task": "markdown", "result": {"markdown": "# 인사 기록 카드"},
+            "truncated": false, "job_id": "c8dc3f0385a541d182006a8c0443a5da", "mode": "private",
+            "stored": true,
+            "pages": [
+                {"id": "1d9ac0658287", "task": "markdown", "image_size": [1653, 662],
+                 "result": {"markdown": "# 인사 기록 카드"}, "truncated": false},
+                {"id": "745bfcc6ffab", "task": "markdown", "image_size": [1653, 900],
+                 "result": {"markdown": "# 보안 서약 안내"}, "truncated": false}
+            ],
+            "usage": {"pages": 2, "credits": 0, "mode": "private"}
+        }))?;
+        let by_index = ocr_pages_by_index(&resp)?;
+        assert_eq!(by_index.len(), 2);
+        assert_eq!(by_index.get(&0).map(|p| p.0.as_str()), Some("# 인사 기록 카드"));
+        assert_eq!(by_index.get(&1).map(|p| p.0.as_str()), Some("# 보안 서약 안내"));
+        Ok(())
+    }
+
+    /// The air-gapped profile (`local_vllm`) sends OCR to its configured endpoint, never as share.
+    #[test]
+    fn local_vllm_with_an_endpoint_uses_it() -> TestResult {
+        let cfg = ParseConfig {
+            ocr_engine: "local_vllm".into(),
+            ..crate::pdf::tests::test_parse_cfg()
+        };
+        let ctx = ParsePolicyCtx::default();
+        let with = resolve_ocr_policy_with_target(&cfg, &ctx, true)?;
+        assert_eq!(with.execution_target, OcrExecutionTarget::SchiftCloud);
+        assert_eq!(with.effective_mode, Sensitivity::Private);
+        let without = resolve_ocr_policy_with_target(&cfg, &ctx, false)?;
+        assert_eq!(without.execution_target, OcrExecutionTarget::LocalVllm);
+        assert_eq!(ocr_upload_mime("scan.PDF"), "application/pdf");
+        assert_eq!(ocr_upload_mime("p.jpg"), "image/jpeg");
         Ok(())
     }
 

@@ -63,7 +63,7 @@ hf download google/embeddinggemma-2 --cache-dir ./models
 # on the air-gapped host, from docker/
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
 export AIRGAP_LLM_URL=http://<vllm-host>:8000/v1 AIRGAP_LLM_MODEL=<served model>   # optional
-docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app --profile airgap \
+docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app \
   up -d postgres local-embed openrag-api
 ```
 

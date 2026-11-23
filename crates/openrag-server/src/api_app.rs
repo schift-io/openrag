@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::api_core::{
     create_concept_handler, db_col_err, delete_concept_alias_handler, delete_concept_handler,
-    get_concept_handler, ingest_document_into_bucket, link_concepts_handler, list_concepts_handler,
+    get_concept_handler, ingest_document_into_bucket, ingest_status, link_concepts_handler, list_concepts_handler,
     map_sqlx_err, parse_multipart_ingest, resolve_bucket_rls, resolve_concepts_handler,
     resolve_org_and_dept_paths, row_to_bucket, BucketRecord,
 };
@@ -239,7 +239,7 @@ async fn app_upload_handler(
         .await
         .map_err(ApiError::from)?;
 
-    Ok((StatusCode::CREATED, Json(result)))
+    Ok((ingest_status(&result), Json(result)))
 }
 
 async fn resolve_or_create_app_bucket(

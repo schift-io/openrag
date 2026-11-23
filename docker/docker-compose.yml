@@ -30,6 +30,33 @@ services:
       timeout: 5s
       retries: 12
 
+  # Text embeddings for meaning-based search: google/embeddinggemma-2 on CPU, used at 256
+  # dimensions. The weights (about 1.5 GB) are downloaded from Hugging Face on first start into
+  # the embed_models volume, so the first start takes a few minutes. To use another
+  # OpenAI-compatible embeddings server instead, set OPENRAG_TEXT_EMBED_URL / _MODEL (and _API_KEY)
+  # and start without this one: `up -d --no-deps postgres openrag-api`.
+  local-embed:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: docker/local-embed/Dockerfile
+    image: ${OPENRAG_EMBED_IMAGE:-openrag/local-embed:local}
+    restart: unless-stopped
+    environment:
+      EMBED_MODEL: ${OPENRAG_EMBED_MODEL:-google/embeddinggemma-2}
+      EMBED_DEVICE: ${OPENRAG_EMBED_DEVICE:-cpu}
+      EMBED_DTYPE: ${OPENRAG_EMBED_DTYPE:-float32}
+      HF_HUB_OFFLINE: "0"
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - embed_models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 900s
+
   # One process: the API drains the indexing outbox inline, so there is no separate worker.
   openrag-api:
     profiles: ["app"]
@@ -41,6 +68,8 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      local-embed:
         condition: service_healthy
     environment:
       # Request traffic runs as openrag_app (RLS enforced); background work as openrag_worker.
@@ -65,8 +94,14 @@ services:
       OPENRAG_LOCAL_LLM_URL: ${OPENRAG_LOCAL_LLM_URL:-}
       OPENRAG_LOCAL_LLM_MODEL: ${OPENRAG_LOCAL_LLM_MODEL:-}
       OPENRAG_VLLM_LIVE: "1"
-      OPENRAG_TEXT_EMBED_URL: ${OPENRAG_TEXT_EMBED_URL:-}
-      OPENRAG_TEXT_EMBED_MODEL: ${OPENRAG_TEXT_EMBED_MODEL:-}
+      # Embeddings: local-embed by default, or any OpenAI-compatible /v1/embeddings server.
+      # Query/document prefixes: embeddinggemma's are built in; set them for other asymmetric
+      # models (e5: "query: " / "passage: ").
+      OPENRAG_TEXT_EMBED_URL: ${OPENRAG_TEXT_EMBED_URL:-http://local-embed:8082/v1/embeddings}
+      OPENRAG_TEXT_EMBED_MODEL: ${OPENRAG_TEXT_EMBED_MODEL:-google/embeddinggemma-2}
+      OPENRAG_TEXT_EMBED_API_KEY: ${OPENRAG_TEXT_EMBED_API_KEY:-}
+      OPENRAG_TEXT_EMBED_QUERY_PREFIX: ${OPENRAG_TEXT_EMBED_QUERY_PREFIX:-}
+      OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX: ${OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX:-}
       OPENRAG_SCHIFT_OCR_URL: ${OPENRAG_SCHIFT_OCR_URL:-}
       SCHIFT_OCR_API_KEY: ${SCHIFT_OCR_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -78,3 +113,4 @@ services:
 
 volumes:
   pg_data:
+  embed_models:

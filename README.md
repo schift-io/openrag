@@ -20,7 +20,7 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
   정해요. PostgreSQL의 행 단위 보안(RLS)이 막기 때문에, 권한 없는 문서는 검색 결과에도 나오지 않아요.
 - **개인정보는 AI로 나갈 때만 가려요.** 저장과 검색은 원문 그대로 하고, AI 모델로 가는 요청과 MCP 도구
   결과에서만 주민등록번호·전화번호·이메일 같은 값을 토큰으로 바꿔요.
-- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, 이미지는 Schift OCR로 읽어요. 키워드
+- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, 스캔한 PDF와 이미지는 Schift OCR로 읽어요. 키워드
   검색은 한국어 형태소 분석(`pg_search` Lindera)을 써요.
 - **AI 모델을 들고 있지 않아요.** 답은 연결한 Claude Code·Codex가 쓰거나, 사내 LLM 서버(vLLM 등)를
   연결하면 서버가 직접 써요.
@@ -33,7 +33,7 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
 ```bash
 # 1) 서버 띄우기
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # 다시 띄울 때도 같은 값을 쓰니 적어 두세요
-docker compose -f docker/docker-compose.yml --profile app up -d postgres openrag-api
+docker compose -f docker/docker-compose.yml --profile app up -d
 
 # 2) 문서 넣고 첫 설정 (조직·관리자·API 키·버킷·문서를 한 번에)
 docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
@@ -54,8 +54,10 @@ claude mcp add --transport http --scope user openrag http://127.0.0.1:8080/mcp \
 폐쇄망 구성, 문서 추가, 팀원 추가, 권한, 개인정보 처리, OCR, 문제 해결은
 **[사용 가이드](docs/guide.md)**에 순서대로 정리했어요.
 
-> 기본 구성에는 임베딩 서버가 없어서 키워드 검색(BM25)으로만 찾아요. 뜻으로 찾게 하려면
-> `OPENRAG_TEXT_EMBED_URL`과 `OPENRAG_TEXT_EMBED_MODEL`을 넣으세요(가이드 11장).
+> 처음 띄울 때 임베딩 모델(`google/embeddinggemma-2`, 약 1.5GB)을 Hugging Face에서 받아요. 다 받을
+> 때까지 `openrag-api`는 기다렸다가 떠요. 진행 상황은
+> `docker compose -f docker/docker-compose.yml logs -f local-embed`로 볼 수 있어요.
+> 다른 임베딩 서버를 쓰려면 가이드 11장을 보세요.
 
 ---
 
@@ -69,7 +71,7 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
    ┌──────────────────────────────────▼──────────────────────────────────┐
    │ OpenRAG API (Rust, 프로세스 하나)                                     │
    │  • 권한: ARN + 권한 그룹 + 등급(1~10), PostgreSQL RLS                │
-   │  • 문서 읽기: kordoc(HWP 계열), PDF 텍스트, Schift OCR(이미지)       │
+   │  • 문서 읽기: kordoc(HWP 계열), PDF, Schift OCR(스캔·이미지)         │
    │  • 개인정보 가드: allow · warn · mask · block                        │
    │  • 색인: 바뀐 내용만 다시 색인(SHA-256), 실패 3회면 격리             │
    │  • 검색: 256차원 벡터 검색(pg_pinecone), BM25는 선택                 │
@@ -83,8 +85,8 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 
 - **벡터 엔진**은 표마다 바꿀 수 있어요: `native`(pg_pinecone RaBitQ IVF, 외부 계정 불필요),
   `pgvector`(HNSW), `remote`(Pinecone Serverless). Amazon S3 Vectors나 OSS 벡터 저장소로 복제할 수도 있어요.
-- **임베딩**은 `google/embeddinggemma-2`를 256차원으로 쓰도록 맞춰 뒀어요(폐쇄망 구성은 이 모델을 같이
-  띄워요). 한국어 검색 평가(Ko-StrategyQA)에서 nDCG@10 0.781이 나왔고, BM25를 섞으면 0.703으로 떨어져서
+- **임베딩**은 `google/embeddinggemma-2`를 256차원으로 쓰도록 맞춰 뒀어요(기본 구성과 폐쇄망 구성
+  모두 이 모델을 같이 띄워요). 한국어 검색 평가(Ko-StrategyQA)에서 nDCG@10 0.781이 나왔고, BM25를 섞으면 0.703으로 떨어져서
   기본으로는 섞지 않아요.
 - **메모리와 위키**: 대화에서 얻은 사실을 고칠 수 없는 패치(`amend` · `supersede` · `retract` · `redact`)로
   쌓고, DB 안의 위키는 `.md`/Obsidian과 양방향으로 동기화해요.
@@ -135,7 +137,7 @@ stdio 방식(`openrag mcp --stdio`, `openrag-mcp`)은 데이터베이스에 직�
 | `openrag init` | 첫 설정 한 번에: 조직·관리자·API 키·버킷·문서, 연결 명령 출력 |
 | `openrag org init` | 조직·부서·관리자와 API 키만 만들기 |
 | `openrag bucket {create\|list}` | 버킷 만들기 / 보기 |
-| `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 문서 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요 |
+| `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 문서 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요. 같은 폴더를 다시 넣으면 바뀐 파일만 들어가요 |
 | `openrag connect {claude\|codex}` | 이 서버를 Claude Code나 Codex에 등록(호스트에서 실행할 때) |
 | `openrag up --profile <standard\|airgap>` | docker compose로 스택 띄우기 |
 | `openrag index {engine\|mirror\|status\|retry}` | 벡터 엔진 바꾸기, 외부 복제, 색인 대기열 보기 |

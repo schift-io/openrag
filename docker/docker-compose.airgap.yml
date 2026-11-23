@@ -1,5 +1,5 @@
 # Air-gapped overlay: docker compose -f docker-compose.yml -f docker-compose.airgap.yml \
-#   --profile app --profile airgap up -d postgres local-embed openrag-api
+#   --profile app up -d postgres local-embed openrag-api
 #
 # postgres and local-embed sit on an internal network with no route out. openrag-api is
 # also on openrag_edge so clients can reach its port and it can reach the site's own LLM / OCR
@@ -20,18 +20,16 @@ services:
   postgres:
     networks: [openrag_airgap]
 
+  # Same service as the standard stack, but offline: the weights come from ./models, read-only.
   local-embed:
-    profiles: ["airgap"]
-    build:
-      context: ..
-      dockerfile: docker/local-embed/Dockerfile
     image: ${AIRGAP_EMBED_IMAGE:-openrag/local-embed:local}
-    restart: unless-stopped
     networks: [openrag_airgap]
     environment:
       EMBED_MODEL: ${AIRGAP_EMBED_MODEL:-google/embeddinggemma-2}
       EMBED_DEVICE: ${AIRGAP_EMBED_DEVICE:-cpu}
       EMBED_DTYPE: ${AIRGAP_EMBED_DTYPE:-float32}
+      HF_HUB_OFFLINE: "1"
+      HF_TOKEN: ""
     volumes:
       - ${AIRGAP_MODEL_DIR:-./models}:/models:ro
 
