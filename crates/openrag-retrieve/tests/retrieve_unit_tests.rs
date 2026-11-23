@@ -424,6 +424,49 @@ async fn test_two_stage_rerank_promotes_exact_match_and_populates_bbox(
     Ok(())
 }
 
+/// A higher revision number only wins over other revisions of the same document (same title).
+/// An unrelated document at revision 2 gets no boost over documents at revision 1.
+#[tokio::test]
+async fn test_revision_boost_stays_within_one_title() -> Result<(), Box<dyn std::error::Error>> {
+    let org_id = Uuid::new_v4();
+    let dept_id = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let ctx = make_ctx(org_id, owner, dept_id, 5)?;
+    let backend = InMemoryRetrieveBackend::new();
+    let mut edited = sample_record(
+        org_id,
+        dept_id,
+        owner,
+        RetrieveSpace::Chunks,
+        "출장비 규정",
+        "출장 숙박비 한도 안내",
+        &["policy"],
+    )?;
+    edited.revision = 2;
+    let edited_id = edited.id;
+    let other = sample_record(
+        org_id,
+        dept_id,
+        owner,
+        RetrieveSpace::Chunks,
+        "보안 서약 안내",
+        "출입증 반납 안내",
+        &["policy"],
+    )?;
+    let other_id = other.id;
+    backend.insert(edited).await;
+    backend.insert(other).await;
+
+    let resp = InMemoryHybridRetriever::new(backend)
+        .search(&ctx, &SearchRequest::new("안내"))
+        .await?;
+    for id in [edited_id, other_id] {
+        let hit = resp.hits.iter().find(|h| h.id == id).ok_or("missing hit")?;
+        assert_eq!(hit.score_breakdown.revision_boost, 0.0, "{:?}", hit.title);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_latest_revision_boost_and_valid_to_and_wiki_supersedes(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -438,7 +481,7 @@ async fn test_latest_revision_boost_and_valid_to_and_wiki_supersedes(
         dept_id,
         owner,
         RetrieveSpace::Chunks,
-        "2025년 출장 여비 규정",
+        "출장 여비 규정",
         "출장 여비 5만원 지급 기준",
         &["travel"],
     )?;
@@ -451,7 +494,7 @@ async fn test_latest_revision_boost_and_valid_to_and_wiki_supersedes(
         dept_id,
         owner,
         RetrieveSpace::Chunks,
-        "2026년 출장 여비 개정 규정",
+        "출장 여비 규정",
         "출장 여비 7만원 지급 기준",
         &["travel"],
     )?;
@@ -1082,7 +1125,7 @@ async fn test_bug3_future_valid_from_not_boosted_and_excluded_when_latest_only(
         dept_id,
         owner,
         RetrieveSpace::Chunks,
-        "사내 보안 규정 v1",
+        "사내 보안 규정",
         "사내 보안 규정 현행 기준 안내",
         &["policy"],
     )?;
@@ -1095,7 +1138,7 @@ async fn test_bug3_future_valid_from_not_boosted_and_excluded_when_latest_only(
         dept_id,
         owner,
         RetrieveSpace::Chunks,
-        "사내 보안 규정 v2 예정",
+        "사내 보안 규정",
         "사내 보안 규정 현행 기준 안내",
         &["policy"],
     )?;

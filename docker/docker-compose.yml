@@ -79,6 +79,8 @@ services:
       OPENRAG_PIPELINE_CONFIG: ${OPENRAG_PIPELINE_CONFIG:-/app/configs/pipeline.default.yaml}
       # `docker compose exec openrag-api openrag init …` runs as the local operator (first org and key).
       OPENRAG_OPERATOR: "1"
+      # Address printed in init's connect commands: the published port on this host by default.
+      OPENRAG_PUBLIC_URL: ${OPENRAG_PUBLIC_URL:-http://127.0.0.1:${OPENRAG_API_PORT:-8080}}
       # 32-byte hex key that wraps the PII vault keys; without it the server uses a fixed dev key.
       OPENRAG_PII_KEK_HEX: ${OPENRAG_PII_KEK_HEX:?set OPENRAG_PII_KEK_HEX (openssl rand -hex 32)}
       # Page thumbnails are off by default (thumbnail.enabled in the pipeline config). When enabled

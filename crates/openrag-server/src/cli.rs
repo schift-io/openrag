@@ -226,8 +226,8 @@ pub struct InitArgs {
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     pub api_url: String,
     /// URL MCP clients use to reach the server (default: --api-url); set it when the clients run
-    /// on other machines
-    #[arg(long)]
+    /// on other machines. Compose sets OPENRAG_PUBLIC_URL to the published host port.
+    #[arg(long, env = "OPENRAG_PUBLIC_URL")]
     pub public_url: Option<String>,
     #[command(flatten)]
     pub org: OrgSpec,

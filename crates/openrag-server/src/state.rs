@@ -254,7 +254,7 @@ impl AppState {
         let in_mem_retrieve_backend = InMemoryRetrieveBackend::new();
         let in_memory_concepts = in_mem_retrieve_backend.concepts().as_ref().clone();
         let text_embedder: Arc<dyn TextEmbedder> = match crate::text_embed::HttpTextEmbedder::from_env()? {
-            Some(http) => Arc::new(http),
+            Some(http) => Arc::new(http.mask_pii_if_external(Arc::clone(&pii_engine))),
             None => Arc::new(DeterministicTextEmbedder::default()),
         };
         let has_text_model = text_embedder_is_model(text_embedder.as_ref());

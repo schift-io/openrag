@@ -65,7 +65,10 @@ docker compose -f docker/docker-compose.yml --profile app up -d
 - 이미지 세 개를 빌드해요.
 - `local-embed`가 임베딩 모델(약 1.5GB)을 Hugging Face에서 받아요. 다 받아서 준비될 때까지
   `openrag-api`는 기다렸다가 떠요. 진행 상황은 아래 명령으로 볼 수 있어요.
-- 임베딩 서버는 메모리를 3GB쯤 써요(파라미터 7억 4천만 개 × 4바이트로 계산한 값).
+- 임베딩 서버는 메모리를 2.2GB쯤 써요.
+
+시험해 본 PC(Docker Desktop, macOS)에서는 모델을 받아서 준비되기까지 2분 41초가 걸렸어요. 회선 속도에
+따라 달라요.
 
 ```bash
 docker compose -f docker/docker-compose.yml logs -f local-embed
@@ -144,7 +147,7 @@ docker compose -f docker/docker-compose.yml exec openrag-api \
 | `--slug` | 조직 이름(영문 소문자, 숫자, `-`, `_`) | `default` |
 | `--name` | 조직 표시 이름 | `Default` |
 | `--bucket` | 문서를 담을 버킷 | `docs` |
-| `--public-url` | PC에서 서버에 접속할 주소. 서버와 PC가 다른 기계면 꼭 넣으세요 | `http://127.0.0.1:8080` |
+| `--public-url` | PC에서 서버에 접속할 주소. 서버와 PC가 다른 기계면 꼭 넣으세요 | `http://127.0.0.1:<API 포트>`(3장에서 `OPENRAG_API_PORT`를 바꿨다면 그 포트) |
 
 예를 들어 서버 주소가 `10.0.0.5`라면 `--public-url http://10.0.0.5:8080`을 붙여요. 그러면 출력되는
 연결 명령에 그 주소가 들어가요.
@@ -260,6 +263,8 @@ curl -s -X POST http://127.0.0.1:8080/api/studio/iam/api-keys \
 - 저장된 문서, 검색, HTTP API에는 원문이 그대로 있어요. 볼 권한이 있는 사람은 원문을 봐요.
 - AI로 나가는 길에서는 `[PII:PHONE:70892581]` 같은 토큰으로 바꿔요. 서버가 AI 모델에 보내는 요청과
   MCP 도구 결과가 여기에 해당해요.
+- 회사 밖 임베딩 서버로 보내는 문서도 가려서 보내요([11장](#11-검색-품질-임베딩-서버)). 기본 구성처럼
+  임베딩 서버가 회사 안에 있으면 원문으로 만들어요.
 - 그래서 Claude Code 답에는 전화번호 같은 값이 가려져 나와요. 원문이 필요하면 문서를 직접 보거나
   HTTP API를 쓰세요.
 - 질문에 직접 쓴 이름이나 번호는 가리지 않아요. 본인이 쓴 내용이니까요.
@@ -329,9 +334,17 @@ OpenAI 호환 `/v1/embeddings` 서버라면 어디든 연결할 수 있어요. �
 | `OPENRAG_TEXT_EMBED_QUERY_PREFIX` | 질문 앞에 붙일 말. embeddinggemma는 알아서 붙여요. e5 계열은 `query: ` |
 | `OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX` | 문서 앞에 붙일 말. e5 계열은 `passage: ` |
 
-> **회사 밖 임베딩 API에는 문서 원문이 그대로 가요.** 개인정보를 가리는 것은 AI 모델로 보내는 요청과
-> MCP 결과뿐이고(9장), 임베딩은 검색용이라 원문으로 만들어요. 개인정보가 있는 문서라면 기본
-> `local-embed`나 사내 임베딩 서버를 쓰세요.
+> **회사 밖 임베딩 서버로는 개인정보를 가려서 보내요.** 문서 안의 이름·전화번호·계좌번호 같은 값을
+> `[PII:NAME]`처럼 바꿔서 보내고, 질문은 쓴 그대로 보내요. 서버가 뜰 때 로그에
+> `embeddings server is outside this network`가 찍히면 이 상태예요.
+>
+> 회사 안으로 보는 주소는 `127.0.0.1`·`10.x`·`172.16~31.x`·`192.168.x` 같은 내부 주소, 점 없는 이름
+> (`local-embed` 같은 compose 서비스), `.local`·`.internal`·`.lan`으로 끝나는 이름, 내부 주소로만
+> 풀리는 이름이에요. 나머지는 모두 회사 밖으로 봐요.
+>
+> 가려서 만든 벡터는 이름·번호의 뜻을 담지 못해서, 이름으로 찾는 검색이 조금 약해져요. 시험 문서에서는
+> "박서연 대리 연락처", "김민준 과장 남은 연차" 모두 맞는 문서가 1위로 나왔지만, 두 번째 질문은 2위와 차이가
+> 작았어요(0.694 대 0.680).
 
 외부 서버를 쓸 때는 `local-embed`를 띄우지 않아도 돼요. `--no-deps`로 띄우세요.
 

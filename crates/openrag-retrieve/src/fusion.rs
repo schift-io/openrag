@@ -282,19 +282,31 @@ pub fn fuse_and_rank(
         );
     }
 
-    // 2. Identify active vs expired/superseded/future-dated revisions.
-    let mut max_active_rev: i32 = 1;
-    let mut any_stale = false;
-
+    // 2. Identify active vs expired/superseded/future-dated revisions per lineage: the same space
+    // group and normalized title, as in `max_rev_by_title_only`. Revisions are compared only within
+    // a lineage, so a document alone in its lineage gets no boost whatever its revision number.
+    #[derive(Default)]
+    struct LineageRevs {
+        max_active: i32,
+        active: usize,
+        any_stale: bool,
+    }
+    let lineage_of = |h: &HydratedCandidate| -> Option<(RevisionSpaceGroup, String)> {
+        let norm_t = normalize_term(h.title.as_deref()?);
+        (!norm_t.is_empty()).then(|| (RevisionSpaceGroup::from_space(h.space), norm_t))
+    };
+    let mut lineages: HashMap<(RevisionSpaceGroup, String), LineageRevs> = HashMap::new();
     for cand in accums.values() {
+        let Some(key) = lineage_of(cand.hydrated) else {
+            continue;
+        };
+        let g = lineages.entry(key).or_default();
         if is_stale(cand.hydrated) {
-            any_stale = true;
+            g.any_stale = true;
             continue;
         }
-        let rev = cand.hydrated.revision.unwrap_or(1).max(1);
-        if rev > max_active_rev {
-            max_active_rev = rev;
-        }
+        g.active += 1;
+        g.max_active = g.max_active.max(cand.hydrated.revision.unwrap_or(1).max(1));
     }
 
     // Prepare lexical rerank query weights.
@@ -406,12 +418,12 @@ pub fn fuse_and_rank(
             0.0
         } else {
             let rev = h.revision.unwrap_or(1).max(1);
-            if max_active_rev > 1 {
-                params.latest_revision_boost * ((rev - 1) as f32 / (max_active_rev - 1) as f32)
-            } else if any_stale {
-                params.latest_revision_boost
-            } else {
-                0.0
+            match lineage_of(h).and_then(|k| lineages.get(&k)) {
+                Some(g) if g.active >= 2 && g.max_active > 1 => {
+                    params.latest_revision_boost * ((rev - 1) as f32 / (g.max_active - 1) as f32)
+                }
+                Some(g) if g.any_stale => params.latest_revision_boost,
+                _ => 0.0,
             }
         };
 
