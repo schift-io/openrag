@@ -51,7 +51,7 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
 ### Option A: Standard Docker Stack
 ```bash
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # keep it: it wraps the PII vault keys
-docker compose -f docker/docker-compose.yml --profile app up -d postgres object-store openrag-api
+docker compose -f docker/docker-compose.yml --profile app up -d postgres openrag-api
 ```
 
 ### Option B: Air-Gapped On-Premises Docker Stack
@@ -62,14 +62,14 @@ hf download google/embeddinggemma-2 --cache-dir ./models
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
 export AIRGAP_LLM_URL=http://<vllm-host>:8000/v1 AIRGAP_LLM_MODEL=<served model>   # optional
 docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app --profile airgap \
-  up -d postgres object-store local-embed openrag-api
+  up -d postgres local-embed openrag-api
 ```
 
 The API runs as one process (it drains the indexing outbox inline; there is no worker service).
 Page thumbnails and figure crops are off by default (`thumbnail.enabled: false`): nothing shows them
-yet. When enabled they go to an S3 bucket: the bundled `object-store` service (RustFS), or any
-S3-compatible store through `OPENRAG_S3_ENDPOINT`, `OPENRAG_S3_BUCKET`, `OPENRAG_S3_REGION`,
-`OPENRAG_S3_ACCESS_KEY_ID`, `OPENRAG_S3_SECRET_ACCESS_KEY` and `OPENRAG_S3_URL_STYLE` (`path` | `virtual`).
+yet. When enabled they go to an S3-compatible bucket (AWS S3, RustFS, …) set through
+`OPENRAG_S3_ENDPOINT`, `OPENRAG_S3_BUCKET`, `OPENRAG_S3_REGION`, `OPENRAG_S3_ACCESS_KEY_ID`,
+`OPENRAG_S3_SECRET_ACCESS_KEY` and `OPENRAG_S3_URL_STYLE` (`path` | `virtual`).
 
 ### Option C: Local Rust & PostgreSQL 17 Verification
 Run all offline unit tests and strict lints:

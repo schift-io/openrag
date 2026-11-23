@@ -727,3 +727,36 @@ fn f16_f36_semantic_threshold_respects_allowlist_with_whitespace_and_surrounding
     assert_eq!(blocked.action, GuardAction::Block);
     Ok(())
 }
+
+#[test]
+fn korean_names_followed_by_a_spaced_job_title() {
+    let engine = PiiEngine::default();
+    let names = |text: &str| -> Vec<String> {
+        engine
+            .detect(text)
+            .into_iter()
+            .filter(|s| s.category == PiiCategory::PersonName)
+            .map(|s| s.matched_text)
+            .collect()
+    };
+    for (text, want) in [
+        ("김민준 과장은 마케팅팀 소속이다.", "김민준"),
+        ("담당: 이서연 대리", "이서연"),
+        ("박지우 사원에게 전달", "박지우"),
+        ("(정하준 부장)", "정하준"),
+    ] {
+        assert_eq!(names(text), vec![want.to_string()], "{text}");
+    }
+    for text in [
+        "신입 사원 교육 일정",
+        "전체 사원 공지",
+        "전산실 과장 회의",
+        "구매팀 차장 보고",
+    ] {
+        assert!(names(text).is_empty(), "{text}: {:?}", names(text));
+    }
+    // 님 after the title still ends it.
+    assert_eq!(names("김민준 과장님께서"), vec!["김민준".to_string()]);
+    // A title that only starts a longer word is not a title.
+    assert!(names("홍길동 대리점 위치").is_empty());
+}

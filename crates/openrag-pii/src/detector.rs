@@ -631,6 +631,53 @@ fn detect_korean_person_names(text: &str, source: &str, out: &mut Vec<(u8, PiiSp
             ));
         }
     }
+
+    // Full name, a space, then a job title: "김민준 과장은", "이서연 대리". Only three-syllable
+    // names (surname + two), so two-syllable words ("신입 사원", "전체 사원") stay out; words
+    // ending like a unit name ("전산실 과장", "구매팀 차장") stay out; the title must end the
+    // word or take a particle.
+    static RE_SPACED_TITLE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"([김이박최정강조윤장임한오서신권황안송류홍전고문양손배백허유남심노하곽성차주우구민][가-힣]{2}) (사원|주임|대리|과장|차장|부장|팀장|실장|본부장|이사|상무|전무|대표|선임|책임|수석|연구원|주무관|교수|박사)").ok()
+    });
+    if let Some(re) = RE_SPACED_TITLE.as_ref() {
+        for caps in re.captures_iter(text) {
+            let (Some(m), Some(title)) = (caps.get(1), caps.get(2)) else {
+                continue;
+            };
+            let before_hangul = text[..m.start()]
+                .chars()
+                .next_back()
+                .is_some_and(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c));
+            let unit_suffix = m
+                .as_str()
+                .chars()
+                .next_back()
+                .is_some_and(|c| "팀실부과처국청소사원단회".contains(c));
+            let mut after = text[title.end()..].chars();
+            let title_ends_word = match after.next() {
+                None => true,
+                Some(c) if !('\u{AC00}'..='\u{D7A3}').contains(&c) => true,
+                Some(c) if "은는이가을를의께도와과님".contains(c) => true,
+                Some('에') => after.next() == Some('게'),
+                Some(_) => false,
+            };
+            if before_hangul || unit_suffix || !title_ends_word {
+                continue;
+            }
+            out.push((
+                5,
+                PiiSpan {
+                    category: PiiCategory::PersonName,
+                    start_byte: m.start(),
+                    end_byte: m.end(),
+                    matched_text: m.as_str().to_string(),
+                    detector_source: source.to_string(),
+                    confidence: 0.80,
+                    detector_trace: serde_json::json!({"rule": "kr_name_spaced_title"}),
+                },
+            ));
+        }
+    }
 }
 
 fn detect_korean_addresses(text: &str, source: &str, out: &mut Vec<(u8, PiiSpan)>) {

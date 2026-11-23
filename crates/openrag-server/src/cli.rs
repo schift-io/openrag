@@ -69,7 +69,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start the local stack (PostgreSQL 17 + MinIO + OpenRAG) with docker compose
+    /// Start the local stack (PostgreSQL 17 + OpenRAG) with docker compose
     Up(UpArgs),
     /// Run the HTTP API and Streamable HTTP MCP endpoint (POST /mcp)
     Serve(ServeArgs),
@@ -132,7 +132,7 @@ pub enum AuthCmd {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum UpProfile {
-    /// PostgreSQL + MinIO + OpenRAG services
+    /// PostgreSQL + OpenRAG services
     Standard,
     /// Same stack on an internal-only network (no egress)
     Airgap,

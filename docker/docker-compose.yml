@@ -30,30 +30,6 @@ services:
       timeout: 5s
       retries: 12
 
-  # S3-compatible object store for page thumbnails and figure crops: RustFS (Apache-2.0). Objects
-  # live in the s3_data volume. Any S3-compatible server works in its place, or point OPENRAG_S3_*
-  # at AWS S3 and other hosted buckets.
-  object-store:
-    image: ${OBJECT_STORE_IMAGE:-rustfs/rustfs:1.0.6}
-    restart: unless-stopped
-    environment:
-      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-openrag_s3}
-      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-openrag_s3_secret}
-      RUSTFS_VOLUMES: /data
-      RUSTFS_ADDRESS: 0.0.0.0:9000
-      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
-      RUSTFS_CONSOLE_ENABLE: "true"
-    ports:
-      - "${S3_PORT:-9000}:9000"
-      - "${S3_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - s3_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-
   # One process: the API drains the indexing outbox inline, so there is no separate worker.
   openrag-api:
     profiles: ["app"]
@@ -66,8 +42,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      object-store:
-        condition: service_healthy
     environment:
       # Request traffic runs as openrag_app (RLS enforced); background work as openrag_worker.
       DATABASE_URL: postgres://openrag_app:${OPENRAG_APP_DB_PASSWORD:-openrag_app_dev_pass}@postgres:5432/${POSTGRES_DB:-openrag}
@@ -76,12 +50,13 @@ services:
       OPENRAG_PIPELINE_CONFIG: ${OPENRAG_PIPELINE_CONFIG:-/app/configs/pipeline.default.yaml}
       # 32-byte hex key that wraps the PII vault keys; without it the server uses a fixed dev key.
       OPENRAG_PII_KEK_HEX: ${OPENRAG_PII_KEK_HEX:?set OPENRAG_PII_KEK_HEX (openssl rand -hex 32)}
-      # Thumbnails go to this bucket (created on first start). Defaults: the object-store service above.
-      OPENRAG_S3_ENDPOINT: ${OPENRAG_S3_ENDPOINT:-http://object-store:9000}
-      OPENRAG_S3_BUCKET: ${S3_BUCKET:-openrag-artifacts}
+      # Page thumbnails are off by default (thumbnail.enabled in the pipeline config). When enabled
+      # they go to this S3-compatible bucket (AWS S3, RustFS, ...), created on first start.
+      OPENRAG_S3_ENDPOINT: ${OPENRAG_S3_ENDPOINT:-}
+      OPENRAG_S3_BUCKET: ${OPENRAG_S3_BUCKET:-}
       OPENRAG_S3_REGION: ${OPENRAG_S3_REGION:-us-east-1}
-      OPENRAG_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-openrag_s3}
-      OPENRAG_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-openrag_s3_secret}
+      OPENRAG_S3_ACCESS_KEY_ID: ${OPENRAG_S3_ACCESS_KEY_ID:-}
+      OPENRAG_S3_SECRET_ACCESS_KEY: ${OPENRAG_S3_SECRET_ACCESS_KEY:-}
       OPENRAG_S3_URL_STYLE: ${OPENRAG_S3_URL_STYLE:-path}
       # LLM for /v1/chat/completions and rag_ask: an OpenAI-compatible server (vLLM, ...).
       # Unset = none; MCP clients (Claude Code, Codex) answer from rag_search instead.
@@ -101,4 +76,3 @@ services:
 
 volumes:
   pg_data:
-  s3_data:
