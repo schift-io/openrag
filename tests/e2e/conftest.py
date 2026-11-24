@@ -12,7 +12,7 @@ from typing import Any, Literal, NoReturn
 import pytest
 
 # Ensure `from lib import ...` resolves regardless of whether pytest is invoked
-# from `/path/to/openrag` or `/path/to/openrag/tests/e2e`.
+# from the repository root or from `tests/e2e`.
 _E2E_ROOT = Path(__file__).resolve().parent
 if str(_E2E_ROOT) not in sys.path:
     sys.path.insert(0, str(_E2E_ROOT))

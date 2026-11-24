@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
-DEFAULT_TARGET_ROOT = "/path/to/openrag"
+# The repository this harness lives in: tests/e2e/lib/ -> repository root.
+DEFAULT_TARGET_ROOT = str(Path(__file__).resolve().parents[3])
 _VALID_MODES = ("auto", "offline", "live")
 _VALID_TIERS = ("1", "2", "3", "4", "all")
 _TIER_MARKERS = frozenset({"tier1", "tier2", "tier3", "tier4"})

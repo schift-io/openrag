@@ -38,8 +38,9 @@ Claude Code / Codex ──(MCP: rag_search)───────┘   찾은 문
 
 ## 2. 준비물
 
-- **Docker**: Docker Desktop, 또는 Docker Engine과 Compose v2. 처음 띄울 때 이미지와 임베딩 모델(약 1.5GB)을
-  받을 디스크 자리와, 임베딩 서버가 쓸 메모리 3GB쯤이 더 필요해요.
+- **Docker**: Docker Desktop, 또는 Docker Engine과 Compose v2. 처음 띄울 때 Docker 디스크가 12GB쯤 비어 있어야
+  해요. 이미지 3.8GB, 빌드 캐시 6GB쯤, 임베딩 모델 1.5GB가 들어가요. 빌드 캐시는 다 뜬 뒤 지워도 돼요. 임베딩
+  서버가 쓸 메모리도 3GB쯤 더 필요해요.
 - **질문할 PC의 Claude Code 또는 Codex**
 - **문서 폴더**: 서버가 이 폴더를 계속 지켜보면서 파일을 넣고, 고친 파일은 새 판으로 바꾸고, 지운 파일은
   검색에서 빼요([7장](#7-문서-넣기고치기지우기)). 기본으로 HWP, HWPX, MD, PDF, DOCX, PPTX, HTML, XLSX, CSV를
@@ -583,8 +584,12 @@ Codex를 실행한 셸에 `OPENRAG_API_KEY`가 없을 가능성이 커요. `echo
 보세요. 받는 중이었다면 다 받은 뒤 3장 명령을 한 번 더 실행하면 `openrag-api`가 떠요.
 
 ### `no space left on device`
-Docker가 쓰는 디스크가 꽉 찼어요. 모델(약 1.5GB)과 이미지를 받을 자리가 필요해요. `docker system df`로
-무엇이 자리를 차지하는지 보고, 필요 없는 것을 정리하거나 Docker Desktop의 디스크 크기를 늘리세요.
+Docker가 쓰는 디스크가 꽉 찼어요. 처음 띄울 때는 12GB쯤 필요해요(이미지 3.8GB, 빌드 캐시 6GB쯤, 모델 1.5GB).
+`docker system df`로 무엇이 자리를 차지하는지 보세요. 빌드 캐시(`Build Cache`)가 크면 `docker builder prune -a`로
+지울 수 있어요. 다른 프로젝트의 빌드 캐시도 같이 지워지니, 다음 빌드가 조금 느려지는 것 말고는 문제없어요. 그래도
+모자라면 Docker Desktop 설정에서 디스크 크기를 늘리세요. 자리를 만든 뒤 같은 `up -d` 명령을 다시 실행해요. 처음
+설치하는 중이라 아직 넣은 문서가 없다면, `down -v`로 볼륨까지 지우고 다시 띄우는 게 가장 확실해요. 볼륨을 지우면
+데이터베이스도 지워지니 설치 중일 때만 그렇게 하세요.
 
 ### PDF를 넣었더니 `this PDF has no text layer (a scan?) and OCR is not configured`
 스캔한 PDF예요. OCR을 설정하고 다시 넣으세요([10장](#10-스캔본-읽기ocr)).

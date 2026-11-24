@@ -4,7 +4,7 @@ This directory contains the requirement-driven, opaque-box `pytest` end-to-end t
 
 ## Quickstart
 
-Run from the repository root (`/path/to/openrag`):
+Run from the repository root:
 
 ```bash
 # List all registered tier and feature markers
@@ -46,7 +46,7 @@ pytest --tier 1
 |---|---|---|---|
 | `--tier` | — | `None` | Filter tests by `1`, `2`, `3`, `4`, or `all` (excludes `selftest` when set) |
 | `--mode` | `OPENRAG_E2E_MODE` | `auto` | Execution mode: `auto`, `offline` (deterministic local adapters), or `live` |
-| `--target-root` | `OPENRAG_ROOT` | `/path/to/openrag` | Root directory of the OpenRAG repository under test |
+| `--target-root` | `OPENRAG_ROOT` | the repository that contains `tests/e2e` | Root directory of the OpenRAG repository under test |
 | `--api-url` | `OPENRAG_API_URL` | `None` | Base URL of an already-running OpenRAG HTTP server (if omitted, `EphemeralOpenRagServer` is spawned) |
 | `--pg-port` | `OPENRAG_PG_PORT` | `0` | TCP port for ephemeral PostgreSQL 17 cluster (`0` picks a free port on `127.0.0.1`) |
 | `--openrag-bin` | `OPENRAG_BIN` | `None` | Explicit path to the `openrag` binary |
