@@ -1,6 +1,6 @@
 {
   "name": "openrag",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "사내 문서 검색 OpenRAG를 Claude Code에 붙인다: 검색·문서 읽기 MCP, 설치·운영 마법사, kordoc으로 만든 문서를 만들자마자 OpenRAG에 저장하는 훅.",
   "author": {
     "name": "schift-io",

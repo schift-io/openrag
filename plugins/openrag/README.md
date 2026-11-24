@@ -57,7 +57,10 @@ Claude Code 설정이 비어 있으면 같은 줄의 환경변수를 읽어요.
 - 서버가 꺼져 있거나 키가 틀리면 경고 한 줄만 보이고 kordoc 결과는 그대로예요.
 - 훅은 저장이 끝날 때까지 기다려요(최대 2분). 시험한 HWPX 문서에서는 0.3~3.6초 걸렸어요.
 
-시험한 것(2026-11-24): Claude Code 2.1.331에 이 폴더를 `--plugin-dir`로 붙이고 kordoc 4.25.11로 HWPX를 만들자,
-같은 세션의 `rag_search` 첫 결과가 그 문서였어요. Codex 0.171.0에서는 같은 훅 스크립트를 설정(`-c hooks…`)으로
-붙여 같은 결과를 받았고, 플러그인 설치(`codex plugin add`)와 스킬 노출은 따로 확인했어요. 시험하지 못한 것:
-GitHub에서 설치하는 경로, Codex에서 플러그인으로 설치한 훅이 실제로 도는 것, Windows.
+시험한 것(2026-11-24): Claude Code 2.1.331과 Codex 0.171.0 모두 kordoc 4.25.11로 HWPX를 만들자, 플러그인 훅이 그 파일을
+저장했고 같은 세션의 `rag_search` 첫 결과가 그 문서였어요. 두 도구 모두 GitHub에서 설치한 사본이 시험한 파일과
+같은 것도 확인했어요. Windows는 시험하지 못했어요.
+
+Codex용 매니페스트는 `.codex-plugin/plugin.json`이에요. 플러그인 루트에 `plugin.json`(Agent Plugins 형식)을 두면
+Codex가 플러그인 훅을 읽지 않아요(Codex 0.171.0 소스 `core-plugins/src/loader.rs`). `mcpServers: {}`는 Claude Code용
+`.mcp.json`을 Codex가 읽지 않게 막아요.
