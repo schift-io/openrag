@@ -67,6 +67,11 @@ store:
   external_mirror: none
   outbox_batch_size: 64
   outbox_max_attempts: 3
+  # pg_pinecone search: share of clusters probed per query and exact re-ranking pool (x100 rows).
+  # 0 keeps pg_pinecone's own value.
+  pg_pinecone_search:
+    scan_fraction: 0.5
+    rescore_multiplier: 4
 
 retrieve:
   # Text spaces are ranked by the embedding model alone: on Ko-StrategyQA (EmbeddingGemma-2 @256d)

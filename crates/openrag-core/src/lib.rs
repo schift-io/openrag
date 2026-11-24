@@ -11,7 +11,7 @@ pub use access::{AccessScope, AuthLevel, IamAction, Sensitivity};
 pub use arn::{arn_pattern_matches, Arn, ArnResourceType};
 pub use config::{
     ExternalMirrorBackend, FusionMode, LlmConfig, MemoryBackendKind, MemoryConfig, OcrModeRule,
-    OptimizationStrategy, ParseConfig, PgPineconeEngine, PiiConfig, PipelineConfig,
+    OptimizationStrategy, ParseConfig, PgPineconeEngine, PgPineconeSearchConfig, PiiConfig, PipelineConfig,
     PipelineProfile, RetrieveConfig, SearchSpaceConfig, SecurityGateConfig, StoreConfig,
     ThumbnailConfig,
 };

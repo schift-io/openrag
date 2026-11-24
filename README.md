@@ -85,6 +85,7 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 
 - **벡터 엔진**은 표마다 바꿀 수 있어요: `native`(pg_pinecone RaBitQ IVF, 외부 계정 불필요),
   `pgvector`(HNSW), `remote`(Pinecone Serverless). Amazon S3 Vectors나 OSS 벡터 저장소로 복제할 수도 있어요.
+  `native` 인덱스는 문서가 20% 늘 때마다 데이터베이스가 알아서 다시 만들어요(가이드 11장).
 - **임베딩**은 `google/embeddinggemma-2`를 256차원으로 쓰도록 맞춰 뒀어요(기본 구성과 폐쇄망 구성
   모두 이 모델을 같이 띄워요). 한국어 검색 평가(Ko-StrategyQA)에서 nDCG@10 0.781이 나왔고, BM25를 섞으면 0.703으로 떨어져서
   기본으로는 섞지 않아요.

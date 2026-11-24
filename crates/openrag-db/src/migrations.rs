@@ -92,6 +92,11 @@ pub const EMBEDDED_MIGRATIONS: &[MigrationSpec] = &[
         filename: "013_llm_cli_providers.sql",
         sql: include_str!("../../../migrations/013_llm_cli_providers.sql"),
     },
+    MigrationSpec {
+        version: "014",
+        filename: "014_pg_pinecone_maintenance.sql",
+        sql: include_str!("../../../migrations/014_pg_pinecone_maintenance.sql"),
+    },
 ];
 
 pub fn sha256_hex(input: &str) -> String {

@@ -109,6 +109,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             external_mirror: ExternalMirrorBackend::None,
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
+            pg_pinecone_search: Default::default(),
         },
         retrieve: RetrieveConfig {
             spaces: vec![
@@ -314,6 +315,7 @@ struct TolerantStoreConfig {
     external_mirror: Option<ExternalMirrorBackend>,
     outbox_batch_size: Option<u32>,
     outbox_max_attempts: Option<u32>,
+    pg_pinecone_search: Option<openrag_core::PgPineconeSearchConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +508,9 @@ pub fn parse_pipeline_yaml_with_profile(
         }
         if let Some(v) = st.outbox_max_attempts {
             cfg.store.outbox_max_attempts = v;
+        }
+        if let Some(v) = st.pg_pinecone_search {
+            cfg.store.pg_pinecone_search = v;
         }
     }
 

@@ -401,6 +401,9 @@ impl AppState {
         let app_pool = self.require_app_pool()?.clone();
         let pipeline = retrieval_pipeline(self.pipeline_config.read().await.clone(), self.has_text_model);
         let mut backend = PgRetrieveBackend::new(app_pool).with_embedder(Arc::clone(&self.text_embedder));
+        if pipeline.store.pg_pinecone_engine == openrag_core::PgPineconeEngine::Native {
+            backend = backend.with_pg_pinecone_search(pipeline.store.pg_pinecone_search);
+        }
         if let Some(worker) = self.worker_pool.as_ref() {
             backend = backend.load_bindings_from_worker(worker, org_id).await?;
         }
@@ -645,6 +648,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             external_mirror: ExternalMirrorBackend::None,
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
+            pg_pinecone_search: Default::default(),
         },
         retrieve: RetrieveConfig {
             spaces: vec![

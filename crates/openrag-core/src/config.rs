@@ -129,7 +129,7 @@ pub enum ExternalMirrorBackend {
     Usearch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     pub pg_pinecone_engine: PgPineconeEngine,
@@ -139,6 +139,27 @@ pub struct StoreConfig {
     pub external_mirror: ExternalMirrorBackend,
     pub outbox_batch_size: u32,
     pub outbox_max_attempts: u32,
+    #[serde(default)]
+    pub pg_pinecone_search: PgPineconeSearchConfig,
+}
+
+/// pg_pinecone (native engine) search settings, set on each search transaction with `SET LOCAL`.
+/// 0 leaves pg_pinecone's own value (the probe count its index build calibrated).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PgPineconeSearchConfig {
+    /// `pinecone.scan_fraction`: share of IVF lists probed per query, 0.0..=1.0.
+    pub scan_fraction: f32,
+    /// `pinecone.rescore_multiplier`: candidates re-ranked with exact distance, in hundreds, 0..=1000.
+    pub rescore_multiplier: u32,
+}
+
+impl Default for PgPineconeSearchConfig {
+    /// Measured 2026-11-24 on 100k rows (Ko-StrategyQA + MIRACL ko, EG2@256) through the HTTP
+    /// search path: nDCG@10 0.7109 → 0.7147 (exact scan 0.7159) at the same p50 latency.
+    fn default() -> Self {
+        Self { scan_fraction: 0.5, rescore_multiplier: 4 }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +238,19 @@ impl PipelineConfig {
             return Err(OpenRagError::Config(format!(
                 "store.dim must be 256, got {}",
                 self.store.dim
+            )));
+        }
+        let search = self.store.pg_pinecone_search;
+        if !search.scan_fraction.is_finite() || !(0.0..=1.0).contains(&search.scan_fraction) {
+            return Err(OpenRagError::Config(format!(
+                "store.pg_pinecone_search.scan_fraction must be within 0.0..=1.0, got {}",
+                search.scan_fraction
+            )));
+        }
+        if search.rescore_multiplier > 1000 {
+            return Err(OpenRagError::Config(format!(
+                "store.pg_pinecone_search.rescore_multiplier must be within 0..=1000, got {}",
+                search.rescore_multiplier
             )));
         }
         if self.thumbnail.max_edge_px == 0

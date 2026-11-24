@@ -92,6 +92,8 @@ impl PgPineconeManager {
 
             if attempt.is_err() {
                 Self::ensure_pgvector_hnsw(worker_pool, table).await?;
+            } else if engine == PgPineconeEngine::Native {
+                Self::schedule_native_maintenance(worker_pool, table_str).await;
             }
         } else {
             Self::ensure_pgvector_hnsw(worker_pool, table).await?;
@@ -119,6 +121,27 @@ impl PgPineconeManager {
         .map_err(|e| OpenRagError::Database(format!("failed to upsert index_binding: {e}")))?;
 
         row_to_binding(&row)
+    }
+
+    /// A native index clusters the rows present when it is built; rows added later are not, and an
+    /// index built on an empty table is costed out by the planner. Registering it lets the
+    /// pg_pinecone worker REINDEX it once 20% of the table was inserted since the last build
+    /// (with `pinecone.auto_maintain = on`, see docker/docker-compose.yml). Failure is logged only:
+    /// the index still works, it just drifts until rebuilt.
+    async fn schedule_native_maintenance(worker_pool: &DbPool, table: &str) {
+        let res = sqlx::query(
+            "SELECT pinecone.schedule_maintenance(i.indexrelid::regclass, 0.2)
+             FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             JOIN pg_am a ON a.oid = c.relam
+             WHERE a.amname = 'pinecone' AND i.indrelid = $1::regclass",
+        )
+        .bind(table)
+        .execute(worker_pool.inner())
+        .await;
+        if let Err(e) = res {
+            tracing::warn!(table, error = %e, "pg_pinecone maintenance not scheduled");
+        }
     }
 
     async fn ensure_pgvector_hnsw(

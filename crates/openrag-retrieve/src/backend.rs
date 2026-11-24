@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use openrag_core::{AccessScope, BBoxNorm1000, OpenRagError, PrincipalContext};
+use openrag_core::{AccessScope, BBoxNorm1000, OpenRagError, PgPineconeSearchConfig, PrincipalContext};
 use openrag_db::{DbPool, RlsTransaction};
 use openrag_memory::{ConceptGraph, DeterministicTextEmbedder, InMemoryConceptStore, TextEmbedder};
 use openrag_store::{
@@ -46,6 +46,7 @@ pub struct PgRetrieveBackend {
     manager: PgPineconeManager,
     embedder: Arc<dyn TextEmbedder>,
     bindings: HashMap<VectorTable, IndexBinding>,
+    pinecone_search: Option<PgPineconeSearchConfig>,
 }
 
 impl PgRetrieveBackend {
@@ -55,6 +56,7 @@ impl PgRetrieveBackend {
             manager: PgPineconeManager::new(),
             embedder: Arc::new(DeterministicTextEmbedder::default()),
             bindings: HashMap::new(),
+            pinecone_search: None,
         }
     }
 
@@ -70,6 +72,12 @@ impl PgRetrieveBackend {
 
     pub fn with_bindings(mut self, bindings: HashMap<VectorTable, IndexBinding>) -> Self {
         self.bindings = bindings;
+        self
+    }
+
+    /// pg_pinecone search settings for every search transaction (native engine only).
+    pub fn with_pg_pinecone_search(mut self, cfg: PgPineconeSearchConfig) -> Self {
+        self.pinecone_search = Some(cfg);
         self
     }
 
@@ -99,6 +107,9 @@ impl RetrieveBackend for PgRetrieveBackend {
     ) -> Result<BackendExecutionOutput, OpenRagError> {
         let caps = self.app_pool.capabilities().await?;
         let mut tx = self.app_pool.begin_rls_tx(ctx).await?;
+        if let Some(cfg) = self.pinecone_search.filter(|_| caps.has_pg_pinecone) {
+            set_pg_pinecone_search(&mut tx, cfg).await?;
+        }
 
         let lookup_terms = build_concept_lookup_terms(&input.clean_query);
         let expanded_terms = if lookup_terms.is_empty() {
@@ -404,6 +415,28 @@ async fn compute_active_bucket_facets_rls(
         out.insert(tag, count);
     }
     Ok(out)
+}
+
+/// `SET LOCAL` for pg_pinecone's probe and rescore settings; 0 keeps pg_pinecone's own value.
+async fn set_pg_pinecone_search(
+    tx: &mut RlsTransaction<'_>,
+    cfg: PgPineconeSearchConfig,
+) -> Result<(), OpenRagError> {
+    let scan = (cfg.scan_fraction > 0.0).then(|| cfg.scan_fraction.to_string());
+    let rescore = (cfg.rescore_multiplier > 0).then(|| cfg.rescore_multiplier.to_string());
+    if scan.is_none() && rescore.is_none() {
+        return Ok(());
+    }
+    sqlx::query(
+        "SELECT CASE WHEN $1::text IS NULL THEN NULL ELSE set_config('pinecone.scan_fraction', $1, true) END,
+                CASE WHEN $2::text IS NULL THEN NULL ELSE set_config('pinecone.rescore_multiplier', $2, true) END",
+    )
+    .bind(scan)
+    .bind(rescore)
+    .execute(&mut **tx.tx_mut())
+    .await
+    .map_err(|e| OpenRagError::Database(format!("set pg_pinecone search settings: {e}")))?;
+    Ok(())
 }
 
 async fn space_hits_contain_archived(

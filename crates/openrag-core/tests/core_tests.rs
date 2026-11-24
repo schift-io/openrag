@@ -57,6 +57,30 @@ fn search_space_example_yaml_roundtrips_1_to_1() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn pg_pinecone_search_defaults_and_bounds() -> Result<(), Box<dyn std::error::Error>> {
+    let base = include_str!("../../../configs/pipeline.default.yaml");
+    let parsed = PipelineConfig::from_yaml_str(base)?;
+    assert!((parsed.store.pg_pinecone_search.scan_fraction - 0.5).abs() < 1e-6);
+    assert_eq!(parsed.store.pg_pinecone_search.rescore_multiplier, 4);
+    let omitted = base.replace("  pg_pinecone_search:\n    scan_fraction: 0.5\n    rescore_multiplier: 4\n", "");
+    assert_ne!(omitted, base);
+    let parsed = PipelineConfig::from_yaml_str(&omitted)?;
+    assert_eq!(parsed.store.pg_pinecone_search, openrag_core::PgPineconeSearchConfig::default());
+    for (from, to) in [
+        ("scan_fraction: 0.5", "scan_fraction: 1.5"),
+        ("scan_fraction: 0.5", "scan_fraction: .nan"),
+        ("rescore_multiplier: 4", "rescore_multiplier: 1001"),
+    ] {
+        let yaml = base.replace(from, to);
+        assert!(
+            matches!(PipelineConfig::from_yaml_str(&yaml), Err(OpenRagError::Config(_))),
+            "expected Config error for {to}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn invalid_configs_are_rejected() {
     let base = include_str!("../../../configs/pipeline.default.yaml");
 
