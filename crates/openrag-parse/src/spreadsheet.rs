@@ -606,7 +606,7 @@ pub fn parse_spreadsheet(bytes: &[u8], format: DocumentFormat, filename: Option<
         .map(|s| format!("{}{} ({}행)", s.name, if s.hidden { "·숨김" } else { "" }, group_digits(data_rows(s))))
         .collect();
     let mut overview = format!(
-        "# {kind} \"{}\"\n이 문서는 {kind}의 안내 카드예요. 시트 {}개: {}.\n셀 내용 전체는 rag_read_sheet 도구(document_id, 시트 이름, 시작 행, 행 수)로 읽을 수 있어요.",
+        "# {kind} \"{}\"\n이 문서는 {kind}의 안내 카드예요. 시트 {}개: {}.\n셀 내용은 rag_read_sheet 도구로 읽어요: 시작 행과 행 수로 넘겨 읽거나, find(찾을 값)와 column(열 이름)으로 그 값이 든 행만 골라 읽어요.",
         filename.unwrap_or(&title),
         sheets.len(),
         visible.join(", ")
@@ -658,7 +658,71 @@ pub struct SheetSlice {
     /// Data rows (below the header), 0-based.
     pub offset: usize,
     pub rows: Vec<Vec<String>>,
+    /// Position of each returned row among the data rows: the `offset` that reads it unfiltered.
+    pub row_index: Vec<usize>,
     pub total_rows: usize,
+    /// Rows of `sheet` that pass the filter (`None` when the read is not filtered).
+    pub total_matches: Option<usize>,
+    /// Matching rows per searched sheet, in workbook order (empty when not filtered).
+    pub matches_by_sheet: Vec<(String, usize)>,
+}
+
+/// Which rows a filtered read keeps: rows with a cell that contains `text` (equals it when
+/// `exact`), looking in `column` only when one is named. Case, runs of spaces and thousands
+/// separators (`1,350,000`) are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowFilter {
+    pub text: String,
+    pub column: Option<String>,
+    pub exact: bool,
+}
+
+fn pick<'a>(sheets: &'a [Sheet], names: &[String], want: &str) -> Result<&'a Sheet, OpenRagError> {
+    sheets
+        .iter()
+        .find(|s| s.name == want)
+        .or_else(|| sheets.iter().find(|s| s.name.eq_ignore_ascii_case(want.trim())))
+        .ok_or_else(|| OpenRagError::NotFound(format!("no sheet named '{want}' (sheets: {})", names.join(", "))))
+}
+
+/// (header, data rows below it).
+fn split_sheet(sheet: &Sheet) -> (Vec<String>, &[Vec<String>]) {
+    let (titles, header_idx) = header_of(&sheet.rows);
+    let start = header_idx.map_or(titles.len(), |i| i + 1);
+    let header = header_idx.and_then(|i| sheet.rows.get(i)).cloned().unwrap_or_default();
+    (header, &sheet.rows[start.min(sheet.rows.len())..])
+}
+
+/// Lower case, single spaces, no commas between digits.
+fn normalize(s: &str) -> String {
+    let lower = s.trim().to_lowercase();
+    let chars: Vec<char> = lower.split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let between_digits = i > 0 && chars[i - 1].is_ascii_digit() && chars.get(i + 1).is_some_and(char::is_ascii_digit);
+        if !(c == ',' && between_digits) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Column by its header name, by the `열N` name the cards use for unnamed columns, or by its
+/// letter (`C`).
+fn column_index(header: &[String], data: &[Vec<String>], want: &str) -> Option<usize> {
+    let w = normalize(want);
+    let width = data.iter().map(Vec::len).chain([header.len()]).max().unwrap_or(0);
+    let named = Some(header.to_vec());
+    (0..width)
+        .find(|&i| header.get(i).is_some_and(|h| normalize(h) == w))
+        .or_else(|| (0..width).find(|&i| normalize(&column_name(named.as_ref(), i)) == w))
+        .or_else(|| {
+            let t = want.trim();
+            (!t.is_empty() && t.len() <= 3 && t.chars().all(|c| c.is_ascii_alphabetic()))
+                .then(|| column_of(t))
+                .flatten()
+                .filter(|&i| i < width)
+        })
 }
 
 /// Rows `offset..offset+limit` of a sheet (by name; the first sheet when `None`), below its header.
@@ -673,17 +737,116 @@ pub fn read_sheet(
     let sheets = sheets_of(bytes, format, filename, usize::MAX)?;
     let names: Vec<String> = sheets.iter().map(|s| s.name.clone()).collect();
     let chosen = match sheet {
-        Some(want) => sheets
-            .iter()
-            .find(|s| s.name == want)
-            .or_else(|| sheets.iter().find(|s| s.name.eq_ignore_ascii_case(want.trim())))
-            .ok_or_else(|| OpenRagError::NotFound(format!("no sheet named '{want}' (sheets: {})", names.join(", "))))?,
+        Some(want) => pick(&sheets, &names, want)?,
         None => sheets.first().ok_or_else(|| OpenRagError::NotFound("the file has no sheets".into()))?,
     };
-    let (titles, header_idx) = header_of(&chosen.rows);
-    let start = header_idx.map_or(titles.len(), |i| i + 1);
-    let header = header_idx.and_then(|i| chosen.rows.get(i)).cloned().unwrap_or_default();
-    let data = &chosen.rows[start.min(chosen.rows.len())..];
+    let (header, data) = split_sheet(chosen);
     let rows: Vec<Vec<String>> = data.iter().skip(offset).take(limit).cloned().collect();
-    Ok(SheetSlice { sheets: names, sheet: chosen.name.clone(), header, offset, rows, total_rows: data.len() })
+    let row_index = (offset..offset + rows.len()).collect();
+    Ok(SheetSlice {
+        sheets: names,
+        sheet: chosen.name.clone(),
+        header,
+        offset,
+        rows,
+        row_index,
+        total_rows: data.len(),
+        total_matches: None,
+        matches_by_sheet: Vec::new(),
+    })
+}
+
+/// One searched sheet: its header, data rows and the rows that passed the filter.
+struct Searched<'a> {
+    sheet: &'a Sheet,
+    header: Vec<String>,
+    data: &'a [Vec<String>],
+    hits: Vec<usize>,
+}
+
+/// The rows that pass `filter`, `offset..offset+limit` of them. With `sheet` the search stays in
+/// that sheet; without it every sheet is searched, `matches_by_sheet` counts them all and the rows
+/// come from the first sheet that has a match.
+pub fn find_rows(
+    bytes: &[u8],
+    format: DocumentFormat,
+    filename: Option<&str>,
+    sheet: Option<&str>,
+    filter: &RowFilter,
+    offset: usize,
+    limit: usize,
+) -> Result<SheetSlice, OpenRagError> {
+    let needle = normalize(&filter.text);
+    if needle.is_empty() {
+        return Err(OpenRagError::Validation("the text to find is empty".into()));
+    }
+    let sheets = sheets_of(bytes, format, filename, usize::MAX)?;
+    let names: Vec<String> = sheets.iter().map(|s| s.name.clone()).collect();
+    let searched: Vec<&Sheet> = match sheet {
+        Some(want) => vec![pick(&sheets, &names, want)?],
+        None => sheets.iter().collect(),
+    };
+    if searched.is_empty() {
+        return Err(OpenRagError::NotFound("the file has no sheets".into()));
+    }
+    let mut found: Vec<Searched<'_>> = Vec::with_capacity(searched.len());
+    let mut has_column = filter.column.is_none();
+    for s in searched {
+        let (header, data) = split_sheet(s);
+        let col = match filter.column.as_deref() {
+            Some(c) => match column_index(&header, data, c) {
+                Some(i) => {
+                    has_column = true;
+                    Some(i)
+                }
+                None => {
+                    found.push(Searched { sheet: s, header, data, hits: Vec::new() });
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let hits = data
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                let cells: Box<dyn Iterator<Item = &String>> = match col {
+                    Some(i) => Box::new(row.get(i).into_iter()),
+                    None => Box::new(row.iter()),
+                };
+                cells.into_iter().any(|cell| {
+                    let c = normalize(cell);
+                    if filter.exact { c == needle } else { c.contains(&needle) }
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        found.push(Searched { sheet: s, header, data, hits });
+    }
+    if !has_column {
+        let Searched { header, data, .. } = &found[0];
+        let width = data.iter().map(Vec::len).chain([header.len()]).max().unwrap_or(0);
+        let named = Some(header.clone());
+        let columns: Vec<String> = (0..width).map(|i| column_name(named.as_ref(), i)).collect();
+        return Err(OpenRagError::NotFound(format!(
+            "no column named '{}' (columns: {})",
+            filter.column.as_deref().unwrap_or_default(),
+            columns.join(", ")
+        )));
+    }
+    let matches_by_sheet = found.iter().map(|f| (f.sheet.name.clone(), f.hits.len())).collect();
+    let at = found.iter().position(|f| !f.hits.is_empty()).unwrap_or(0);
+    let Searched { sheet: chosen, header, data, hits } = found.swap_remove(at);
+    let row_index: Vec<usize> = hits.iter().copied().skip(offset).take(limit).collect();
+    Ok(SheetSlice {
+        sheets: names,
+        sheet: chosen.name.clone(),
+        header,
+        offset,
+        rows: row_index.iter().map(|&i| data[i].clone()).collect(),
+        row_index,
+        total_rows: data.len(),
+        total_matches: Some(hits.len()),
+        matches_by_sheet,
+    })
 }

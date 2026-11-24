@@ -419,7 +419,7 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "openrag", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card. rag_list_documents shows what is in a bucket.",
+        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card; to find a specific value in it, pass find (and column) rather than paging through every row. rag_list_documents shows what is in a bucket.",
     })
 }
 
@@ -593,12 +593,15 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "rag_read_sheet",
             "Read spreadsheet rows",
-            "Read rows of an Excel (.xlsx) or CSV document found by rag_search or rag_list_documents (source.kind = spreadsheet). Returns the column names, the rows from 'offset' (below the header), total_rows and next_offset for paging, plus a Markdown table. Omit 'sheet' for the first sheet; the response lists every sheet. Only files from a watched documents folder can be read this way.",
+            "Read rows of an Excel (.xlsx) or CSV document found by rag_search or rag_list_documents (source.kind = spreadsheet). Search only indexes the file's catalog card, so look up a specific value (an order number, a name, a date like 2024-03) here with 'find': only rows with a cell containing it come back, with total_matches and row_index (each row's position; pass it as 'offset' without 'find' to read the rows around it). Case and thousands separators are ignored; 'column' limits the search to one column, 'exact' requires the whole cell to match. Without 'find', returns the rows from 'offset' (below the header). Either way: column names, total_rows, next_offset for paging, and a Markdown table. Omit 'sheet' for the first sheet, or with 'find' to search every sheet (matches_by_sheet counts them; rows come from the first sheet with a match). Only files from a watched documents folder can be read this way.",
             schema(
                 json!({
                     "document_id": str_prop("Document id"),
-                    "sheet": str_prop("Sheet name (default: the first sheet)"),
-                    "offset": int_prop("First data row, 0-based", 0, 10_000_000),
+                    "sheet": str_prop("Sheet name (default: the first sheet; with find, every sheet)"),
+                    "find": str_prop("Keep only rows with a cell containing this text"),
+                    "column": str_prop("Look for 'find' in this column only (a name from columns)"),
+                    "exact": { "type": "boolean", "description": "The whole cell must equal 'find'" },
+                    "offset": int_prop("First data row (or first match, with find), 0-based", 0, 10_000_000),
                     "limit": int_prop("Rows to return (default 50)", 1, 500),
                 }),
                 &["document_id"],
@@ -1272,6 +1275,15 @@ async fn rag_read_sheet(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Valu
     let mut qs: Vec<String> = Vec::new();
     if let Some(sh) = arg_str_opt(args, "sheet")?.filter(|s| !s.trim().is_empty()) {
         qs.push(format!("sheet={}", pct_encode(sh.trim())));
+    }
+    if let Some(f) = arg_str_opt(args, "find")?.filter(|s| !s.trim().is_empty()) {
+        qs.push(format!("find={}", pct_encode(f.trim())));
+    }
+    if let Some(c) = arg_str_opt(args, "column")?.filter(|s| !s.trim().is_empty()) {
+        qs.push(format!("column={}", pct_encode(c.trim())));
+    }
+    if arg_bool_opt(args, "exact")? == Some(true) {
+        qs.push("exact=true".into());
     }
     if let Some(o) = arg_u64_opt(args, "offset")? {
         qs.push(format!("offset={o}"));

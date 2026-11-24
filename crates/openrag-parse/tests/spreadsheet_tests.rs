@@ -1,6 +1,6 @@
 use std::io::{Cursor, Write};
 
-use openrag_parse::{parse_spreadsheet, read_sheet, DocumentFormat};
+use openrag_parse::{find_rows, parse_spreadsheet, read_sheet, DocumentFormat, RowFilter};
 use zip::write::SimpleFileOptions;
 
 type R = Result<(), Box<dyn std::error::Error>>;
@@ -97,6 +97,41 @@ fn rows_are_read_on_demand() -> R {
     assert_eq!(s.rows, [vec!["2024-01-29", "판교", "29000"], vec!["2024-01-30", "부산", "30000"]]);
     let err = read_sheet(&bytes, DocumentFormat::Xlsx, None, Some("없는시트"), 0, 5).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("sheets: 매출, 코드"), "{err}");
+    Ok(())
+}
+
+fn find(text: &str, column: Option<&str>, exact: bool) -> RowFilter {
+    RowFilter { text: text.into(), column: column.map(Into::into), exact }
+}
+
+#[test]
+fn rows_with_a_value_across_sheets() -> R {
+    let bytes = workbook()?;
+    let x = DocumentFormat::Xlsx;
+    // Every sheet is searched; rows come from the first sheet with a match.
+    let s = find_rows(&bytes, x, None, None, &find("판교", None, false), 0, 50)?;
+    assert_eq!(s.matches_by_sheet, [("매출".to_string(), 10), ("코드".to_string(), 0)]);
+    assert_eq!((s.sheet.as_str(), s.total_matches, s.total_rows), ("매출", Some(10), 30));
+    assert_eq!(s.row_index[..3], [1, 4, 7]);
+    let s = find_rows(&bytes, x, None, None, &find("본사", None, false), 0, 50)?;
+    assert_eq!((s.sheet.as_str(), s.rows.clone()), ("코드", vec![vec!["A01".to_string(), "본사 & 지원".to_string()]]));
+    // Thousands separators and case are ignored; paging goes over the matches.
+    let s = find_rows(&bytes, x, None, Some("매출"), &find("29,000", None, false), 0, 50)?;
+    assert_eq!((s.rows.clone(), s.row_index.clone()), (vec![vec!["2024-01-29".to_string(), "판교".into(), "29000".into()]], vec![28]));
+    let s = find_rows(&bytes, x, None, None, &find("판교", None, false), 8, 5)?;
+    assert_eq!((s.row_index.clone(), s.total_matches), (vec![25, 28], Some(10)));
+    // A month of dates, one column by name or letter, a whole cell.
+    assert_eq!(find_rows(&bytes, x, None, None, &find("2024-01-1", None, false), 0, 50)?.total_matches, Some(10));
+    assert_eq!(find_rows(&bytes, x, None, None, &find("강남", Some("B"), false), 0, 50)?.total_matches, Some(10));
+    assert!(find_rows(&bytes, x, None, None, &find("2000", Some("금액"), false), 0, 50)?.total_matches > Some(1));
+    let s = find_rows(&bytes, x, None, None, &find("2000", Some("금액"), true), 0, 50)?;
+    assert_eq!((s.row_index.clone(), s.total_matches), (vec![1], Some(1)));
+    // A column only some sheets have counts nothing elsewhere; one no sheet has is an error.
+    let s = find_rows(&bytes, x, None, None, &find("본사", Some("지점"), false), 0, 50)?;
+    assert_eq!(s.matches_by_sheet, [("매출".to_string(), 0), ("코드".to_string(), 0)]);
+    let err = find_rows(&bytes, x, None, None, &find("본사", Some("없는열"), false), 0, 50).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("no column named '없는열' (columns: 날짜, 지점, 금액)"), "{err}");
+    assert!(find_rows(&bytes, x, None, None, &find("  ", None, false), 0, 50).is_err());
     Ok(())
 }
 

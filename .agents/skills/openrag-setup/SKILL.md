@@ -130,7 +130,7 @@ docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents f
   blocked`)이면 9장을 안내한다.
 - 폴더가 비어 있으면 아무 줄도 없다. 폴더에 파일을 넣으면 30초 안에 들어간다고 알려 준다. 기본으로 읽는 종류는
   hwp, hwpx, md, pdf, docx, pptx, html, xlsx, csv다(바꾸려면 `docker/.env`에 `OPENRAG_DOCS_TYPES`). 엑셀·CSV는
-  안내 카드로 들어가고 칸 값은 AI가 `rag_read_sheet`로 읽는다고 알려 준다.
+  안내 카드로 들어가고 칸 값은 AI가 `rag_read_sheet`로 읽거나 `find`로 찾는다고 알려 준다.
 
 ## 7단계: Claude Code / Codex 연결 (확인 받고)
 

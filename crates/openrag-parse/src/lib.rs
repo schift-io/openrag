@@ -22,7 +22,7 @@ pub mod thumbnail;
 pub use aliases::extract_parenthetical_aliases;
 pub use html::{html_to_markdown, parse_html};
 pub use office::{parse_docx, parse_pptx};
-pub use spreadsheet::{parse_spreadsheet, read_sheet, SheetSlice};
+pub use spreadsheet::{find_rows, parse_spreadsheet, read_sheet, RowFilter, SheetSlice};
 pub use hwp::{escape_html, parse_hml, parse_hwp5, parse_hwp_family, parse_hwpx, sanitize_table_html, KordocCliConfig};
 pub use model::{
     sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrBlock, OcrExecutionTarget,

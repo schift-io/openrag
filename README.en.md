@@ -197,7 +197,7 @@ text is not.
 - `rag_ingest` — Ingest document/text with scope, permission groups, and clearance level
 - `rag_get_page` — Fetch redacted page text, thumbnail URI, and `bbox_norm_1000` coordinates
 - `rag_list_documents` — Documents in a bucket (original path, revision, in force or not)
-- `rag_read_sheet` — Rows of an Excel/CSV file; spreadsheets are indexed as catalog cards and read on demand
+- `rag_read_sheet` — Rows of an Excel/CSV file; spreadsheets are indexed as catalog cards and read on demand, or searched for a value with `find`
 - `docs_status` — Documents-folder watcher status (failed files and why, progress) and scan now (org admins)
 - `wiki_search` / `wiki_get` — Query and retrieve DB-native LLM Wiki pages
 - `memory_search` / `memory_patch` / `memory_engage` / `memory_reflect` — Search active memory view, append CCLG patches, record use and reflections

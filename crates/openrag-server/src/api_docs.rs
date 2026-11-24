@@ -211,6 +211,12 @@ struct SheetQuery {
     sheet: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
+    /// Keep only rows with a cell containing this text.
+    find: Option<String>,
+    /// Look for `find` in this column only.
+    column: Option<String>,
+    /// The cell must equal `find`.
+    exact: Option<bool>,
 }
 
 fn md_table(header: &[String], rows: &[Vec<String>]) -> String {
@@ -276,15 +282,29 @@ async fn read_sheet_handler(
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let name = path.file_name().and_then(|n| n.to_str()).map(ToString::to_string);
     let sheet = q.sheet.clone();
-    let slice = tokio::task::spawn_blocking(move || {
-        openrag_parse::read_sheet(&bytes, format, name.as_deref(), sheet.as_deref(), offset, limit)
+    let filter = match q.find.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        Some(text) => Some(openrag_parse::RowFilter {
+            text: text.to_string(),
+            column: q.column.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(ToString::to_string),
+            exact: q.exact.unwrap_or(false),
+        }),
+        None if q.column.as_deref().is_some_and(|c| !c.trim().is_empty()) => {
+            return Err(ApiError::bad_request("find_required", "column only narrows a search: pass find with the value to look for"));
+        }
+        None => None,
+    };
+    let filter_for_read = filter.clone();
+    let slice = tokio::task::spawn_blocking(move || match &filter_for_read {
+        Some(f) => openrag_parse::find_rows(&bytes, format, name.as_deref(), sheet.as_deref(), f, offset, limit),
+        None => openrag_parse::read_sheet(&bytes, format, name.as_deref(), sheet.as_deref(), offset, limit),
     })
     .await
     .map_err(|e| ApiError::from(OpenRagError::Internal(format!("read sheet: {e}"))))?
     .map_err(ApiError::from)?;
 
-    let next = (slice.offset + slice.rows.len() < slice.total_rows).then(|| slice.offset + slice.rows.len());
-    Ok(Json(json!({
+    let total = slice.total_matches.unwrap_or(slice.total_rows);
+    let next = (slice.offset + slice.rows.len() < total).then(|| slice.offset + slice.rows.len());
+    let mut out = json!({
         "document_id": id,
         "title": title,
         "path": watch::host_path_of(&key).unwrap_or(key),
@@ -295,9 +315,19 @@ async fn read_sheet_handler(
         "total_rows": slice.total_rows,
         "next_offset": next,
         "rows": slice.rows,
+        "row_index": slice.row_index,
         "text": md_table(&slice.header, &slice.rows),
         "changed_since_indexed": changed,
-    })))
+    });
+    if let Some(f) = filter {
+        out["find"] = json!(f.text);
+        out["column"] = json!(f.column);
+        out["exact"] = json!(f.exact);
+        out["total_matches"] = json!(total);
+        out["matches_by_sheet"] =
+            slice.matches_by_sheet.iter().map(|(sheet, n)| json!({ "sheet": sheet, "matches": n })).collect::<Value>();
+    }
+    Ok(Json(out))
 }
 
 async fn watch_status_handler(AuthPrincipal(principal): AuthPrincipal) -> Result<Json<Value>, ApiError> {
