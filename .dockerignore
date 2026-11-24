@@ -5,4 +5,8 @@ target/
 **/*.py[cod]
 .env
 .env.*
+# Secrets under docker/ (the KEK in docker/.env, the admin key from init) stay out of builds.
+**/.env
+**/.env.*
+**/.openrag-init.json
 docker/models/

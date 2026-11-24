@@ -188,6 +188,24 @@ fn f11_hml_and_hwp5_pure_rust_parsing() -> Result<(), Box<dyn std::error::Error>
     let hwp5_doc = parse_hwp5(&hwp5_bytes, Some("legacy.hwp"))?;
     assert_eq!(hwp5_doc.format, DocumentFormat::Hwp);
     assert!(hwp5_doc.full_markdown.contains("한글바이너리 테스트"));
+    // Public offices publish HWP 5 files named .hwpx: the bytes decide, not the name.
+    assert_eq!(DocumentFormat::detect(&hwp5_bytes, None, Some("공고문.hwpx")), DocumentFormat::Hwp);
+    Ok(())
+}
+
+#[test]
+fn f11_mislabeled_files_are_read_by_their_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    let hwpx = build_test_hwpx("<hs:sec/>")?;
+    assert_eq!(DocumentFormat::detect(&hwpx, None, Some("공고문.hwp")), DocumentFormat::Hwpx);
+    let mut docx = ZipWriter::new(Cursor::new(Vec::new()));
+    docx.start_file("word/document.xml", SimpleFileOptions::default())?;
+    docx.write_all(b"<w:document/>")?;
+    let docx = docx.finish()?.into_inner();
+    assert_eq!(DocumentFormat::detect(&docx, Some("application/hwp+zip"), Some("공고문.hwpx")), DocumentFormat::Docx);
+    assert_eq!(DocumentFormat::detect(b"%PDF-1.7\n", None, Some("공고문.hwp")), DocumentFormat::Pdf);
+    // Text has no signature: the extension still decides.
+    assert_eq!(DocumentFormat::detect(b"# PK", None, Some("notes.md")), DocumentFormat::Markdown);
+    assert_eq!(DocumentFormat::detect(b"a,b\n1,2\n", None, Some("t.csv")), DocumentFormat::Csv);
     Ok(())
 }
 

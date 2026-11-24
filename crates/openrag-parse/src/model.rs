@@ -42,6 +42,9 @@ impl DocumentFormat {
     }
 
     pub fn detect(bytes: &[u8], mime: Option<&str>, filename: Option<&str>) -> Self {
+        if let Some(format) = Self::sniff(bytes) {
+            return format;
+        }
         if let Some(m) = mime.map(str::to_ascii_lowercase) {
             if m.contains("hwpx") {
                 return Self::Hwpx;
@@ -133,6 +136,33 @@ impl DocumentFormat {
             return Self::Html;
         }
         Self::PlainText
+    }
+
+    /// The format the bytes declare when their signature leaves no doubt. It wins over a MIME type
+    /// or an extension that says otherwise: public offices publish HWP 5 files named `.hwpx` (and
+    /// HWPX named `.hwp`), and a mislabeled file would otherwise fail to open.
+    fn sniff(bytes: &[u8]) -> Option<Self> {
+        const OLE: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
+        if bytes.starts_with(b"%PDF-") {
+            return Some(Self::Pdf);
+        }
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Some(Self::Png);
+        }
+        if bytes.starts_with(b"\xFF\xD8\xFF") {
+            return Some(Self::Jpeg);
+        }
+        if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            return Some(Self::Webp);
+        }
+        // An OLE file is HWP 5 when its FileHeader stream carries the HWP signature (stored as is).
+        if bytes.starts_with(OLE) && bytes.windows(17).any(|w| w == b"HWP Document File") {
+            return Some(Self::Hwp);
+        }
+        if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+            return crate::office::office_zip_kind(bytes);
+        }
+        None
     }
 }
 

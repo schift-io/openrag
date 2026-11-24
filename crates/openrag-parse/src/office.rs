@@ -23,7 +23,7 @@ const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
 
 type Archive<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
-/// The Office format of a zip archive, by the parts it contains.
+/// The format of a zip archive (DOCX, PPTX, XLSX or HWPX), by the parts it contains.
 pub fn office_zip_kind(bytes: &[u8]) -> Option<DocumentFormat> {
     let archive = ZipArchive::new(Cursor::new(bytes)).ok()?;
     let mut kind = None;
@@ -38,6 +38,10 @@ pub fn office_zip_kind(bytes: &[u8]) -> Option<DocumentFormat> {
         }
         if name == "xl/workbook.xml" {
             kind = Some(DocumentFormat::Xlsx);
+            break;
+        }
+        if name == "Contents/header.xml" || name.starts_with("Contents/section") {
+            kind = Some(DocumentFormat::Hwpx);
             break;
         }
     }
