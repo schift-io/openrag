@@ -1,0 +1,32 @@
+# HTTPS for clients on other machines: Caddy terminates TLS and forwards to openrag-api.
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.https.yml --profile app up -d
+# Settings (docker/.env):
+#   OPENRAG_HTTPS_HOST   name or IP clients use (default localhost)
+#   OPENRAG_HTTPS_TLS    "internal" (private CA, default) or an e-mail for Let's Encrypt
+#   OPENRAG_HTTPS_PORT   published HTTPS port (default 8443; 443 for Let's Encrypt)
+#   OPENRAG_PUBLIC_URL   https://<host>:<port>, so `init` prints connect commands that use HTTPS
+# Plain HTTP stays on this machine only: the API port is bound to 127.0.0.1.
+services:
+  openrag-api:
+    ports: !override
+      - "127.0.0.1:${OPENRAG_API_PORT:-8080}:8080"
+
+  https:
+    profiles: ["app"]
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    depends_on:
+      openrag-api:
+        condition: service_healthy
+    environment:
+      OPENRAG_HTTPS_HOST: ${OPENRAG_HTTPS_HOST:-localhost}
+      OPENRAG_HTTPS_TLS: ${OPENRAG_HTTPS_TLS:-internal}
+    ports:
+      - "${OPENRAG_HTTPS_PORT:-8443}:443"
+      - "${OPENRAG_HTTPS_HTTP_PORT:-8081}:80"
+    volumes:
+      - ./https/Caddyfile:/etc/caddy/Caddyfile:ro
+      - https_data:/data
+
+volumes:
+  https_data:

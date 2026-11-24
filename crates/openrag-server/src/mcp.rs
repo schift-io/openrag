@@ -48,11 +48,14 @@ use crate::llm_router::{neutralize_literal_pii_tokens, seal_text_for_llm};
 use crate::state::AppState;
 
 /// The exact, ordered MCP tool registry.
-pub const MCP_TOOL_NAMES: [&str; 13] = [
+pub const MCP_TOOL_NAMES: [&str; 16] = [
     "rag_search",
     "rag_ask",
     "rag_ingest",
     "rag_get_page",
+    "rag_list_documents",
+    "rag_read_sheet",
+    "docs_status",
     "wiki_search",
     "wiki_get",
     "memory_search",
@@ -416,7 +419,7 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "openrag", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard.",
+        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card. rag_list_documents shows what is in a bucket.",
     })
 }
 
@@ -570,6 +573,49 @@ pub fn tool_definitions() -> Vec<Value> {
                 &[],
             ),
             true,
+        ),
+        tool(
+            "rag_list_documents",
+            "List documents",
+            "List the documents you may read in a bucket (title, original path, revision, whether in force, number of passages). Filter by part of the title or path with 'query'. By default only documents in force are listed; include_closed also lists superseded and removed ones. Omit 'bucket' to list every bucket you can access.",
+            schema(
+                json!({
+                    "bucket": str_prop("Bucket slug or id (optional)"),
+                    "query": str_prop("Part of the title or path"),
+                    "include_closed": { "type": "boolean", "description": "Also list documents no longer in force" },
+                    "limit": int_prop("Maximum documents per bucket", 1, 500),
+                    "offset": int_prop("Skip this many documents", 0, 1_000_000),
+                }),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "rag_read_sheet",
+            "Read spreadsheet rows",
+            "Read rows of an Excel (.xlsx) or CSV document found by rag_search or rag_list_documents (source.kind = spreadsheet). Returns the column names, the rows from 'offset' (below the header), total_rows and next_offset for paging, plus a Markdown table. Omit 'sheet' for the first sheet; the response lists every sheet. Only files from a watched documents folder can be read this way.",
+            schema(
+                json!({
+                    "document_id": str_prop("Document id"),
+                    "sheet": str_prop("Sheet name (default: the first sheet)"),
+                    "offset": int_prop("First data row, 0-based", 0, 10_000_000),
+                    "limit": int_prop("Rows to return (default 50)", 1, 500),
+                }),
+                &["document_id"],
+            ),
+            true,
+        ),
+        tool(
+            "docs_status",
+            "Documents folder status",
+            "What the documents-folder watcher is doing (organization admins): watched folders, documents in force per bucket, files that failed to ingest and why, progress of a running scan. Pass scan=true to scan the folders now instead of waiting for the next interval.",
+            schema(
+                json!({
+                    "scan": { "type": "boolean", "description": "Start a scan now" },
+                }),
+                &[],
+            ),
+            false,
         ),
         tool(
             "wiki_search",
@@ -1039,6 +1085,9 @@ async fn call_tool(ctx: &ToolCtx, name: &str, args: &Map<String, Value>) -> Resu
         "rag_ask" => rag_ask(ctx, args).await,
         "rag_ingest" => rag_ingest(ctx, args).await,
         "rag_get_page" => rag_get_page(ctx, args).await,
+        "rag_list_documents" => rag_list_documents(ctx, args).await,
+        "rag_read_sheet" => rag_read_sheet(ctx, args).await,
+        "docs_status" => docs_status(ctx, args).await,
         "wiki_search" => wiki_search(ctx, args).await,
         "wiki_get" => wiki_get(ctx, args).await,
         "memory_search" => memory_search(ctx, args).await,
@@ -1184,6 +1233,66 @@ async fn search_once(ctx: &ToolCtx, bucket: Option<&str>, body: Value, k: u64) -
         "tag_facets": facets,
         "buckets_searched": bucket_ids.len() - skipped,
     }))
+}
+
+async fn rag_list_documents(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(q) = arg_str_opt(args, "query")?.filter(|q| !q.trim().is_empty()) {
+        qs.push(format!("q={}", pct_encode(q.trim())));
+    }
+    if arg_bool_opt(args, "include_closed")? == Some(true) {
+        qs.push("include_closed=true".into());
+    }
+    if let Some(l) = arg_u64_opt(args, "limit")? {
+        qs.push(format!("limit={l}"));
+    }
+    if let Some(o) = arg_u64_opt(args, "offset")? {
+        qs.push(format!("offset={o}"));
+    }
+    let query = if qs.is_empty() { String::new() } else { format!("?{}", qs.join("&")) };
+    let bucket = arg_str_opt(args, "bucket")?.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    if let Some(b) = bucket {
+        let uri = format!("/v2/buckets/{}/documents{query}", pct_encode(&b));
+        return dispatch(ctx, Method::GET, &uri, DispatchBody::Empty).await;
+    }
+    let listed = dispatch(ctx, Method::GET, "/v2/buckets", DispatchBody::Empty).await?;
+    let mut buckets = Vec::new();
+    for b in listed.get("buckets").and_then(Value::as_array).into_iter().flatten().take(MAX_FANOUT_BUCKETS) {
+        let Some(id) = b.get("id").and_then(Value::as_str) else { continue };
+        let uri = format!("/v2/buckets/{}/documents{query}", pct_encode(id));
+        if let Ok(v) = dispatch(ctx, Method::GET, &uri, DispatchBody::Empty).await {
+            buckets.push(v);
+        }
+    }
+    Ok(json!({ "buckets": buckets }))
+}
+
+async fn rag_read_sheet(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    let id = arg_uuid_opt(args, "document_id")?.ok_or_else(|| ToolFailure::invalid("document_id is required"))?;
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(sh) = arg_str_opt(args, "sheet")?.filter(|s| !s.trim().is_empty()) {
+        qs.push(format!("sheet={}", pct_encode(sh.trim())));
+    }
+    if let Some(o) = arg_u64_opt(args, "offset")? {
+        qs.push(format!("offset={o}"));
+    }
+    if let Some(l) = arg_u64_opt(args, "limit")? {
+        qs.push(format!("limit={l}"));
+    }
+    let query = if qs.is_empty() { String::new() } else { format!("?{}", qs.join("&")) };
+    dispatch(ctx, Method::GET, &format!("/v2/documents/{id}/sheet{query}"), DispatchBody::Empty).await
+}
+
+async fn docs_status(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    let mut scan = Value::Null;
+    if arg_bool_opt(args, "scan")? == Some(true) {
+        scan = dispatch(ctx, Method::POST, "/v2/watch/scan", DispatchBody::Empty).await?;
+    }
+    let mut status = dispatch(ctx, Method::GET, "/v2/watch", DispatchBody::Empty).await?;
+    if let (Some(obj), false) = (status.as_object_mut(), scan.is_null()) {
+        obj.insert("scan".into(), scan);
+    }
+    Ok(status)
 }
 
 async fn rag_ask(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {

@@ -114,7 +114,9 @@ services:
       #   ["/docs", {"path": "/docs-hr", "bucket": "hr", "types": ["pdf", "hwp"]}]
       # Every folder listed here needs a mount below. Empty: no watching.
       OPENRAG_DOCS_DIRS: ${OPENRAG_DOCS_DIRS:-["/docs"]}
-      OPENRAG_DOCS_TYPES: ${OPENRAG_DOCS_TYPES:-hwp,hwpx,md,pdf,docx,pptx,html}
+      OPENRAG_DOCS_TYPES: ${OPENRAG_DOCS_TYPES:-hwp,hwpx,md,pdf,docx,pptx,html,xlsx,csv}
+      # Where /docs lives on this machine, so search results name the original file as you see it.
+      OPENRAG_DOCS_HOST_DIR: ${OPENRAG_DOCS_DIR:-}
       OPENRAG_DOCS_BUCKET: ${OPENRAG_DOCS_BUCKET:-docs}
       OPENRAG_DOCS_SCAN_SECS: ${OPENRAG_DOCS_SCAN_SECS:-30}
       OPENRAG_SCHIFT_OCR_URL: ${OPENRAG_SCHIFT_OCR_URL:-}
@@ -122,7 +124,14 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       PINECONE_API_KEY: ${PINECONE_API_KEY:-}
     ports:
-      - "${OPENRAG_API_PORT:-8080}:8080"
+      # OPENRAG_API_BIND=127.0.0.1 keeps plain HTTP on this machine (e.g. behind the HTTPS overlay).
+      - "${OPENRAG_API_BIND:-0.0.0.0}:${OPENRAG_API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
     volumes:
       - ../configs:/app/configs:ro
       # The documents folder on this machine (default: documents/ next to docker/), read-only.

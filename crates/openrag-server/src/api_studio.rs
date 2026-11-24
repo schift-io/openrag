@@ -72,11 +72,11 @@ pub fn studio_routes() -> Router<Arc<AppState>> {
         .route("/api/studio/iam/orgs", post(studio_iam_create_org_handler))
         .route(
             "/api/studio/iam/principals",
-            post(studio_iam_create_principal_handler),
+            post(studio_iam_create_principal_handler).get(crate::api_members::list_principals_handler),
         )
         .route(
             "/api/studio/iam/api-keys",
-            post(studio_iam_create_api_key_handler),
+            post(studio_iam_create_api_key_handler).get(crate::api_members::list_keys_handler),
         )
         .route("/api/studio/iam/cli-codes", post(studio_iam_create_cli_code_handler))
         .route(

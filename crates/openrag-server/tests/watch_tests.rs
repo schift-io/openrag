@@ -20,8 +20,8 @@ fn folders_come_as_a_json_list_or_a_comma_list() -> R {
     assert_eq!(
         cfg.folders,
         vec![
-            WatchFolder { path: "/docs".into(), bucket: "docs".into(), types: defaults },
-            WatchFolder { path: "/mnt/hr".into(), bucket: "hr".into(), types: vec!["pdf".into(), "hwp".into()] },
+            WatchFolder { path: "/docs".into(), bucket: "docs".into(), types: defaults, host: None },
+            WatchFolder { path: "/mnt/hr".into(), bucket: "hr".into(), types: vec!["pdf".into(), "hwp".into()], host: None },
         ]
     );
     assert_eq!(cfg.interval, Duration::from_secs(30));
@@ -38,13 +38,28 @@ fn folders_come_as_a_json_list_or_a_comma_list() -> R {
 }
 
 #[test]
+fn original_paths_on_the_host() -> R {
+    let cfg = DocsWatchConfig::parse(r#"["/docs", {"path": "/docs-hr", "host": "/srv/인사/"}]"#, None, None, None, None)?
+        .ok_or("no config")?
+        .with_docs_host(Some("/Users/kim/회사문서"));
+    assert_eq!(cfg.folders[0].host_path("/docs/규정/출장비.md").as_deref(), Some("/Users/kim/회사문서/규정/출장비.md"));
+    assert_eq!(cfg.folders[1].host_path("/docs-hr/급여.xlsx").as_deref(), Some("/srv/인사/급여.xlsx"));
+    // Windows hosts get backslashes; a relative host path names nothing.
+    let win = DocsWatchConfig::parse("/docs", None, None, None, None)?.ok_or("no config")?.with_docs_host(Some(r"C:\Docs"));
+    assert_eq!(win.folders[0].host_path("/docs/a/b.pdf").as_deref(), Some(r"C:\Docs\a\b.pdf"));
+    let rel = DocsWatchConfig::parse("/docs", None, None, None, None)?.ok_or("no config")?.with_docs_host(Some("../documents"));
+    assert_eq!(rel.folders[0].host, None);
+    Ok(())
+}
+
+#[test]
 fn bad_folder_settings_are_refused() {
     let err = |dirs: &str, types: Option<&str>, secs: Option<&str>| {
         DocsWatchConfig::parse(dirs, types, None, secs, None).err().map(|e| e.to_string()).unwrap_or_default()
     };
     assert!(err("docs", None, None).contains("absolute path"));
     assert!(err("/a,/a/", None, None).contains("twice"));
-    assert!(err("/a", Some("pdf,xlsx"), None).contains("'xlsx' is not a file type"));
+    assert!(err("/a", Some("pdf,dwg"), None).contains("'dwg' is not a file type"));
     assert!(err("/a", None, Some("0")).contains("at least 1"));
     assert!(err("[\"/a\"", None, None).contains("not a JSON list"));
 }

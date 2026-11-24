@@ -15,6 +15,8 @@ use tower_http::trace::TraceLayer;
 
 pub mod api_app;
 pub mod api_core;
+pub mod api_docs;
+pub mod api_members;
 pub mod api_studio;
 pub mod auth;
 pub mod egress;
@@ -36,6 +38,8 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub fn api_router() -> Router<Arc<AppState>> {
     Router::new()
         .merge(api_core::core_routes())
+        .merge(api_docs::docs_routes())
+        .merge(api_members::member_routes())
         .merge(api_app::app_routes())
         .merge(api_studio::studio_routes())
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))

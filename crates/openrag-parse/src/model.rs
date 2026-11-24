@@ -17,6 +17,8 @@ pub enum DocumentFormat {
     Docx,
     Pptx,
     Html,
+    Xlsx,
+    Csv,
 }
 
 impl DocumentFormat {
@@ -34,6 +36,8 @@ impl DocumentFormat {
             Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             Self::Pptx => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             Self::Html => "text/html",
+            Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Self::Csv => "text/csv",
         }
     }
 
@@ -72,6 +76,12 @@ impl DocumentFormat {
             if m.starts_with("text/html") || m.starts_with("application/xhtml") {
                 return Self::Html;
             }
+            if m.contains("spreadsheetml.sheet") {
+                return Self::Xlsx;
+            }
+            if m.starts_with("text/csv") || m.starts_with("text/tab-separated-values") {
+                return Self::Csv;
+            }
         }
 
         if let Some(ext) = filename
@@ -91,6 +101,8 @@ impl DocumentFormat {
                 "docx" => return Self::Docx,
                 "pptx" => return Self::Pptx,
                 "html" | "htm" | "xhtml" => return Self::Html,
+                "xlsx" | "xlsm" => return Self::Xlsx,
+                "csv" | "tsv" => return Self::Csv,
                 _ => {}
             }
         }

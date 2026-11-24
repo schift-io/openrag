@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "openrag-mcp", version, about = "OpenRAG local MCP server (13 tools) over stdio")]
+#[command(name = "openrag-mcp", version, about = "OpenRAG local MCP server (16 tools) over stdio")]
 struct McpBinArgs {
     /// Accepted for parity with `openrag mcp --stdio` (stdio is the only transport here)
     #[arg(long)]

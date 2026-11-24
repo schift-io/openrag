@@ -21,7 +21,8 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
 - **개인정보는 AI로 나갈 때만 가려요.** 저장과 검색은 원문 그대로 하고, AI 모델로 가는 요청과 MCP 도구
   결과, 회사 밖 임베딩 서버로 보내는 문서에서만 주민등록번호·전화번호·이메일 같은 값을 토큰으로 바꿔요.
 - **문서 폴더를 지켜봐요.** 폴더에 파일을 넣거나 고치거나 지우면 30초 안에 검색에 반영돼요. 옮기거나 이름을
-  바꾼 파일은 내용 해시로 알아봐서 다시 읽지 않고, 지운 파일은 검색에서만 빼고 기록은 남겨요.
+  바꾼 파일은 내용 해시로 알아봐서 다시 읽지 않고, 지운 파일은 검색에서만 빼고 기록은 남겨요. 엑셀·CSV는
+  안내 카드로 찾고 칸 값은 AI가 필요한 행만 읽어 가요.
 - **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, DOCX·PPTX·HTML도 읽어요. 스캔한 PDF와 이미지는 Schift OCR로 읽어요. 키워드
   검색은 한국어 형태소 분석(`pg_search` Lindera)을 써요.
 - **AI 모델을 들고 있지 않아요.** 답은 연결한 Claude Code·Codex가 쓰거나, 사내 LLM 서버(vLLM 등)를
@@ -100,7 +101,7 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 - **페이지 썸네일**은 기본으로 꺼져 있어요(`thumbnail.enabled: false`). 켜면 S3 호환 저장소
   (`OPENRAG_S3_*`)에 저장해요.
 
-## MCP 도구 (13개)
+## MCP 도구 (16개)
 
 | 도구 | 하는 일 |
 | --- | --- |
@@ -108,6 +109,9 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 | `rag_ask` | 문서를 근거로 서버가 직접 답하기(서버에 LLM을 연결했을 때만) |
 | `rag_ingest` | 텍스트를 버킷에 넣기. 파일 경로는 stdio 연결에서만 돼요 |
 | `rag_get_page` | 문서 한 페이지 읽기(가린 본문, 그림 위치, 썸네일 링크) |
+| `rag_list_documents` | 버킷에 들어 있는 문서 목록(원본 경로, 판, 효력) |
+| `rag_read_sheet` | 엑셀·CSV의 행 읽기. 검색은 안내 카드로 찾고, 칸 값은 이걸로 읽어요 |
+| `docs_status` | 문서 폴더 상태(실패한 파일과 이유, 진행 상황), 지금 바로 훑기(관리자) |
 | `wiki_search` / `wiki_get` | 위키 페이지 찾기 / 읽기 |
 | `memory_search` | 지금 유효한 메모리 찾기(철회·대체된 항목 제외) |
 | `memory_patch` | 메모리에 패치 추가: 수정, 대체, 철회, 가림 |
@@ -144,6 +148,9 @@ stdio 방식(`openrag mcp --stdio`, `openrag-mcp`)은 데이터베이스에 직�
 | `openrag init` | 첫 설정 한 번에: 조직·관리자·API 키·버킷, 연결 명령 출력(`--docs`로 폴더를 한 번 넣을 수도 있어요) |
 | `openrag org init` | 조직·부서·관리자와 API 키만 만들기 |
 | `openrag bucket {create\|list}` | 버킷 만들기 / 보기 |
+| `openrag docs {list\|status\|scan}` | 문서 목록, 문서 폴더 상태(실패한 파일과 이유), 지금 바로 훑기 |
+| `openrag member {add\|list}` | 팀원 추가(계정·키·연결 명령 한 번에) / 목록 |
+| `openrag key {list\|revoke}` | API 키 목록 / 바로 막기 |
 | `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 한 번만 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요. 같은 폴더를 다시 넣으면 바뀐 파일만 들어가요. 계속 맞춰 두려면 문서 폴더(`OPENRAG_DOCS_DIR`)를 쓰세요 |
 | `openrag connect {claude\|codex}` | 이 서버를 Claude Code나 Codex에 등록(호스트에서 실행할 때) |
 | `openrag up --profile <standard\|airgap>` | docker compose로 스택 띄우기 |

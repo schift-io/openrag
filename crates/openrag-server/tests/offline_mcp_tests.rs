@@ -197,7 +197,7 @@ async fn openrag_mcp_binary_lists_13_tools_with_content_length() -> anyhow::Resu
     let out = child.wait_with_output().await?;
     let replies = parse_output(&out.stdout)?;
     let count = replies[0]["result"]["tools"].as_array().map_or(0, Vec::len);
-    assert_eq!(count, 13);
+    assert_eq!(count, 16);
     Ok(())
 }
 

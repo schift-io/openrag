@@ -12,17 +12,22 @@
 //! - `OPENRAG_DOCS_BUCKET`: bucket for entries without one (default `docs`).
 //! - `OPENRAG_DOCS_SCAN_SECS`: seconds between scans (default 30).
 //! - `OPENRAG_DOCS_ORG`: organization slug, when the database holds more than one.
+//! - `OPENRAG_DOCS_HOST_DIR`: where `/docs` lives on the host, so search results can name the
+//!   original file as the user sees it (compose sets it from `OPENRAG_DOCS_DIR`). Entries may set
+//!   their own `"host"`.
 //!
 //! Folders are scanned, not subscribed to, so network shares and Docker bind mounts work the same.
 //! A scan only reads files whose size or modification time changed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use openrag_core::{OpenRagError, PrincipalContext};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -32,12 +37,12 @@ use crate::auth::load_principal_context;
 use crate::state::{non_empty_env, AppState};
 
 /// File types picked up when `OPENRAG_DOCS_TYPES` is unset.
-pub const DEFAULT_TYPES: &[&str] = &["hwp", "hwpx", "md", "pdf", "docx", "pptx", "html"];
+pub const DEFAULT_TYPES: &[&str] = &["hwp", "hwpx", "md", "pdf", "docx", "pptx", "html", "xlsx", "csv"];
 
 /// Every type the parser reads.
 pub const SUPPORTED_TYPES: &[&str] = &[
-    "hwp", "hwpx", "hml", "pdf", "md", "markdown", "txt", "docx", "pptx", "html", "htm", "png",
-    "jpg", "jpeg", "webp",
+    "hwp", "hwpx", "hml", "pdf", "md", "markdown", "txt", "docx", "pptx", "html", "htm", "xlsx",
+    "xlsm", "csv", "tsv", "png", "jpg", "jpeg", "webp",
 ];
 
 /// Files larger than the HTTP upload limit are skipped, so a folder and an upload accept the same.
@@ -51,9 +56,26 @@ pub struct WatchFolder {
     pub path: String,
     pub bucket: String,
     pub types: Vec<String>,
+    /// The same folder as seen on the host, for showing original paths.
+    pub host: Option<String>,
+}
+
+fn host_dir(raw: Option<&str>) -> Option<String> {
+    let h = raw?.trim().trim_end_matches(['/', '\\']);
+    // Only absolute paths (`/srv/docs`, `C:\\Docs`) can name a file for the user.
+    let absolute = h.starts_with('/') || h.as_bytes().get(1) == Some(&b':');
+    (absolute && !h.is_empty()).then(|| h.to_string())
 }
 
 impl WatchFolder {
+    /// The host path of a file under this folder, when the host location is known.
+    pub fn host_path(&self, key: &str) -> Option<String> {
+        let host = self.host.as_ref()?;
+        let rest = key.strip_prefix(&self.path)?;
+        let sep = if host.contains('\\') && !host.contains('/') { "\\" } else { "/" };
+        Some(format!("{host}{}", rest.replace('/', sep)))
+    }
+
     fn accepts(&self, ext: &str) -> bool {
         let ext = ext.to_ascii_lowercase();
         self.types.iter().any(|t| t == &ext || alias(t) == Some(ext.as_str()))
@@ -89,6 +111,8 @@ enum DirEntry {
         bucket: Option<String>,
         #[serde(default)]
         types: Option<TypesValue>,
+        #[serde(default)]
+        host: Option<String>,
     },
 }
 
@@ -152,13 +176,24 @@ impl DocsWatchConfig {
         let Some(dirs) = non_empty_env("OPENRAG_DOCS_DIRS") else {
             return Ok(None);
         };
-        Self::parse(
+        Ok(Self::parse(
             &dirs,
             non_empty_env("OPENRAG_DOCS_TYPES").as_deref(),
             non_empty_env("OPENRAG_DOCS_BUCKET").as_deref(),
             non_empty_env("OPENRAG_DOCS_SCAN_SECS").as_deref(),
             non_empty_env("OPENRAG_DOCS_ORG").as_deref(),
-        )
+        )?
+        .map(|c| c.with_docs_host(non_empty_env("OPENRAG_DOCS_HOST_DIR").as_deref())))
+    }
+
+    /// Gives the `/docs` entry (when it has no `host` of its own) the host folder it is mounted from.
+    pub fn with_docs_host(mut self, host: Option<&str>) -> Self {
+        if let Some(h) = host_dir(host) {
+            for f in self.folders.iter_mut().filter(|f| f.path == "/docs" && f.host.is_none()) {
+                f.host = Some(h.clone());
+            }
+        }
+        self
     }
 
     pub fn parse(
@@ -200,9 +235,9 @@ impl DocsWatchConfig {
 
         let mut folders: Vec<WatchFolder> = Vec::new();
         for entry in entries {
-            let (path, bucket, types) = match entry {
-                DirEntry::Path(p) => (p, None, None),
-                DirEntry::Full { path, bucket, types } => (path, bucket, types),
+            let (path, bucket, types, host) = match entry {
+                DirEntry::Path(p) => (p, None, None, None),
+                DirEntry::Full { path, bucket, types, host } => (path, bucket, types, host),
             };
             let path = path.trim().trim_end_matches('/').to_string();
             let path = if path.is_empty() { "/".to_string() } else { path };
@@ -221,7 +256,7 @@ impl DocsWatchConfig {
                 .map(|b| b.trim().to_string())
                 .filter(|b| !b.is_empty())
                 .unwrap_or_else(|| default_bucket.clone());
-            folders.push(WatchFolder { path, bucket, types });
+            folders.push(WatchFolder { path, bucket, types, host: host_dir(host.as_deref()) });
         }
         if folders.is_empty() {
             return Ok(None);
@@ -243,9 +278,142 @@ pub fn start_from_env(state: &Arc<AppState>) -> Result<(), OpenRagError> {
     for f in &cfg.folders {
         tracing::info!(folder = %f.path, bucket = %f.bucket, types = %f.types.join(","), "watching documents folder");
     }
+    let _ = CONFIG.set(cfg.clone());
+    if let Ok(mut r) = report().write() {
+        r.running = true;
+        r.interval_secs = cfg.interval.as_secs();
+        r.folders = cfg
+            .folders
+            .iter()
+            .map(|f| FolderStatus {
+                path: f.path.clone(),
+                host_path: f.host.clone(),
+                bucket: f.bucket.clone(),
+                types: f.types.clone(),
+                available: true,
+                files: 0,
+            })
+            .collect();
+    }
     let watcher = Watcher::new(Arc::clone(state), cfg);
     tokio::spawn(watcher.run());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+static CONFIG: OnceLock<DocsWatchConfig> = OnceLock::new();
+static REPORT: OnceLock<RwLock<WatchReport>> = OnceLock::new();
+static SCAN_NOW: OnceLock<Notify> = OnceLock::new();
+
+fn report() -> &'static RwLock<WatchReport> {
+    REPORT.get_or_init(|| RwLock::new(WatchReport::default()))
+}
+
+fn scan_now() -> &'static Notify {
+    SCAN_NOW.get_or_init(Notify::new)
+}
+
+/// What the watcher is doing, for `GET /v2/watch`, `docs_status` and `openrag docs status`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WatchReport {
+    pub running: bool,
+    pub interval_secs: u64,
+    pub folders: Vec<FolderStatus>,
+    pub buckets: BTreeMap<String, BucketStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderStatus {
+    pub path: String,
+    pub host_path: Option<String>,
+    pub bucket: String,
+    pub types: Vec<String>,
+    /// False while the folder is missing or unreadable (its documents are kept).
+    pub available: bool,
+    /// Files of the watched types found in the last scan.
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BucketStatus {
+    /// `waiting` (no organization or bucket yet), `scanning`, `idle` or `error`.
+    pub state: String,
+    pub message: Option<String>,
+    pub last_scan_started_at: Option<DateTime<Utc>>,
+    pub last_scan_finished_at: Option<DateTime<Utc>>,
+    /// Documents in force that came from the folders.
+    pub documents: usize,
+    /// Files being ingested in the current scan: (done, total).
+    pub progress: Option<(usize, usize)>,
+    /// What the last scan that changed something did.
+    pub last_changes: Option<Changes>,
+    pub last_changed_at: Option<DateTime<Utc>>,
+    pub failed: Vec<FailedFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Changes {
+    pub added: usize,
+    pub replaced: usize,
+    pub moved: usize,
+    pub removed: usize,
+    pub restored: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedFile {
+    pub path: String,
+    pub host_path: Option<String>,
+    pub reason: String,
+    pub since: DateTime<Utc>,
+}
+
+/// The current report; `None` when no folder is watched.
+pub fn status() -> Option<WatchReport> {
+    let r = report().read().ok()?.clone();
+    r.running.then_some(r)
+}
+
+/// Asks the watcher to scan now instead of at the next interval. False when nothing is watched.
+pub fn request_scan() -> bool {
+    if CONFIG.get().is_none() {
+        return false;
+    }
+    scan_now().notify_one();
+    true
+}
+
+/// The file behind a watched document's key, when the key lies inside a watched folder.
+pub fn watched_file(key: &str) -> Option<PathBuf> {
+    let cfg = CONFIG.get()?;
+    let path = Path::new(key);
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    cfg.folders
+        .iter()
+        .any(|f| key.strip_prefix(&f.path).is_some_and(|rest| rest.starts_with('/')))
+        .then(|| path.to_path_buf())
+}
+
+/// The host path of a watched file, when its folder's host location is known.
+pub fn host_path_of(key: &str) -> Option<String> {
+    let cfg = CONFIG.get()?;
+    cfg.folders
+        .iter()
+        .filter(|f| key.strip_prefix(&f.path).is_some_and(|rest| rest.starts_with('/')))
+        .max_by_key(|f| f.path.len())
+        .and_then(|f| f.host_path(key))
+}
+
+fn update_bucket(slug: &str, f: impl FnOnce(&mut BucketStatus)) {
+    if let Ok(mut r) = report().write() {
+        f(r.buckets.entry(slug.to_string()).or_default());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +644,7 @@ struct StoredDoc {
     title: String,
     size: Option<String>,
     mtime: Option<String>,
+    host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,8 +668,8 @@ struct Watcher {
     cfg: DocsWatchConfig,
     /// key -> (size/mtime, sha) of files already hashed.
     hashes: HashMap<String, (Stamp, String)>,
-    /// key -> size/mtime of files that failed to ingest; retried once they change.
-    failures: HashMap<String, Stamp>,
+    /// key -> size/mtime, reason and time of files that failed to ingest; retried once they change.
+    failures: HashMap<String, (Stamp, String, DateTime<Utc>)>,
     /// Messages already logged, so a waiting or broken state is reported once, not every scan.
     reported: HashSet<String>,
 }
@@ -522,6 +691,10 @@ impl Watcher {
         self.reported.insert(msg)
     }
 
+    fn host_of(&self, f: &Found) -> Option<String> {
+        self.cfg.folders.iter().find(|w| w.path == f.root).and_then(|w| w.host_path(&f.key))
+    }
+
     async fn run(mut self) {
         let mut groups: BTreeMap<String, Vec<WatchFolder>> = BTreeMap::new();
         for f in &self.cfg.folders {
@@ -531,13 +704,21 @@ impl Watcher {
         loop {
             for (bucket, folders) in &groups {
                 if let Err(e) = self.sync_bucket(bucket, folders, &all_roots).await {
+                    update_bucket(bucket, |b| {
+                        b.state = "error".into();
+                        b.message = Some(e.to_string());
+                        b.progress = None;
+                    });
                     let msg = format!("{bucket}: {e}");
                     if self.report_once(msg) {
                         tracing::warn!(bucket = %bucket, error = %e, "documents folder sync failed; retrying every scan");
                     }
                 }
             }
-            tokio::time::sleep(self.cfg.interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(self.cfg.interval) => {}
+                () = scan_now().notified() => {}
+            }
         }
     }
 
@@ -556,6 +737,12 @@ impl Watcher {
         };
         match rows.as_slice() {
             [] => {
+                for f in &self.cfg.folders {
+                    update_bucket(&f.bucket, |b| {
+                        b.state = "waiting".into();
+                        b.message = Some("no organization yet: run `openrag init`".into());
+                    });
+                }
                 if self.report_once("no-org".into()) {
                     tracing::info!("documents folders wait for an organization (run `openrag init`)");
                 }
@@ -583,6 +770,10 @@ impl Watcher {
         match row {
             Some(r) => Ok(Some(row_to_bucket(&r)?)),
             None => {
+                update_bucket(slug, |b| {
+                    b.state = "waiting".into();
+                    b.message = Some(format!("bucket '{slug}' does not exist yet (`openrag init` creates `docs`)"));
+                });
                 if self.report_once(format!("no-bucket:{slug}")) {
                     tracing::info!(bucket = %slug, "documents folders wait for this bucket (`openrag init` creates `docs`)");
                 }
@@ -596,7 +787,8 @@ impl Watcher {
         let rows = sqlx::query(
             "SELECT id, title, content_sha256,
                     metadata->>'external_key' AS key, metadata->>'watch_root' AS root,
-                    metadata->>'watch_size' AS size, metadata->>'watch_mtime' AS mtime
+                    metadata->>'watch_size' AS size, metadata->>'watch_mtime' AS mtime,
+                    metadata->>'watch_host_path' AS host
              FROM corpus.documents
              WHERE org_id = $1 AND bucket_id = $2
                AND metadata->>'source' = 'watch' AND metadata->>'watch_root' = ANY($3)
@@ -621,6 +813,7 @@ impl Watcher {
                 title: r.try_get("title").map_err(|e| db(e, "title"))?,
                 size: get("size")?,
                 mtime: get("mtime")?,
+                host: get("host")?,
             });
         }
         Ok(out)
@@ -660,10 +853,21 @@ impl Watcher {
         )
         .await?;
 
+        update_bucket(slug, |b| {
+            b.state = "scanning".into();
+            b.message = None;
+            b.last_scan_started_at = Some(Utc::now());
+        });
         let (folders_owned, roots_owned) = (folders.to_vec(), all_roots.to_vec());
         let scan = tokio::task::spawn_blocking(move || scan_folders(&folders_owned, &roots_owned))
             .await
             .map_err(|e| OpenRagError::Internal(format!("folder scan: {e}")))?;
+        if let Ok(mut r) = report().write() {
+            for fs in r.folders.iter_mut().filter(|fs| fs.bucket == slug) {
+                fs.available = !scan.unavailable.contains(&fs.path);
+                fs.files = scan.files.iter().filter(|f| f.root == fs.path).count();
+            }
+        }
         for root in &scan.unavailable {
             if self.report_once(format!("unavailable:{root}")) {
                 tracing::warn!(folder = %root, "documents folder is missing or unreadable; its documents stay as they are");
@@ -686,7 +890,7 @@ impl Watcher {
         let mut disk = Vec::with_capacity(scan.files.len());
         for f in &scan.files {
             let stamp = Stamp { size: f.size, mtime: f.mtime.clone() };
-            let failing = self.failures.get(&f.key) == Some(&stamp);
+            let failing = self.failures.get(&f.key).is_some_and(|(s, _, _)| *s == stamp);
             let sha = if !f.settled || failing || f.empty {
                 None
             } else {
@@ -705,6 +909,14 @@ impl Watcher {
         let steps = plan(&disk, &docs, &keep_roots, writing);
 
         let mut tally = Tally::default();
+        let total = steps.iter().filter(|s| matches!(s, Step::Ingest { .. })).count();
+        let (mut done, mut last_log) = (0usize, Instant::now());
+        if total > 0 {
+            update_bucket(slug, |b| b.progress = Some((0, total)));
+            if total >= 20 {
+                tracing::info!(bucket = %slug, files = total, "documents folder: ingesting new and changed files");
+            }
+        }
         for step in steps {
             match step {
                 Step::Keep { doc, file } => {
@@ -713,7 +925,8 @@ impl Watcher {
                     let fresh = d.is_some_and(|d| {
                         d.size.as_deref() == Some(f.size.to_string().as_str()) && d.mtime.as_deref() == Some(f.mtime.as_str())
                     });
-                    if !fresh {
+                    let host_known = self.host_of(f).is_none() || d.is_some_and(|d| d.host.is_some());
+                    if !fresh || !host_known {
                         self.mark(org, doc, f, None).await?;
                     }
                 }
@@ -742,9 +955,15 @@ impl Watcher {
                         Ok(None) => {}
                         Err(e) => {
                             tally.failed += 1;
-                            self.failures.insert(f.key.clone(), Stamp { size: f.size, mtime: f.mtime.clone() });
+                            self.failures.insert(f.key.clone(), (Stamp { size: f.size, mtime: f.mtime.clone() }, e.to_string(), Utc::now()));
                             tracing::warn!(file = %f.key, error = %e, "cannot ingest file; retried when it changes");
                         }
+                    }
+                    done += 1;
+                    update_bucket(slug, |b| b.progress = Some((done, total)));
+                    if total >= 20 && (last_log.elapsed() >= Duration::from_secs(30) || done % 100 == 0) && done < total {
+                        last_log = Instant::now();
+                        tracing::info!(bucket = %slug, done, total, "documents folder: still ingesting");
                     }
                 }
                 Step::Retire { doc } => {
@@ -758,6 +977,38 @@ impl Watcher {
         let present: HashSet<&str> = scan.files.iter().map(|f| f.key.as_str()).collect();
         self.hashes.retain(|k, _| present.contains(k.as_str()));
         self.failures.retain(|k, _| present.contains(k.as_str()));
+        let in_force = self.stored_docs(org, bucket.id, &roots).await.map(|d| d.len()).unwrap_or(0);
+        let mut failed: Vec<FailedFile> = self
+            .failures
+            .iter()
+            .filter(|(k, _)| folders.iter().any(|f| k.starts_with(&format!("{}/", f.path))))
+            .map(|(k, (_, reason, since))| FailedFile {
+                path: k.clone(),
+                host_path: host_path_of(k),
+                reason: reason.clone(),
+                since: *since,
+            })
+            .collect();
+        failed.sort_by(|a, b| a.path.cmp(&b.path));
+        let changed = tally.added + tally.replaced + tally.moved + tally.removed + tally.restored + tally.failed > 0;
+        update_bucket(slug, |b| {
+            b.state = "idle".into();
+            b.progress = None;
+            b.last_scan_finished_at = Some(Utc::now());
+            b.documents = in_force;
+            b.failed = failed;
+            if changed {
+                b.last_changes = Some(Changes {
+                    added: tally.added,
+                    replaced: tally.replaced,
+                    moved: tally.moved,
+                    removed: tally.removed,
+                    restored: tally.restored,
+                    failed: tally.failed,
+                });
+                b.last_changed_at = Some(Utc::now());
+            }
+        });
         if tally.added + tally.replaced + tally.moved + tally.removed + tally.restored + tally.failed > 0 {
             tracing::info!(
                 bucket = %slug,
@@ -847,10 +1098,13 @@ impl Watcher {
     /// Records the file a document came from (path, folder, size, mtime); with `title`, renames it.
     async fn mark(&self, org: Uuid, doc: Uuid, f: &Found, title: Option<&str>) -> Result<(), OpenRagError> {
         let worker = self.state.require_worker_pool()?;
+        let rel = f.key.strip_prefix(&f.root).unwrap_or(&f.key).trim_start_matches('/');
         let meta = json!({
             "source": "watch",
             "watch_root": f.root,
             "external_key": f.key,
+            "watch_rel_path": rel,
+            "watch_host_path": self.host_of(f),
             "watch_size": f.size.to_string(),
             "watch_mtime": f.mtime,
         });

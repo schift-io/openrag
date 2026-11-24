@@ -36,6 +36,10 @@ pub fn office_zip_kind(bytes: &[u8]) -> Option<DocumentFormat> {
             kind = Some(DocumentFormat::Pptx);
             break;
         }
+        if name == "xl/workbook.xml" {
+            kind = Some(DocumentFormat::Xlsx);
+            break;
+        }
     }
     kind
 }

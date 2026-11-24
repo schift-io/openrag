@@ -1,0 +1,9 @@
+# HTTPS in front of the OpenRAG API (docker/docker-compose.https.yml).
+# OPENRAG_HTTPS_HOST: the name or IP clients use. OPENRAG_HTTPS_TLS: "internal" for a private CA
+# (clients must trust its root certificate), or an e-mail address for a public Let's Encrypt
+# certificate (the name must resolve to this machine and ports 80/443 must be reachable).
+{$OPENRAG_HTTPS_HOST} {
+	tls {$OPENRAG_HTTPS_TLS}
+	encode gzip
+	reverse_proxy openrag-api:8080
+}

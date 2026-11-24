@@ -57,7 +57,7 @@ use crate::state::{non_empty_env, AppState, OpenRagMode};
 #[command(
     name = "openrag",
     version,
-    about = "OpenRAG — secure, local-first RAG: server, MCP (13 tools), ingestion and operations",
+    about = "OpenRAG — secure, local-first RAG: server, MCP (16 tools), ingestion and operations",
     long_about = None,
     propagate_version = true,
     after_help = "Identity: api_key (config.toml or OPENRAG_API_KEY) runs as that key's principal; api_url sends HTTP-backed commands to a remote server; local operator mode needs `operator = true` in config.toml (or OPENRAG_OPERATOR=1).\nConfig: $OPENRAG_CONFIG, else ~/.config/openrag/config.toml (api_url, api_key, org_id, principal_id, database_url, mode, operator). Environment variables override the file."
@@ -96,7 +96,7 @@ pub enum Command {
     /// Pipeline configuration promotion
     #[command(subcommand)]
     Pipeline(PipelineCmd),
-    /// Run the local MCP server (13 tools) over stdio
+    /// Run the local MCP server (16 tools) over stdio
     Mcp(McpArgs),
     /// One-time CLI authorization codes (exchanged for API keys)
     #[command(subcommand)]
@@ -112,6 +112,79 @@ pub enum Command {
     /// Set up a fresh install in one step: org and admin key, CLI config, a bucket, a folder of
     /// documents and MCP clients
     Init(InitArgs),
+    /// Documents in a bucket and the documents-folder watcher (status, scan now)
+    #[command(subcommand)]
+    Docs(DocsCmd),
+    /// API keys: list and revoke
+    #[command(subcommand)]
+    Key(KeyCmd),
+    /// Team members: add one (account, key and connect commands) or list them
+    #[command(subcommand)]
+    Member(MemberCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DocsCmd {
+    /// Documents in a bucket (in force only, unless --all)
+    List {
+        #[arg(long, default_value = "docs")]
+        bucket: String,
+        /// Part of the title or path
+        #[arg(long)]
+        query: Option<String>,
+        /// Also list superseded and removed documents
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// What the watcher is doing: folders, documents, failed files and why (org admins)
+    Status,
+    /// Scan the documents folders now instead of at the next interval (org admins)
+    Scan,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyCmd {
+    /// API keys (prefix only): every key for org admins, your own otherwise
+    List {
+        /// Only this member's keys
+        #[arg(long)]
+        principal: Option<Uuid>,
+        /// Include revoked keys
+        #[arg(long)]
+        all: bool,
+    },
+    /// Stop a key at once (its id from `openrag key list`)
+    Revoke { id: Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemberCmd {
+    /// Add a member with an API key and print the commands that connect their Claude Code / Codex
+    Add {
+        #[arg(long)]
+        email: String,
+        /// Display name
+        #[arg(long)]
+        name: String,
+        /// Permission level (1..10)
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i16).range(1..=10))]
+        level: i16,
+        /// Department id (default: the first admin's department)
+        #[arg(long)]
+        dept: Option<Uuid>,
+        /// Name of the key, e.g. the member's laptop (default: the e-mail)
+        #[arg(long)]
+        key_name: Option<String>,
+        /// URL the member's machine uses to reach this server
+        #[arg(long, env = "OPENRAG_PUBLIC_URL")]
+        public_url: Option<String>,
+    },
+    /// Members of the organization (org admins)
+    List,
 }
 
 /// The first organization of a fresh install.
@@ -912,6 +985,9 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Bucket(c) => cmd_bucket(c).await,
         Command::Connect(a) => cmd_connect(a).await,
         Command::Init(a) => cmd_init(a).await,
+        Command::Docs(c) => cmd_docs(c).await,
+        Command::Key(c) => cmd_key(c).await,
+        Command::Member(c) => cmd_member(c).await,
     }
 }
 
@@ -2549,6 +2625,102 @@ async fn cmd_bucket(c: BucketCmd) -> Result<(), CliError> {
         BucketCmd::List => call_as_caller(&ex, Method::GET, "/v2/buckets", DispatchBody::Empty).await?,
     };
     print_json(&out);
+    Ok(())
+}
+
+async fn cmd_docs(c: DocsCmd) -> Result<(), CliError> {
+    let ex = exec().await?;
+    let out = match c {
+        DocsCmd::List { bucket, query, all, limit, offset } => {
+            let mut path = format!("/v2/buckets/{}/documents?limit={limit}&offset={offset}", pct_encode(bucket.trim()));
+            if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
+                path.push_str(&format!("&q={}", pct_encode(q.trim())));
+            }
+            if all {
+                path.push_str("&include_closed=true");
+            }
+            call_as_caller(&ex, Method::GET, &path, DispatchBody::Empty).await?
+        }
+        DocsCmd::Status => call_as_caller(&ex, Method::GET, "/v2/watch", DispatchBody::Empty).await?,
+        DocsCmd::Scan => call_as_caller(&ex, Method::POST, "/v2/watch/scan", DispatchBody::Empty).await?,
+    };
+    print_json(&out);
+    Ok(())
+}
+
+async fn cmd_key(c: KeyCmd) -> Result<(), CliError> {
+    let ex = exec().await?;
+    let out = match c {
+        KeyCmd::List { principal, all } => {
+            let mut path = String::from("/api/studio/iam/api-keys?include_revoked=");
+            path.push_str(if all { "true" } else { "false" });
+            if let Some(p) = principal {
+                path.push_str(&format!("&principal_id={p}"));
+            }
+            call_as_caller(&ex, Method::GET, &path, DispatchBody::Empty).await?
+        }
+        KeyCmd::Revoke { id } => {
+            call_as_caller(&ex, Method::POST, &format!("/api/studio/iam/api-keys/{id}/revoke"), DispatchBody::Empty).await?
+        }
+    };
+    print_json(&out);
+    Ok(())
+}
+
+async fn cmd_member(c: MemberCmd) -> Result<(), CliError> {
+    let ex = exec().await?;
+    match c {
+        MemberCmd::List => {
+            let out = call_as_caller(&ex, Method::GET, "/api/studio/iam/principals", DispatchBody::Empty).await?;
+            print_json(&out);
+        }
+        MemberCmd::Add { email, name, level, dept, key_name, public_url } => {
+            let dept = match dept {
+                Some(d) => Some(d),
+                None => {
+                    let members = call_as_caller(&ex, Method::GET, "/api/studio/iam/principals", DispatchBody::Empty).await?;
+                    members
+                        .get("principals")
+                        .and_then(Value::as_array)
+                        .and_then(|ps| ps.iter().find(|p| p.get("is_org_admin").and_then(Value::as_bool) == Some(true)))
+                        .and_then(|p| p.get("dept_ids").and_then(Value::as_array))
+                        .and_then(|ids| ids.first())
+                        .and_then(Value::as_str)
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                }
+            };
+            let body = json!({
+                "email": email.trim(),
+                "display_name": name.trim(),
+                "auth_level": level,
+                "dept_ids": dept.into_iter().collect::<Vec<_>>(),
+            });
+            let created = call_as_caller(&ex, Method::POST, "/api/studio/iam/principals", DispatchBody::Json(body)).await?;
+            let principal_id = created
+                .get("id")
+                .or_else(|| created.get("principal_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::new("the server did not return the new member's id"))?
+                .to_string();
+            let key_body = json!({ "principal_id": principal_id, "name": key_name.unwrap_or_else(|| email.trim().to_string()) });
+            let key = call_as_caller(&ex, Method::POST, "/api/studio/iam/api-keys", DispatchBody::Json(key_body)).await?;
+            let api_key = key
+                .get("api_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::new("the server did not return the new key"))?
+                .to_string();
+            let public = public_url
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+            print_json(&json!({
+                "member": { "id": principal_id, "email": email.trim(), "name": name.trim(), "auth_level": level, "dept_id": dept },
+                "api_key": api_key,
+                "key_id": key.get("id").or_else(|| key.get("key_id")).cloned().unwrap_or(Value::Null),
+                "connect": connect_commands(&public, &api_key),
+                "next": "Send the member one connect line (it holds their key) to run on their machine. They see only documents their level and departments allow. Stop the key with `openrag key revoke <key_id>`.",
+            }));
+        }
+    }
     Ok(())
 }
 

@@ -55,7 +55,7 @@ pub fn core_routes() -> Router<Arc<AppState>> {
         .route("/v2/buckets/{id}", get(get_bucket_handler))
         .route(
             "/v2/buckets/{id}/documents",
-            get(list_documents_handler).post(upload_or_create_document_handler),
+            get(crate::api_docs::list_documents_handler).post(upload_or_create_document_handler),
         )
         .route(
             "/v2/buckets/{id}/documents/{doc_id}",
@@ -353,76 +353,6 @@ async fn get_bucket_handler(
     Ok(Json(bucket))
 }
 
-#[derive(Debug, Serialize)]
-struct DocumentSummary {
-    id: Uuid,
-    document_id: Uuid,
-    bucket_id: Uuid,
-    title: String,
-    source_uri: Option<String>,
-    mime_type: Option<String>,
-    sensitivity: String,
-    status: String,
-    access_scope: String,
-    min_auth_level: i16,
-    tags: Vec<String>,
-    revision: i32,
-    created_at: DateTime<Utc>,
-}
-
-async fn list_documents_handler(
-    State(state): State<Arc<AppState>>,
-    AuthPrincipal(principal): AuthPrincipal,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let app_pool = state.require_app_pool().map_err(ApiError::from)?;
-    let mut tx = app_pool
-        .begin_rls_tx(&principal)
-        .await
-        .map_err(ApiError::from)?;
-    let bucket = resolve_bucket_rls(&mut tx, principal.org_id, &id)
-        .await
-        .map_err(ApiError::from)?;
-    enforce_api_key_arn_scope(&principal, &bucket.arn).map_err(ApiError::from)?;
-
-    let rows = sqlx::query(
-        "SELECT id, bucket_id, title, source_uri, mime_type, sensitivity, status,
-                access_scope, min_auth_level, tags, revision, created_at
-         FROM corpus.documents
-         WHERE org_id = $1 AND bucket_id = $2 AND status <> 'archived'
-         ORDER BY created_at DESC",
-    )
-    .bind(principal.org_id)
-    .bind(bucket.id)
-    .fetch_all(&mut **tx.tx_mut())
-    .await
-    .map_err(|e| ApiError::from(OpenRagError::Database(format!("list corpus.documents: {e}"))))?;
-
-    let mut documents = Vec::with_capacity(rows.len());
-    for r in rows {
-        let doc_id: Uuid = r.try_get("id").map_err(db_col_err)?;
-        documents.push(DocumentSummary {
-            id: doc_id,
-            document_id: doc_id,
-            bucket_id: r.try_get("bucket_id").map_err(db_col_err)?,
-            title: r.try_get("title").map_err(db_col_err)?,
-            source_uri: r.try_get("source_uri").map_err(db_col_err)?,
-            mime_type: r.try_get("mime_type").map_err(db_col_err)?,
-            sensitivity: r.try_get("sensitivity").map_err(db_col_err)?,
-            status: r.try_get("status").map_err(db_col_err)?,
-            access_scope: r.try_get("access_scope").map_err(db_col_err)?,
-            min_auth_level: r.try_get("min_auth_level").map_err(db_col_err)?,
-            tags: r.try_get("tags").map_err(db_col_err)?,
-            revision: r.try_get("revision").map_err(db_col_err)?,
-            created_at: r.try_get("created_at").map_err(db_col_err)?,
-        });
-    }
-    tx.commit()
-        .await
-        .map_err(|e| ApiError::from(OpenRagError::Database(format!("commit list_documents: {e}"))))?;
-
-    Ok(Json(json!({ "documents": documents })))
-}
 
 #[derive(Debug, Default, Deserialize)]
 struct CreateDocumentJsonRequest {
@@ -1470,9 +1400,11 @@ async fn search_bucket_handler(
         .await
         .map_err(ApiError::from)?;
 
+    let mut hits: Vec<Value> = resp.hits.iter().map(|h| serde_json::to_value(h).unwrap_or(Value::Null)).collect();
+    crate::api_docs::add_sources(&state, principal.org_id, &mut hits).await?;
     Ok(Json(json!({
-        "results": &resp.hits,
-        "hits": &resp.hits,
+        "results": &hits,
+        "hits": &hits,
         "clean_query": &resp.clean_query,
         "cleaned_query": &resp.clean_query,
         "parsed_inline_tags": &resp.parsed_inline_tags,

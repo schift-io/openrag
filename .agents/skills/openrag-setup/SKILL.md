@@ -1,6 +1,6 @@
 ---
 name: openrag-setup
-description: OpenRAG 설치 마법사. 이 저장소에서 OpenRAG 서버를 처음 띄우고(Docker), 조직·관리자 키를 만들고(init), 문서 폴더를 연결하고, Claude Code나 Codex에 MCP로 등록한 뒤 검색이 되는지 확인까지 한 번에 진행한다. "OpenRAG 설치", "openrag 셋업", "init 해줘", "사내 문서 검색 붙여줘", "설치 마법사", 또는 이미 설치된 서버에 문서 폴더 추가·키 재발급·다시 연결을 요청할 때 쓴다.
+description: OpenRAG 설치·운영 마법사. 이 저장소에서 OpenRAG 서버를 처음 띄우고(Docker), 조직·관리자 키를 만들고(init), 문서 폴더를 연결하고, Claude Code나 Codex에 MCP로 등록한 뒤 검색이 되는지 확인까지 한 번에 진행한다. 설치된 뒤에는 팀원 추가, 키 폐기, 문서 폴더 상태 점검, 백업·복원, 업데이트, HTTPS 켜기도 한다. "OpenRAG 설치", "openrag 셋업", "init 해줘", "사내 문서 검색 붙여줘", "설치 마법사", "팀원 추가해줘", "키 막아줘", "백업해줘", "업데이트해줘", "HTTPS로 바꿔줘" 같은 요청에 쓴다.
 ---
 
 # OpenRAG 설치 마법사
@@ -31,8 +31,9 @@ test -f docker/.env && grep -E '^(OPENRAG_API_PORT|PG_PORT|OPENRAG_DOCS_DIR|OPEN
 ```
 
 `openrag-api`가 떠 있고 `curl -sf http://127.0.0.1:<API 포트>/health`가 `"status":"ok"`면 새로 설치하지 않는다.
-무엇을 할지 묻는다: 문서 폴더 추가(7장), 관리자 키 다시 받기(init을 다시 실행하면 조직은 그대로 두고 새 키만 줌),
-Claude Code/Codex 다시 연결, 상태 점검.
+요청에 맞는 아래 "설치 뒤에 하는 일"로 가고, 요청이 없으면 무엇을 할지 묻는다: 상태 점검, 팀원 추가, 키 폐기,
+문서 폴더 추가(7장), 관리자 키 다시 받기(init을 다시 실행하면 조직은 그대로 두고 새 키만 줌), Claude Code/Codex
+다시 연결, 백업, 업데이트, HTTPS.
 
 ## 1단계: 점검 (묻지 않고 실행)
 
@@ -128,7 +129,8 @@ docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents f
 - 실패한 파일은 `cannot ingest file` 줄에 이유가 있다. 스캔한 PDF에 OCR이 없으면 10장, 비밀값 차단(`guard
   blocked`)이면 9장을 안내한다.
 - 폴더가 비어 있으면 아무 줄도 없다. 폴더에 파일을 넣으면 30초 안에 들어간다고 알려 준다. 기본으로 읽는 종류는
-  hwp, hwpx, md, pdf, docx, pptx, html이다(바꾸려면 `docker/.env`에 `OPENRAG_DOCS_TYPES`).
+  hwp, hwpx, md, pdf, docx, pptx, html, xlsx, csv다(바꾸려면 `docker/.env`에 `OPENRAG_DOCS_TYPES`). 엑셀·CSV는
+  안내 카드로 들어가고 칸 값은 AI가 `rag_read_sheet`로 읽는다고 알려 준다.
 
 ## 7단계: Claude Code / Codex 연결 (확인 받고)
 
@@ -154,6 +156,31 @@ curl -s http://127.0.0.1:<API 포트>/mcp \
 ```
 
 결과의 첫 문서 제목과 첫 문단 일부를 보여 준다. 문서가 아직 없으면 이 단계는 건너뛰고 그렇다고 적는다.
+
+## 설치 뒤에 하는 일
+
+관리자 키가 필요하다. `docker/.openrag-init.json`에 있으면 거기서 읽고, 없으면 사용자에게 받거나 init을 다시
+실행해 새로 받는다. 아래 `$E`는 `docker compose -f docker/docker-compose.yml exec -T -e OPENRAG_API_KEY openrag-api`다
+(`OPENRAG_API_KEY`에 관리자 키를 넣고 실행). HTTPS를 켰으면 모든 compose 명령에 `-f docker/docker-compose.https.yml`을 더한다.
+
+- **상태 점검**: `$E openrag docs status` — 폴더별 파일 수, 문서 수, 실패한 파일과 이유, 진행 중인 반영.
+  실패 이유별로 가이드 13장(스캔 PDF·OCR), 9장(비밀값 차단)을 안내한다. 지금 바로 훑으려면 `$E openrag docs scan`.
+- **팀원 추가**: 이메일, 이름, 등급(기본 3)을 묻고 `$E openrag member add --email … --name … --level …`.
+  출력의 `connect.claude`/`connect.codex` 한 줄(팀원 키가 들어 있다)을 팀원에게 전하라고 알려 준다. 키를
+  채팅에 다시 옮겨 적지 않는다. 목록은 `$E openrag member list`.
+- **키 폐기**: `$E openrag key list`로 보여 주고, 어느 키인지 확인을 받은 뒤 `$E openrag key revoke <id>`.
+  바로 막히고 되돌릴 수 없다고 먼저 말한다(새 키는 member add나 init으로 다시 받는다).
+- **백업**: 가이드 14장 명령을 그대로 쓴다. `pg_dump … -Fc --exclude-table-data=pinecone.index_maintenance`와
+  `docker/.env` 복사를 **둘 다** 하고, 두 파일을 같은 곳에 보관하라고 말한다.
+- **복원**: 새로 설치한 빈 서버에서만 한다. `dropdb` 전에 `corpus.documents`가 0건인지 확인하고, 0건이 아니면
+  멈추고 알린다. 순서는 가이드 14장(같은 `docker/.env` → `up -d postgres` → `dropdb --force` → `createdb` →
+  `pg_restore --exit-on-error` → `up -d`).
+- **업데이트**: 먼저 백업을 권한 뒤 `git pull`과 `docker compose -f docker/docker-compose.yml --profile app up -d --build`.
+  끝나면 상태 점검과 검색 확인(8단계)을 다시 한다.
+- **HTTPS**(다른 PC에서 쓸 때): 접속 이름이나 IP를 묻고 `docker/.env`에 `OPENRAG_HTTPS_HOST`, `OPENRAG_HTTPS_PORT`
+  (기본 8443), `OPENRAG_PUBLIC_URL=https://<이름>:<포트>`를 넣은 뒤 오버레이로 `up -d`. 사내용 인증서면 루트
+  인증서를 꺼내(가이드 5장) 접속 PC가 믿게 하는 방법(Claude Code는 `NODE_EXTRA_CA_CERTS`)을 알려 주고, init을 다시
+  실행해 `https://` 연결 명령을 준다.
 
 ## 마무리 보고
 

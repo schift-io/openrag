@@ -181,6 +181,7 @@ impl AppState {
 
         if let Some(mig_pool) = admin_pool.as_ref().or(worker_pool.as_ref()) {
             ensure_migrations_if_needed(mig_pool).await?;
+            register_index_maintenance(mig_pool).await;
         }
 
         let default_org_id = match non_empty_env("OPENRAG_ORG_ID") {
@@ -490,6 +491,18 @@ pub fn non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Registers every pg_pinecone index for automatic rebuilds (what migration 014 does) on each
+/// start. A restored backup leaves the registrations out (they name indexes by OID), and
+/// registering again is harmless. Without pg_pinecone it does nothing; a failure only warns.
+async fn register_index_maintenance(pool: &DbPool) {
+    let Some(spec) = openrag_db::EMBEDDED_MIGRATIONS.iter().find(|m| m.version == "014") else {
+        return;
+    };
+    if let Err(e) = sqlx::raw_sql(spec.sql).execute(pool.inner()).await {
+        tracing::warn!(error = %e, "could not register pg_pinecone indexes for maintenance");
+    }
 }
 
 pub async fn ensure_migrations_if_needed(pool: &DbPool) -> Result<bool, OpenRagError> {

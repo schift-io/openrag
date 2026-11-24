@@ -312,7 +312,7 @@ async fn pg_live_m4c3_mcp_http_transport_and_13_tools_under_rls() -> anyhow::Res
     assert_eq!(r.status, StatusCode::ACCEPTED);
     let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
     let r = send(&app, Method::POST, "/mcp", Some(&admin_key), Some(list.clone()), &[("mcp-session-id", &sid)]).await?;
-    assert_eq!(r.json["result"]["tools"].as_array().map_or(0, Vec::len), 13);
+    assert_eq!(r.json["result"]["tools"].as_array().map_or(0, Vec::len), 16);
     // Session bound to its principal: another key cannot ride it; unknown ids are 404.
     let r = send(&app, Method::POST, "/mcp", Some(&owner_key), Some(list.clone()), &[("mcp-session-id", &sid)]).await?;
     assert_eq!(r.status, StatusCode::NOT_FOUND);

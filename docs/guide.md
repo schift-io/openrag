@@ -16,7 +16,7 @@ OpenRAG를 처음 설치하는 분을 위한 안내예요. 위에서부터 순�
 - [11. 검색 품질: 임베딩 서버](#11-검색-품질-임베딩-서버)
 - [12. 서버에서 직접 답하기(선택)](#12-서버에서-직접-답하기선택)
 - [13. 자주 막히는 곳](#13-자주-막히는-곳)
-- [14. 멈추기와 다시 켜기](#14-멈추기와-다시-켜기)
+- [14. 멈추기, 다시 켜기, 백업, 업데이트](#14-멈추기-다시-켜기-백업-업데이트)
 
 ---
 
@@ -42,8 +42,8 @@ Claude Code / Codex ──(MCP: rag_search)───────┘   찾은 문
   받을 디스크 자리와, 임베딩 서버가 쓸 메모리 3GB쯤이 더 필요해요.
 - **질문할 PC의 Claude Code 또는 Codex**
 - **문서 폴더**: 서버가 이 폴더를 계속 지켜보면서 파일을 넣고, 고친 파일은 새 판으로 바꾸고, 지운 파일은
-  검색에서 빼요([7장](#7-문서-넣기고치기지우기)). 기본으로 HWP, HWPX, MD, PDF, DOCX, PPTX, HTML을 읽고,
-  하위 폴더까지 다 봐요.
+  검색에서 빼요([7장](#7-문서-넣기고치기지우기)). 기본으로 HWP, HWPX, MD, PDF, DOCX, PPTX, HTML, XLSX, CSV를
+  읽고, 하위 폴더까지 다 봐요.
 - (선택) **Schift OCR 키**: 스캔한 PDF나 사진(PNG, JPG, WEBP)에서 글자를 읽을 때 필요해요([10장](#10-스캔본-읽기ocr)).
 
 호스트에 따로 설치할 프로그램은 없어요. 설정에 쓰는 `openrag` 명령은 서버 이미지 안에 들어 있어요.
@@ -201,6 +201,35 @@ claude mcp list
 Codex는 `connect.codex` 줄을 실행해요. Codex는 키를 `OPENRAG_API_KEY` 환경변수에서 읽어요. 그래서
 Codex를 실행하는 셸에 `export OPENRAG_API_KEY=orag_…`가 항상 있어야 해요. 셸 시작 파일에 넣어 두면 편해요.
 
+### 다른 PC에서 접속할 때(HTTPS)
+
+기본 연결은 HTTP라서 키가 네트워크에 그대로 지나가요. 다른 PC에서 쓰면 HTTPS 오버레이를 켜세요. 앞에 Caddy가
+서서 HTTPS를 받고, 평문 HTTP 포트는 서버 PC 안(`127.0.0.1`)에만 열려요.
+
+```bash
+# docker/.env에 추가(사내 이름이나 IP)
+OPENRAG_HTTPS_HOST=openrag.acme.local
+OPENRAG_HTTPS_PORT=8443
+OPENRAG_PUBLIC_URL=https://openrag.acme.local:8443
+
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.https.yml --profile app up -d
+```
+
+이후 모든 명령에 같은 `-f` 두 개를 붙이고, `init`을 다시 실행하면 연결 명령에 `https://` 주소가 나와요.
+
+- **사내용(기본, `OPENRAG_HTTPS_TLS=internal`)**: Caddy가 자체 인증서를 만들어요. 접속하는 PC가 그 인증서를
+  믿게 해야 해요. 루트 인증서는 이렇게 꺼내요.
+
+  ```bash
+  docker compose -f docker/docker-compose.yml -f docker/docker-compose.https.yml \
+    cp https:/data/caddy/pki/authorities/local/root.crt ./openrag-ca.crt
+  ```
+
+  Claude Code는 실행할 때 `NODE_EXTRA_CA_CERTS=/경로/openrag-ca.crt`를 주면 믿어요. 이 방식으로 HTTPS 연결과
+  검색까지 확인했어요. 다른 도구(Codex 등)는 PC의 신뢰 저장소에 인증서를 넣어 주세요(시험하지 못했어요).
+- **인터넷 도메인이 있을 때**: `OPENRAG_HTTPS_TLS`에 이메일 주소를 넣으면 Let's Encrypt 인증서를 받아요. 그 이름이
+  이 서버를 가리키고 80·443 포트가 밖에서 열려 있어야 해요(`OPENRAG_HTTPS_PORT=443`, `OPENRAG_HTTPS_HTTP_PORT=80`).
+
 ## 6. 질문하기
 
 Claude Code에 평소처럼 물어보면 돼요. "사내 문서에서"라고 붙이면 OpenRAG를 먼저 찾아봐요.
@@ -244,14 +273,15 @@ Claude Code에 평소처럼 물어보면 돼요. "사내 문서에서"라고 붙
 
 ### 읽는 파일 종류
 
-기본은 `hwp, hwpx, md, pdf, docx, pptx, html`이에요. 다른 파일은 폴더에 있어도 건너뛰어요. 바꾸려면
+기본은 `hwp, hwpx, md, pdf, docx, pptx, html, xlsx, csv`예요. 다른 파일은 폴더에 있어도 건너뛰어요. 바꾸려면
 `OPENRAG_DOCS_TYPES`에 적고 서버를 다시 띄워요.
 
 ```bash
 export OPENRAG_DOCS_TYPES=hwp,hwpx,pdf,docx      # 이 네 가지만 읽기
 ```
 
-적을 수 있는 종류는 hwp, hwpx, hml, pdf, md, markdown, txt, docx, pptx, html, htm, png, jpg, jpeg, webp예요.
+적을 수 있는 종류는 hwp, hwpx, hml, pdf, md, markdown, txt, docx, pptx, html, htm, xlsx, xlsm, csv, tsv, png,
+jpg, jpeg, webp예요. 예전 형식(doc, ppt, xls)은 읽지 못해요.
 `md`를 적으면 `.markdown`도, `html`을 적으면 `.htm`도 같이 읽어요.
 
 이런 파일은 건너뛰어요.
@@ -260,6 +290,37 @@ export OPENRAG_DOCS_TYPES=hwp,hwpx,pdf,docx      # 이 네 가지만 읽기
 - 64MB보다 큰 파일
 - 2초 안에 바뀐 파일(아직 쓰는 중일 수 있어서요). 다음에 훑을 때 넣어요.
 - 읽다가 실패한 파일. 로그에 남기고, 파일이 바뀌면 다시 시도해요.
+
+### 엑셀과 CSV
+
+엑셀은 칸마다 쪼개서 넣지 않고, "이 파일이 무엇에 관한 것인지"를 적은 **안내 카드**로 넣어요. 카드에는
+시트 이름, 제목 줄, 열 이름, 행 수, 날짜·숫자 범위, 자주 나오는 값, 앞쪽 10행이 들어가요. 검색은 이 카드로
+파일을 찾고, 실제 칸 값은 AI가 `rag_read_sheet` 도구로 필요한 시트와 행만 서버에서 읽어 가요.
+
+예를 들어 "2024년 판교 지점 노트북 판매 금액 합계"를 물었더니 Claude Code가 카드로 파일을 찾고, 행을 읽어
+합계(13,300,000원)를 직접 계산했어요(22초).
+
+- 검색은 카드에 적힌 내용으로만 걸려요. 기본 검색은 의미(벡터) 검색이라 BM25 키워드 검색이 꺼져 있어서, 카드에 없는
+  값 하나(주문번호 같은 것)로는 파일을 찾지 못할 수 있어요. 그럴 때는 파일 이름이나 시트를 말해 주세요.
+- 행 단위 읽기는 문서 폴더에서 들어온 파일만 돼요. 서버가 원본을 그 폴더에서 바로 읽기 때문이에요.
+- AI로 나가는 칸 값에서도 전화번호 같은 개인정보는 가려져요(9장).
+
+### 지금 상태 보기
+
+들어간 문서와 실패한 파일은 Claude Code에 "사내 문서 목록 보여줘", "문서 폴더 상태 알려줘"라고 물어보면
+돼요(`rag_list_documents`, `docs_status` 도구). 명령으로도 볼 수 있어요.
+
+```bash
+export OPENRAG_API_KEY=orag_…            # init이 준 관리자 키
+E="docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api"
+$E openrag docs list                     # 문서 목록(원본 경로, 판, 효력, 문단 수). --query 일부, --all 예전 판까지
+$E openrag docs status                   # 폴더별 파일 수, 문서 수, 실패한 파일과 이유, 진행 중인 반영
+$E openrag docs scan                     # 30초 기다리지 않고 지금 훑기
+```
+
+- 파일을 한꺼번에 많이 넣으면 로그와 `docs status`에 진행 상황이 나와요(`done / total`).
+- 검색 결과와 목록의 `source.path`는 원본 파일을 이 PC의 경로로 보여 줘요(`OPENRAG_DOCS_DIR`에서 계산). 7장
+  방식으로 붙인 다른 폴더는 `OPENRAG_DOCS_DIRS` 항목에 `"host": "/Volumes/NAS/규정"`처럼 적어 주면 그 경로로 나와요.
 
 ### 폴더 여러 개
 
@@ -322,25 +383,31 @@ docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api 
 
 ### 팀원 추가
 
-지금은 HTTP API로 추가해요. 관리자 키가 필요해요.
+관리자 키로 한 줄이면 돼요. 계정과 키를 만들고, 팀원 PC에서 실행할 연결 명령까지 출력해요. 설치 마법사에
+"팀원 추가해줘"라고 해도 돼요.
 
 ```bash
 export OPENRAG_API_KEY=orag_…   # 관리자 키
-# 1) 팀원 계정 만들기: 등급 3, init이 만든 부서(dept_id는 init 출력의 org.dept_id)
-curl -s -X POST http://127.0.0.1:8080/api/studio/iam/principals \
-  -H "Authorization: Bearer $OPENRAG_API_KEY" -H 'content-type: application/json' \
-  -d '{"email":"kim@acme.example","display_name":"김사원","auth_level":3,"dept_ids":["<dept_id>"]}'
-# 응답의 "id"가 팀원 ID예요
-
-# 2) 팀원용 키 발급
-curl -s -X POST http://127.0.0.1:8080/api/studio/iam/api-keys \
-  -H "Authorization: Bearer $OPENRAG_API_KEY" -H 'content-type: application/json' \
-  -d '{"principal_id":"<팀원 ID>","name":"kim-laptop"}'
-# 응답의 "api_key"를 팀원에게 전달해요
+docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api \
+  openrag member add --email kim@acme.example --name 김사원 --level 3
 ```
 
-팀원은 받은 키로 5장의 `claude mcp add …`를 실행하면 돼요. 그러면 팀원의 Claude Code는 팀원이 볼 수
-있는 문서만 찾아요.
+- 부서는 따로 주지 않으면 관리자와 같은 부서예요(`--dept <부서 ID>`로 바꿔요).
+- 출력의 `connect.claude`(또는 `connect.codex`) 한 줄을 팀원에게 보내요. 그 줄에 팀원 키가 들어 있어요.
+- 팀원의 Claude Code는 팀원이 볼 수 있는 문서만 찾아요.
+- 팀원 목록은 `openrag member list`예요.
+
+### 키 목록과 폐기
+
+키가 새었거나 팀원이 나가면 그 키를 바로 막아요.
+
+```bash
+$E openrag key list                 # 키 목록(앞 몇 글자만, 주인, 상태)
+$E openrag key revoke <키 ID>        # 바로 막기. 그 키로 오는 요청은 401
+```
+
+(`$E`는 7장의 `docker compose … exec -e OPENRAG_API_KEY openrag-api`예요.) 관리자가 아닌 사람은 자기 키만 보고
+막을 수 있어요.
 
 ## 9. 개인정보는 이렇게 다뤄요
 
@@ -531,7 +598,7 @@ Word·한글에서 직접 저장한 파일로는 아직 시험하지 못했어�
 ### `/v1/chat/completions`가 503
 서버 쪽 LLM을 연결하지 않았어요([12장](#12-서버에서-직접-답하기선택)). Claude Code로 물을 때는 필요 없어요.
 
-## 14. 멈추기와 다시 켜기
+## 14. 멈추기, 다시 켜기, 백업, 업데이트
 
 ```bash
 docker compose -f docker/docker-compose.yml --profile app stop    # 멈추기
@@ -540,3 +607,43 @@ docker compose -f docker/docker-compose.yml --profile app start   # 다시 켜�
 
 문서와 계정은 Docker 볼륨(`pg_data`)에, 임베딩 모델은 `embed_models`에 남아 있어서, 멈췄다 켜도 그대로예요.
 모델을 다시 받지도 않아요.
+
+### 백업
+
+**두 가지를 함께** 백업해요. 데이터베이스와 `docker/.env`(암호화 키)예요. 둘 중 하나만 있으면 복원할 수 없어요.
+
+```bash
+docker compose -f docker/docker-compose.yml exec -T postgres \
+  pg_dump -U openrag -d openrag -Fc --exclude-table-data=pinecone.index_maintenance \
+  > openrag-$(date +%F).dump
+cp docker/.env openrag-$(date +%F).env
+```
+
+서버를 켜 둔 채로 떠도 돼요. `--exclude-table-data`는 꼭 붙여요. 그 표는 인덱스를 내부 번호로 가리켜서
+복원할 때 걸리고, 서버가 시작할 때 다시 채워요.
+
+### 복원
+
+**새로 설치한 빈 서버**에서만 해요. 같은 `docker/.env`(암호화 키)를 먼저 넣어 둬요.
+
+```bash
+docker compose -f docker/docker-compose.yml --profile app up -d postgres
+docker compose -f docker/docker-compose.yml exec -T postgres dropdb -U openrag --force openrag   # 처음 생긴 빈 DB
+docker compose -f docker/docker-compose.yml exec -T postgres createdb -U openrag openrag
+docker compose -f docker/docker-compose.yml exec -T postgres \
+  pg_restore -U openrag -d openrag --exit-on-error < openrag-2026-11-24.dump
+docker compose -f docker/docker-compose.yml --profile app up -d
+```
+
+`dropdb`는 처음 시작할 때 생긴 빈 DB를 지우는 거예요. 문서가 있는 서버에서는 실행하지 마세요. 시험한
+결과 문서·문단·키·개인정보 보관함이 그대로 돌아왔고, 서버가 문서 폴더를 다시 넣지 않았어요(`added=0`).
+
+### 업데이트
+
+```bash
+git pull
+docker compose -f docker/docker-compose.yml --profile app up -d --build
+```
+
+서버가 시작할 때 데이터베이스 구조를 알아서 새 판에 맞춰요. 문서와 키는 그대로예요. 올리기 전에 위 방법으로
+백업해 두세요.

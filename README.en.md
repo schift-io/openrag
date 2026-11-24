@@ -136,6 +136,9 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 - `openrag init [--docs <folder>] [--connect claude|codex]` — One-step setup: first organization and admin key, CLI config, a bucket, documents, MCP clients
 - `openrag org init` — First organization, department and admin plus an API key (local operator, `DATABASE_URL`)
 - `openrag bucket {create|list}` — Buckets
+- `openrag docs {list|status|scan}` — Documents in a bucket, documents-folder status, scan now
+- `openrag member {add|list}` — Add a member (account, key and connect commands) / list members
+- `openrag key {list|revoke}` — API keys / revoke one at once
 - `openrag connect {claude|codex}` — Register this server's `/mcp` in Claude Code or Codex
 - `openrag ingest <file or folder> --bucket <slug> [--scope private|dept|group|org] [--auth-level 1..10]`
 - `openrag index {engine|mirror|status|retry}` — Switch `pg_pinecone` engines, mirror S3 Vectors/OSS, inspect outbox/quarantine
@@ -188,13 +191,17 @@ answers come back with the original values; MCP `rag_ask` keeps the tokens. Name
 after a label (`성명:`, `담당자:`, …) or an attached title (`김민준과장`); a bare name in running
 text is not.
 
-### Exposed MCP Tools (9)
+### Exposed MCP Tools (16)
 - `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)
 - `rag_ask` — Grounded RAG Q&A through the policy-enforced LLM router
 - `rag_ingest` — Ingest document/text with scope, permission groups, and clearance level
 - `rag_get_page` — Fetch redacted page text, thumbnail URI, and `bbox_norm_1000` coordinates
+- `rag_list_documents` — Documents in a bucket (original path, revision, in force or not)
+- `rag_read_sheet` — Rows of an Excel/CSV file; spreadsheets are indexed as catalog cards and read on demand
+- `docs_status` — Documents-folder watcher status (failed files and why, progress) and scan now (org admins)
 - `wiki_search` / `wiki_get` — Query and retrieve DB-native LLM Wiki pages
-- `memory_search` / `memory_patch` — Search active memory view and append CCLG patches
+- `memory_search` / `memory_patch` / `memory_engage` / `memory_reflect` — Search active memory view, append CCLG patches, record use and reflections
+- `concept_link` / `concept_resolve` — Canonical concepts and cross-lingual aliases
 - `guard_check` — Inspect text against active PII + Safe-Word Guard policies (`allow` | `warn` | `mask` | `block`)
 
 ### Claude Desktop (`claude_desktop_config.json`)
