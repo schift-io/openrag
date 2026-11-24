@@ -36,3 +36,6 @@ __pycache__/
 
 # Documents folder the compose stack watches (OPENRAG_DOCS_DIR default)
 /documents/
+
+# Setup wizard: init output with the admin API key
+docker/.openrag-init.json

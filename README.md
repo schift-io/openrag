@@ -32,6 +32,9 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
 
 준비물은 Docker 하나예요. 호스트에 따로 설치할 프로그램은 없어요.
 
+Claude Code나 Codex가 있다면 저장소 폴더에서 `/openrag-setup`(Codex는 `$openrag-setup`)을 입력하세요.
+설치 마법사가 아래 과정을 대신 진행하고, 끝나면 연결과 검색까지 확인해 줘요.
+
 ```bash
 # 1) 서버 띄우기
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # 다시 띄울 때도 같은 값을 쓰니 적어 두세요

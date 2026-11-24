@@ -67,6 +67,11 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
   up -d postgres local-embed openrag-api
 ```
 
+### Or let Claude Code / Codex do it
+Open Claude Code in the repository and type `/openrag-setup` (in Codex, `$openrag-setup`). The setup
+skill checks Docker, asks for the documents folder, organization and client, writes `docker/.env`,
+starts the stack, runs `init`, registers the MCP server (after asking) and checks a search.
+
 ### Then: set it up from inside the server container
 Nothing to install on the host: the API image ships the `openrag` CLI.
 ```bash

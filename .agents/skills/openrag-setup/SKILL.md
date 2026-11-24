@@ -1,0 +1,167 @@
+---
+name: openrag-setup
+description: OpenRAG 설치 마법사. 이 저장소에서 OpenRAG 서버를 처음 띄우고(Docker), 조직·관리자 키를 만들고(init), 문서 폴더를 연결하고, Claude Code나 Codex에 MCP로 등록한 뒤 검색이 되는지 확인까지 한 번에 진행한다. "OpenRAG 설치", "openrag 셋업", "init 해줘", "사내 문서 검색 붙여줘", "설치 마법사", 또는 이미 설치된 서버에 문서 폴더 추가·키 재발급·다시 연결을 요청할 때 쓴다.
+---
+
+# OpenRAG 설치 마법사
+
+사용자를 대신해 설치를 진행하는 마법사 역할을 한다. 명령은 직접 실행하고, 사용자에게는 결정할 것만 묻는다.
+자세한 설명이 필요하면 `docs/guide.md`(3·4·5·7·13장)를 연다.
+
+## 원칙
+
+- **묻는 것은 한 번에 모아서.** 1단계 점검이 끝나면 질문을 한 메시지에 묶고, 각 질문에 기본값을 적는다.
+  사용자가 "기본값으로"라고 하면 그대로 진행한다.
+- **사용자 PC 설정을 바꾸기 전에는 확인을 받는다.** MCP 등록(`claude mcp add`, `codex mcp add`)과
+  셸 설정 파일(`~/.zshrc` 등) 수정이 여기에 해당한다. 서버와 저장소 안 파일(`docker/.env`)은 묻지 않고 만든다.
+- **비밀값을 채팅에 그대로 옮겨 적지 않는다.** 암호화 키(`OPENRAG_PII_KEK_HEX`)는 `docker/.env`에만 둔다.
+  관리자 API 키는 init 출력에서 한 번 보여 주고, 보관하라고 말한다.
+- **`docker/.env`의 `OPENRAG_PII_KEK_HEX`는 절대 바꾸지 않는다.** 이미 값이 있으면 그대로 쓴다. 바꾸면 이미
+  저장한 개인정보 보관함을 열 수 없게 된다.
+- **지우지 않는다.** 컨테이너·볼륨·문서를 지우는 명령(`down -v`, `volume rm`, `rm`)은 쓰지 않는다. 막히면
+  원인을 보여 주고 사용자에게 고르게 한다.
+- 모든 compose 명령은 저장소 루트에서 `docker compose -f docker/docker-compose.yml --profile app …`으로 실행한다.
+  compose는 `docker/.env`를 읽는다. 폐쇄망 구성이면 `-f docker/docker-compose.yml -f docker/docker-compose.airgap.yml`.
+
+## 0단계: 이미 설치돼 있는지
+
+```bash
+docker compose -f docker/docker-compose.yml --profile app ps --format '{{.Service}} {{.Status}}' 2>/dev/null
+test -f docker/.env && grep -E '^(OPENRAG_API_PORT|PG_PORT|OPENRAG_DOCS_DIR|OPENRAG_PUBLIC_URL)=' docker/.env
+```
+
+`openrag-api`가 떠 있고 `curl -sf http://127.0.0.1:<API 포트>/health`가 `"status":"ok"`면 새로 설치하지 않는다.
+무엇을 할지 묻는다: 문서 폴더 추가(7장), 관리자 키 다시 받기(init을 다시 실행하면 조직은 그대로 두고 새 키만 줌),
+Claude Code/Codex 다시 연결, 상태 점검.
+
+## 1단계: 점검 (묻지 않고 실행)
+
+```bash
+docker info --format '{{.ServerVersion}}'          # Docker가 떠 있는지
+docker compose version                              # Compose v2
+docker system df                                    # 디스크
+lsof -nP -iTCP:8080 -sTCP:LISTEN; lsof -nP -iTCP:5432 -sTCP:LISTEN   # 포트
+```
+
+- Docker가 없거나 꺼져 있으면 설치·실행을 안내하고 멈춘다.
+- 처음 설치에는 이미지 빌드와 임베딩 모델(약 1.5GB)을 받을 자리가 필요하다. Docker 디스크 여유가 5GB보다
+  적어 보이면 알린다(13장 `no space left on device`).
+- 8080이나 5432를 이미 쓰고 있으면 비어 있는 포트를 골라 기본값으로 제안한다(예: 18080, 55432).
+
+## 2단계: 질문 (한 메시지로)
+
+1. **문서 폴더**: 서버가 지켜볼 폴더의 절대 경로. 기본값은 저장소의 `documents/`. 여러 개면 첫 번째를 기본
+   폴더로 쓰고 나머지는 7장 방식(볼륨 한 줄 추가)으로 붙인다.
+2. **조직 이름**: 영문 소문자 slug와 표시 이름. 기본값 `default` / `Default`.
+3. **접속 주소**: Claude Code·Codex를 이 PC에서만 쓰면 기본값(`http://127.0.0.1:<API 포트>`). 다른 PC에서도
+   쓰면 이 서버의 주소(예: `http://10.0.0.5:8080`).
+4. **연결할 도구**: Claude Code, Codex, 둘 다(기본값은 지금 이 마법사를 실행한 도구).
+5. (선택) **스캔본 OCR**: Schift OCR 키가 있는지. 없으면 건너뛴다(10장).
+6. (선택) **폐쇄망**인지. 그렇다면 3장의 폐쇄망 절차를 따른다.
+
+## 3단계: `docker/.env` 만들기
+
+`docker/.env`가 없으면 만든다. 있으면 아는 키만 고치고 나머지 줄은 그대로 둔다. `.env`는 git에 올라가지 않는다.
+
+```bash
+umask 077
+test -f docker/.env || printf 'OPENRAG_PII_KEK_HEX=%s\n' "$(openssl rand -hex 32)" > docker/.env
+```
+
+그다음 필요한 줄을 넣는다(값이 기본값이면 생략해도 된다).
+
+```text
+OPENRAG_DOCS_DIR=/절대/경로/문서폴더
+OPENRAG_API_PORT=8080
+PG_PORT=5432
+OPENRAG_PUBLIC_URL=http://<접속 주소>:<API 포트>
+OPENRAG_SCHIFT_OCR_URL=https://schift.io      # OCR을 쓸 때만
+SCHIFT_OCR_API_KEY=…                          # OCR을 쓸 때만. 사용자가 직접 넣게 한다
+```
+
+문서 폴더가 없으면 만든다(`mkdir -p`). 사용자에게 `docker/.env`에 암호화 키가 있고, 이 파일을 잃으면
+개인정보 보관함을 열 수 없으니 따로 백업하라고 말한다. 키 값은 말하지 않는다.
+
+## 4단계: 서버 띄우기
+
+```bash
+docker compose -f docker/docker-compose.yml --profile app up -d
+```
+
+처음에는 이미지 빌드와 모델 다운로드로 몇 분 걸린다(시험한 PC에서 모델 준비까지 2분 41초). 30초마다 상태를
+확인하며 기다리고, 진행 상황을 짧게 알린다.
+
+```bash
+docker compose -f docker/docker-compose.yml --profile app ps --format '{{.Service}} {{.Status}}'
+curl -sf http://127.0.0.1:<API 포트>/health     # {"db_connected":true,…,"status":"ok"}
+```
+
+10초 간격으로 15분까지 기다린다. 15분이 지나도 안 뜨면 `docker compose -f docker/docker-compose.yml logs --tail 50 <서비스>`로 원인을 보고
+13장에서 해당 항목을 찾아 안내한다. 자주 나오는 것: `port is already allocated`(다른 포트로), `local-embed …
+unhealthy`(모델 다운로드 중이거나 메모리 부족), `no space left on device`.
+
+## 5단계: init
+
+```bash
+umask 077
+docker compose -f docker/docker-compose.yml --profile app exec -T openrag-api \
+  openrag init --slug <slug> --name "<표시 이름>" > docker/.openrag-init.json
+```
+
+다른 PC에서 접속한다면 `--public-url <접속 주소>`를 붙인다(`docker/.env`의 `OPENRAG_PUBLIC_URL`이 있으면
+생략 가능). 출력은 관리자 키가 든 JSON이라 화면에 그대로 찍지 않고 `docker/.openrag-init.json`에만 둔다
+(git이 무시하는 파일이다). 내용을 볼 때는 키를 가리고 본다. 다른 곳에 저장하지 않는다.
+
+- `api_key`: 관리자 키. 사용자에게 한 번 보여 주고 비밀번호 관리자 같은 곳에 보관하라고 한다.
+- `connect.claude`, `connect.codex`: 6단계에서 쓸 등록 명령.
+- `config.not_saved`는 정상이다(컨테이너 안에는 설정을 저장하지 않는다).
+
+## 6단계: 문서가 들어갔는지
+
+init이 버킷을 만들면 서버가 문서 폴더를 읽기 시작한다(30초마다 훑는다). 40초쯤 기다린 뒤 확인한다.
+
+```bash
+docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents folder"
+```
+
+- `documents folder synced … added=N failed=M`: 들어간 수와 실패한 수.
+- 실패한 파일은 `cannot ingest file` 줄에 이유가 있다. 스캔한 PDF에 OCR이 없으면 10장, 비밀값 차단(`guard
+  blocked`)이면 9장을 안내한다.
+- 폴더가 비어 있으면 아무 줄도 없다. 폴더에 파일을 넣으면 30초 안에 들어간다고 알려 준다. 기본으로 읽는 종류는
+  hwp, hwpx, md, pdf, docx, pptx, html이다(바꾸려면 `docker/.env`에 `OPENRAG_DOCS_TYPES`).
+
+## 7단계: Claude Code / Codex 연결 (확인 받고)
+
+등록 명령은 사용자 PC 설정을 바꾸므로, 실행해도 되는지 먼저 묻는다.
+
+- **Claude Code**: init 출력의 `connect.claude`를 그대로 실행한다. 이미 `openrag`가 등록돼 있다는 오류가 나면
+  `claude mcp remove openrag -s user`로 지우고 다시 등록해도 되는지 묻는다. 등록 뒤에는 Claude Code를 새로
+  시작해야 도구가 보인다고 알린다.
+- **Codex**: `connect.codex`는 `OPENRAG_API_KEY` 환경 변수를 쓴다. `codex mcp add …` 부분을 실행하고, 키를
+  셸 설정 파일에 넣어도 되는지 물은 뒤 `export OPENRAG_API_KEY=…` 한 줄을 추가한다(거절하면 직접 넣는 방법만
+  알려 준다).
+- 마법사를 다른 PC에서 쓸 사람이 있으면, 그 PC에서 실행할 명령으로 `connect.*` 줄을 넘겨준다.
+
+## 8단계: 검색 확인
+
+들어간 문서의 제목 하나로 질문을 만들어 MCP로 직접 검색한다.
+
+```bash
+curl -s http://127.0.0.1:<API 포트>/mcp \
+  -H "Authorization: Bearer <api_key>" -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rag_search","arguments":{"query":"<질문>","bucket":"docs","top_k":3}}}'
+```
+
+결과의 첫 문서 제목과 첫 문단 일부를 보여 준다. 문서가 아직 없으면 이 단계는 건너뛰고 그렇다고 적는다.
+
+## 마무리 보고
+
+짧게, 이 순서로:
+
+1. 된 것: 서버 주소, 조직, 들어간 문서 수(실패가 있으면 파일과 이유), 연결한 도구.
+2. 사용자가 할 일: 관리자 키 보관(키를 옮겨 적은 뒤 `docker/.openrag-init.json`은 지워도 된다고 알린다.
+   마법사가 지우지는 않는다), `docker/.env` 백업, Claude Code/Codex 새로 시작한 뒤 "사내 문서에서
+   찾아서 답해줘: …"처럼 묻기.
+3. 문서 다루는 법 한 줄: 문서 폴더에 넣고·고치고·옮기고·지우면 30초 안에 반영된다(7장).
+4. 멈추기·다시 켜기: `docker compose -f docker/docker-compose.yml --profile app stop` / `start`(14장).
