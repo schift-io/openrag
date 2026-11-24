@@ -13,6 +13,7 @@ pub mod model;
 pub mod office;
 pub mod ocr;
 pub mod pdf;
+mod pdf_text;
 pub mod s3;
 pub mod store;
 pub mod thumbnail;

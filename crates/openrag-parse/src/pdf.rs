@@ -1,10 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use flate2::read::ZlibDecoder;
 use openrag_core::{OpenRagError, ParseConfig};
 use tokio::process::Command;
 
@@ -12,9 +10,9 @@ use crate::aliases::extract_parenthetical_aliases;
 use crate::model::{sha256_hex_bytes, sha256_hex_str, DocumentFormat, ParsedDocument, ParsedPage};
 
 #[derive(Debug, Clone)]
-struct PdfObj<'a> {
-    dict: Cow<'a, str>,
-    stream: Option<&'a [u8]>,
+pub(crate) struct PdfObj<'a> {
+    pub(crate) dict: Cow<'a, str>,
+    pub(crate) stream: Option<&'a [u8]>,
 }
 
 pub async fn parse_pdf_native(
@@ -192,7 +190,7 @@ fn refs_in(fragment: &str) -> Vec<u32> {
         .collect()
 }
 
-fn parse_pdf_objects(bytes: &[u8]) -> HashMap<u32, PdfObj<'_>> {
+pub(crate) fn parse_pdf_objects(bytes: &[u8]) -> HashMap<u32, PdfObj<'_>> {
     let mut map = HashMap::new();
     // Walk byte offsets in `bytes` using ASCII marker search on latin1-compatible view.
     let mut pos = 0usize;
@@ -237,6 +235,11 @@ fn parse_pdf_objects(bytes: &[u8]) -> HashMap<u32, PdfObj<'_>> {
                 stream: stream_bytes,
             },
         );
+    }
+    // PDF 1.5+ packs most objects (pages, fonts) into compressed object streams.
+    let packed: Vec<(u32, String)> = map.values().flat_map(crate::pdf_text::object_stream_members).collect();
+    for (id, text) in packed {
+        map.entry(id).or_insert(PdfObj { dict: Cow::Owned(text), stream: None });
     }
     map
 }
@@ -374,227 +377,7 @@ fn extract_page_text(
     page_obj: &PdfObj<'_>,
     objects: &HashMap<u32, PdfObj<'_>>,
 ) -> Result<String, OpenRagError> {
-    let content_ids = parse_ref_list(&page_obj.dict, "/Contents");
-    let mut combined = Vec::new();
-
-    for cid in content_ids {
-        let Some(cobj) = objects.get(&cid) else {
-            continue;
-        };
-        let Some(stream) = cobj.stream else {
-            continue;
-        };
-        let decompressed = if cobj.dict.contains("/FlateDecode") {
-            let mut dec = ZlibDecoder::new(stream);
-            let mut buf = Vec::new();
-            if dec.read_to_end(&mut buf).is_ok() {
-                buf
-            } else {
-                stream.to_vec()
-            }
-        } else {
-            stream.to_vec()
-        };
-        let chunk = extract_text_operators(&decompressed);
-        if !chunk.trim().is_empty() {
-            combined.push(chunk);
-        }
-    }
-
-    Ok(combined.join("\n"))
-}
-
-fn extract_text_operators(stream: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stream);
-    let bytes = text.as_bytes();
-    let mut lines: Vec<String> = Vec::new();
-    let mut current_line = String::new();
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                let (decoded, next_i) = parse_pdf_literal_string(bytes, i);
-                i = next_i;
-                let _look = skip_ws_slice(&bytes[i..]);
-                current_line.push_str(&decoded);
-            }
-            b'<' if bytes.get(i + 1) != Some(&b'<') => {
-                if let Some((decoded, next_i)) = parse_pdf_hex_string(bytes, i) {
-                    i = next_i;
-                    current_line.push_str(&decoded);
-                } else {
-                    i += 1;
-                }
-            }
-            b'[' => {
-                let (arr_text, next_i) = parse_pdf_tj_array(bytes, i);
-                if !arr_text.is_empty() {
-                    current_line.push_str(&arr_text);
-                }
-                i = next_i;
-            }
-            b'T' if matches!(bytes.get(i + 1), Some(b'*' | b'd' | b'D')) => {
-                if !current_line.trim().is_empty() {
-                    lines.push(current_line.trim().to_string());
-                    current_line.clear();
-                }
-                i += 2;
-            }
-            b'E' if bytes.get(i + 1) == Some(&b'T') => {
-                if !current_line.trim().is_empty() {
-                    lines.push(current_line.trim().to_string());
-                    current_line.clear();
-                }
-                i += 2;
-            }
-            _ => i += 1,
-        }
-    }
-    if !current_line.trim().is_empty() {
-        lines.push(current_line.trim().to_string());
-    }
-    lines.join("\n")
-}
-
-fn skip_ws_slice(s: &[u8]) -> &[u8] {
-    let mut idx = 0;
-    while idx < s.len() && s[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    &s[idx..]
-}
-
-fn parse_pdf_literal_string(bytes: &[u8], start: usize) -> (String, usize) {
-    let mut i = start + 1;
-    let mut depth = 1usize;
-    let mut raw: Vec<u8> = Vec::new();
-    while i < bytes.len() && depth > 0 {
-        match bytes[i] {
-            b'\\' => {
-                i += 1;
-                if i >= bytes.len() {
-                    break;
-                }
-                match bytes[i] {
-                    b'n' => raw.push(b'\n'),
-                    b'r' => raw.push(b'\r'),
-                    b't' => raw.push(b'\t'),
-                    b'b' => raw.push(0x08),
-                    b'f' => raw.push(0x0C),
-                    b'(' | b')' | b'\\' => raw.push(bytes[i]),
-                    b'0'..=b'7' => {
-                        let mut val = bytes[i] - b'0';
-                        for _ in 0..2 {
-                            if let Some(&d @ b'0'..=b'7') = bytes.get(i + 1) {
-                                val = val.wrapping_mul(8).wrapping_add(d - b'0');
-                                i += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        raw.push(val);
-                    }
-                    b'\r' | b'\n' => {}
-                    other => raw.push(other),
-                }
-            }
-            b'(' => {
-                depth += 1;
-                raw.push(b'(');
-            }
-            b')' => {
-                depth -= 1;
-                if depth > 0 {
-                    raw.push(b')');
-                }
-            }
-            b => raw.push(b),
-        }
-        i += 1;
-    }
-
-    let decoded = if raw.starts_with(&[0xFE, 0xFF]) {
-        decode_utf16_be(&raw[2..])
-    } else {
-        String::from_utf8_lossy(&raw).into_owned()
-    };
-    (decoded, i)
-}
-
-fn parse_pdf_hex_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    let close = bytes[start + 1..].iter().position(|&b| b == b'>')?;
-    let hex_slice = &bytes[start + 1..start + 1 + close];
-    let clean: Vec<u8> = hex_slice
-        .iter()
-        .copied()
-        .filter(|b| b.is_ascii_hexdigit())
-        .collect();
-    let mut raw = Vec::with_capacity(clean.len().div_ceil(2));
-    let mut idx = 0usize;
-    while idx < clean.len() {
-        let hi = hex_val(clean[idx])?;
-        let lo = if idx + 1 < clean.len() {
-            hex_val(clean[idx + 1])?
-        } else {
-            0
-        };
-        raw.push((hi << 4) | lo);
-        idx += 2;
-    }
-    let decoded = if raw.starts_with(&[0xFE, 0xFF]) {
-        decode_utf16_be(&raw[2..])
-    } else {
-        String::from_utf8_lossy(&raw).into_owned()
-    };
-    Some((decoded, start + 1 + close + 1))
-}
-
-fn parse_pdf_tj_array(bytes: &[u8], start: usize) -> (String, usize) {
-    let mut i = start + 1;
-    let mut out = String::new();
-    while i < bytes.len() {
-        match bytes[i] {
-            b']' => {
-                i += 1;
-                break;
-            }
-            b'(' => {
-                let (s, next_i) = parse_pdf_literal_string(bytes, i);
-                out.push_str(&s);
-                i = next_i;
-            }
-            b'<' if bytes.get(i + 1) != Some(&b'<') => {
-                if let Some((s, next_i)) = parse_pdf_hex_string(bytes, i) {
-                    out.push_str(&s);
-                    i = next_i;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    (out, i)
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn decode_utf16_be(bytes: &[u8]) -> String {
-    let mut units = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        units.push(u16::from_be_bytes([bytes[i], bytes[i + 1]]));
-        i += 2;
-    }
-    String::from_utf16_lossy(&units)
+    Ok(crate::pdf_text::page_text(page_obj, objects))
 }
 
 async fn try_pdftotext_page(bytes: &[u8], page_no: usize) -> Option<String> {
@@ -624,7 +407,7 @@ async fn try_pdftotext_page(bytes: &[u8], page_no: usize) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let text = crate::pdf_text::clean(String::from_utf8_lossy(&out.stdout).trim());
     if text.is_empty() {
         None
     } else {

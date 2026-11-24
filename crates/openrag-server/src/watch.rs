@@ -1,7 +1,8 @@
 //! Watched document folders. The server keeps buckets in step with folders on disk: a new file is
 //! ingested, a changed file replaces its in-force copy, a moved or renamed file keeps its document
 //! (matched by the file's SHA-256, so nothing is parsed or embedded again), and a deleted file goes
-//! out of force (`valid_to`) while its record stays.
+//! out of force (`valid_to`) while its record stays. When a file with that content shows up again
+//! (restored from the trash, a remounted share), the same document comes back into force.
 //!
 //! Configuration (environment):
 //! - `OPENRAG_DOCS_DIRS`: folders to watch, a JSON list such as `["/docs", "/mnt/hr"]` (entries may
@@ -388,7 +389,6 @@ struct Found {
 struct Scan {
     files: Vec<Found>,
     unavailable: HashSet<String>,
-    empty_roots: HashSet<String>,
     too_large: Vec<(String, u64)>,
 }
 
@@ -406,7 +406,6 @@ fn scan_folders(folders: &[WatchFolder], all_roots: &[String]) -> Scan {
     let mut scan = Scan {
         files: Vec::new(),
         unavailable: HashSet::new(),
-        empty_roots: HashSet::new(),
         too_large: Vec::new(),
     };
     for folder in folders {
@@ -415,7 +414,6 @@ fn scan_folders(folders: &[WatchFolder], all_roots: &[String]) -> Scan {
             scan.unavailable.insert(folder.path.clone());
             continue;
         }
-        let before = scan.files.len();
         let mut stack = vec![root.to_path_buf()];
         let mut failed = false;
         while let Some(dir) = stack.pop() {
@@ -467,8 +465,6 @@ fn scan_folders(folders: &[WatchFolder], all_roots: &[String]) -> Scan {
         }
         if failed {
             scan.unavailable.insert(folder.path.clone());
-        } else if scan.files.len() == before {
-            scan.empty_roots.insert(folder.path.clone());
         }
     }
     scan
@@ -494,6 +490,7 @@ struct Tally {
     replaced: usize,
     moved: usize,
     removed: usize,
+    restored: usize,
     failed: usize,
 }
 
@@ -682,23 +679,9 @@ impl Watcher {
         let stored = self.stored_docs(org, bucket.id, &roots).await?;
         let by_key: HashMap<&str, &StoredDoc> = stored.iter().map(|d| (d.doc.key.as_str(), d)).collect();
 
-        // A folder that loses every file at once is more likely an unmounted share than a
-        // cleared library; its documents are kept until files show up there again. Deleting the
-        // last single file of a folder still retires it.
-        let mut keep_roots = scan.unavailable.clone();
-        for root in &scan.empty_roots {
-            let held = stored.iter().filter(|d| &d.doc.root == root).count();
-            if held >= 2 {
-                keep_roots.insert(root.clone());
-                if self.report_once(format!("empty:{root}")) {
-                    tracing::warn!(
-                        folder = %root,
-                        documents = held,
-                        "documents folder lost all its files at once; its documents are kept (to retire them on purpose, leave one file until the others are gone)"
-                    );
-                }
-            }
-        }
+        // A folder that cannot be read keeps its documents. An empty one does not: its files
+        // were removed, and if it was an unmounted share they come back as the same documents.
+        let keep_roots = scan.unavailable.clone();
 
         let mut disk = Vec::with_capacity(scan.files.len());
         for f in &scan.files {
@@ -746,6 +729,13 @@ impl Watcher {
                 Step::Ingest { file, replaces } => {
                     let f = scan.files[file].clone();
                     let Some(sha) = disk[file].sha.clone() else { continue };
+                    if replaces.is_none() {
+                        if let Some(doc) = self.restore(org, bucket.id, &f, &sha).await? {
+                            tally.restored += 1;
+                            tracing::info!(file = %f.key, document_id = %doc, "file is back; document in force again (not re-embedded)");
+                            continue;
+                        }
+                    }
                     match self.ingest(&principal, &bucket, &f, &sha, replaces, &docs).await {
                         Ok(Some(true)) => tally.replaced += 1,
                         Ok(Some(false)) => tally.added += 1,
@@ -768,13 +758,14 @@ impl Watcher {
         let present: HashSet<&str> = scan.files.iter().map(|f| f.key.as_str()).collect();
         self.hashes.retain(|k, _| present.contains(k.as_str()));
         self.failures.retain(|k, _| present.contains(k.as_str()));
-        if tally.added + tally.replaced + tally.moved + tally.removed + tally.failed > 0 {
+        if tally.added + tally.replaced + tally.moved + tally.removed + tally.restored + tally.failed > 0 {
             tracing::info!(
                 bucket = %slug,
                 added = tally.added,
                 replaced = tally.replaced,
                 moved = tally.moved,
                 removed = tally.removed,
+                restored = tally.restored,
                 failed = tally.failed,
                 "documents folder synced"
             );
@@ -880,6 +871,46 @@ impl Watcher {
         .await
         .map_err(|e| db(e, "record watched file"))?;
         Ok(())
+    }
+
+    /// Puts back in force the latest document the watcher retired with this content, at the
+    /// file's current path. Nothing is parsed or embedded again.
+    async fn restore(&self, org: Uuid, bucket: Uuid, f: &Found, sha: &str) -> Result<Option<Uuid>, OpenRagError> {
+        let worker = self.state.require_worker_pool()?;
+        let row = sqlx::query(
+            "SELECT id, title, metadata->>'external_key' AS key FROM corpus.documents
+             WHERE org_id = $1 AND bucket_id = $2 AND content_sha256 = $3
+               AND metadata->>'source' = 'watch' AND metadata ? 'watch_removed_at'
+               AND valid_to IS NOT NULL AND valid_to <= now()
+               AND status IN ('indexed', 'pending')
+             ORDER BY valid_to DESC
+             LIMIT 1",
+        )
+        .bind(org)
+        .bind(bucket)
+        .bind(sha)
+        .fetch_optional(worker.inner())
+        .await
+        .map_err(|e| db(e, "lookup retired document"))?;
+        let Some(row) = row else { return Ok(None) };
+        let id: Uuid = row.try_get("id").map_err(|e| db(e, "id"))?;
+        let title: String = row.try_get("title").map_err(|e| db(e, "title"))?;
+        let old_key: Option<String> = row.try_get("key").map_err(|e| db(e, "key"))?;
+        sqlx::query(
+            "UPDATE corpus.documents
+             SET valid_to = NULL, updated_at = now(),
+                 metadata = (metadata - 'watch_removed_at')
+                     || jsonb_build_object('watch_restored_at', now(), 'watch_last_removed_at', metadata->'watch_removed_at')
+             WHERE org_id = $1 AND id = $2",
+        )
+        .bind(org)
+        .bind(id)
+        .execute(worker.inner())
+        .await
+        .map_err(|e| db(e, "restore document"))?;
+        let renamed = old_key.as_deref().map(file_name) == Some(title.as_str()) && file_name(&f.key) != title;
+        self.mark(org, id, f, renamed.then(|| file_name(&f.key))).await?;
+        Ok(Some(id))
     }
 
     /// Takes a document out of force; the row, its pages and chunks stay.
