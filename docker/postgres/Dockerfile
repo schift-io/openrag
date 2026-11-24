@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1
+# Versions are pinned to the build verified on 2026-11-24 (clean clone, no cache): ParadeDB 0.27.0
+# (pg_search 0.27.0, PostgreSQL 17.12), pg_pinecone main at d860f6f (v0.13.0 + 5 commits), Rust 1.100.0.
 ARG PG_MAJOR=17
-FROM paradedb/paradedb:latest-pg${PG_MAJOR} AS pg_pinecone_builder
+ARG PARADEDB_VERSION=0.27.0
+FROM paradedb/paradedb:${PARADEDB_VERSION}-pg${PG_MAJOR} AS pg_pinecone_builder
 
 ARG PG_MAJOR
 ARG PG_PINECONE_REPO=https://github.com/pinecone-io/pg_pinecone.git
-ARG PG_PINECONE_REF=main
+ARG PG_PINECONE_REF=d860f6fd3a21733d75ed2cde2b5b5e71e79bd3ac
+ARG RUST_TOOLCHAIN=1.100.0
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,11 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+    | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
-RUN git clone --depth 1 --branch "${PG_PINECONE_REF}" "${PG_PINECONE_REPO}" pg_pinecone
+# PG_PINECONE_REF may be a commit, a tag or a branch: pull just that one into an empty repository.
+RUN git init -q pg_pinecone \
+    && git -C pg_pinecone pull -q --depth 1 "${PG_PINECONE_REPO}" "${PG_PINECONE_REF}" \
+    && git -C pg_pinecone log -1 --format='pg_pinecone %H %cs'
 WORKDIR /build/pg_pinecone
 
 RUN PGRX_VER=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
@@ -30,7 +37,7 @@ RUN PGRX_VER=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
     && if [ "${TARGETARCH}" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi \
     && cargo pgrx install --release --pg-config "$(which pg_config)"
 
-FROM paradedb/paradedb:latest-pg${PG_MAJOR}
+FROM paradedb/paradedb:${PARADEDB_VERSION}-pg${PG_MAJOR}
 ARG PG_MAJOR
 
 COPY --from=pg_pinecone_builder \
