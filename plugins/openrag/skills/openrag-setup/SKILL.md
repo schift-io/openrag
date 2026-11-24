@@ -49,6 +49,8 @@ lsof -nP -iTCP:8080 -sTCP:LISTEN; lsof -nP -iTCP:5432 -sTCP:LISTEN   # 포트
 ```
 
 - Docker가 없거나 꺼져 있으면 설치·실행을 안내하고 멈춘다.
+- `docker compose version`이 `unknown command`면 Compose가 없다(Ubuntu `docker.io`가 그렇다). 가이드 13장대로
+  `sudo apt install docker-compose-v2`(Docker 공식 저장소면 `docker-compose-plugin`)를 안내하고 멈춘다.
 - 처음 설치에는 Docker 디스크가 12GB쯤 필요하다(이미지 3.8GB, 빌드 캐시 6GB쯤, 임베딩 모델 1.5GB). 여유가
   그보다 적어 보이면 먼저 알린다(13장 `no space left on device`).
 - 8080이나 5432를 이미 쓰고 있으면 비어 있는 포트를 골라 기본값으로 제안한다(예: 18080, 55432).

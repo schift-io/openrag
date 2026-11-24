@@ -565,6 +565,12 @@ vLLM처럼 OpenAI 호환 API를 주는 서버면 돼요. 등급 8 이상 문서�
 
 ## 13. 자주 막히는 곳
 
+### `unknown command: docker compose` 또는 `unknown shorthand flag: 'f' in -f`
+Docker에 Compose가 없어요. Ubuntu의 `docker.io` 패키지에는 Compose가 들어 있지 않아요(Ubuntu 24.04에서 확인).
+`sudo apt install docker-compose-v2`로 넣고 `docker compose version`이 나오는지 보세요. Docker 공식 저장소로
+설치했다면 패키지 이름이 `docker-compose-plugin`이에요. Ubuntu 패키지의 Compose 2.40.3이 이 저장소의 compose
+파일을 읽는 것까지 확인했고, 그 패키지로 서버를 띄워 보지는 못했어요.
+
 ### `required variable OPENRAG_PII_KEK_HEX is missing a value`
 3장의 `export OPENRAG_PII_KEK_HEX=…`를 빠뜨렸어요. 처음 만든 값을 그대로 다시 넣으세요.
 

@@ -59,7 +59,12 @@ Claude Code 설정이 비어 있으면 같은 줄의 환경변수를 읽어요.
 
 시험한 것(2026-11-24): Claude Code 2.1.331과 Codex 0.171.0 모두 kordoc 4.25.11로 HWPX를 만들자, 플러그인 훅이 그 파일을
 저장했고 같은 세션의 `rag_search` 첫 결과가 그 문서였어요. 두 도구 모두 GitHub에서 설치한 사본이 시험한 파일과
-같은 것도 확인했어요. Windows는 시험하지 못했어요.
+같은 것도 확인했어요.
+
+Windows 11에서는 Codex 0.172.0으로 GitHub에서 설치하면 스킬이 보였어요. 훅은 Codex가 Windows에서 실행하는
+방식(`cmd /C`) 그대로 kordoc 결과 이벤트를 넣어 돌렸고, HWPX를 서버에 저장한 뒤 `rag_search` 첫 결과가 그 문서였어요.
+Windows에서 kordoc과 모델을 실제로 돌린 세션, Windows의 Claude Code는 시험하지 못했어요. `codex plugin` 명령이 없다고
+나오면 Codex가 오래된 판이에요(0.42.0에는 없었어요). 업데이트한 뒤 다시 하세요.
 
 Codex용 매니페스트는 `.codex-plugin/plugin.json`이에요. 플러그인 루트에 `plugin.json`(Agent Plugins 형식)을 두면
 Codex가 플러그인 훅을 읽지 않아요(Codex 0.171.0 소스 `core-plugins/src/loader.rs`). `mcpServers: {}`는 Claude Code용
