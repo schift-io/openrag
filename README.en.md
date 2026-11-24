@@ -72,6 +72,14 @@ Open Claude Code in the repository and type `/openrag-setup` (in Codex, `$openra
 skill checks Docker, asks for the documents folder, organization and client, writes `docker/.env`,
 starts the stack, runs `init`, registers the MCP server (after asking) and checks a search.
 
+### Plugins for Claude Code and Codex
+`plugins/openrag` is a plugin for both: the setup skill, the MCP connection (Claude Code, configured with the
+server URL and key at install time) and a hook that saves documents written by
+[kordoc](https://github.com/chrisryugj/kordoc) to OpenRAG as soon as kordoc writes them. Install it with
+`/plugin marketplace add schift-io/openrag` and `/plugin install openrag@openrag` in Claude Code, or
+`codex plugin marketplace add schift-io/openrag` and `codex plugin add openrag@openrag`. See
+[plugins/openrag/README.md](plugins/openrag/README.md).
+
 ### Then: set it up from inside the server container
 Nothing to install on the host: the API image ships the `openrag` CLI.
 ```bash

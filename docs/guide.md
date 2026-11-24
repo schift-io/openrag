@@ -17,6 +17,7 @@ OpenRAG를 처음 설치하는 분을 위한 안내예요. 위에서부터 순�
 - [12. 서버에서 직접 답하기(선택)](#12-서버에서-직접-답하기선택)
 - [13. 자주 막히는 곳](#13-자주-막히는-곳)
 - [14. 멈추기, 다시 켜기, 백업, 업데이트](#14-멈추기-다시-켜기-백업-업데이트)
+- [15. 다른 도구에 붙이기: 플러그인, kordoc, Docufinder](#15-다른-도구에-붙이기-플러그인-kordoc-docufinder)
 
 ---
 
@@ -201,6 +202,9 @@ claude mcp list
 
 Codex는 `connect.codex` 줄을 실행해요. Codex는 키를 `OPENRAG_API_KEY` 환경변수에서 읽어요. 그래서
 Codex를 실행하는 셸에 `export OPENRAG_API_KEY=orag_…`가 항상 있어야 해요. 셸 시작 파일에 넣어 두면 편해요.
+
+Claude Code는 명령 대신 OpenRAG 플러그인으로 붙여도 돼요. 주소와 키를 설치 화면에서 넣고, kordoc으로 만든 문서를
+바로 저장하는 기능도 같이 들어와요(15장). 둘 중 하나만 하세요. 둘 다 하면 같은 서버가 두 번 붙어요.
 
 ### 다른 PC에서 접속할 때(HTTPS)
 
@@ -658,3 +662,91 @@ docker compose -f docker/docker-compose.yml --profile app up -d --build
 
 서버가 시작할 때 데이터베이스 구조를 알아서 새 판에 맞춰요. 문서와 키는 그대로예요. 올리기 전에 위 방법으로
 백업해 두세요.
+
+## 15. 다른 도구에 붙이기: 플러그인, kordoc, Docufinder
+
+### Claude Code 플러그인
+
+```text
+/plugin marketplace add schift-io/openrag
+/plugin install openrag@openrag
+```
+
+설치할 때 서버 주소(`http://127.0.0.1:8080`처럼 끝에 `/` 없이), API 키, 버킷을 물어요. 키는 OS 보안 저장소에
+들어가요. 바꿀 때는 `/plugin configure openrag@openrag`를 열어요. 플러그인을 쓰면 5장의 `claude mcp add`는 하지
+않아요.
+
+플러그인에 들어 있는 것:
+
+- 검색·문서 읽기 MCP(`rag_search`, `rag_read_document`, `rag_read_sheet` …)
+- 설치·운영 마법사 `/openrag:openrag-setup`. 저장소 밖에서 부르면 저장소를 받을 곳부터 물어요.
+- kordoc 자동 저장(아래)
+
+### Codex 플러그인
+
+```bash
+codex plugin marketplace add schift-io/openrag
+codex plugin add openrag@openrag
+```
+
+Codex 플러그인에는 키를 넣는 설정이 없어요. 그래서 MCP는 5장의 `connect.codex`로 연결해요. kordoc 자동 저장은
+셸 환경변수 `OPENRAG_API_KEY`(5장과 같은 키)와 `OPENRAG_URL`(기본 `http://127.0.0.1:8080`)을 읽어요.
+Codex는 플러그인 훅을 처음 한 번 `/hooks`에서 내용을 보고 승인해야 실행해요.
+
+### kordoc으로 만든 문서 바로 저장하기
+
+[kordoc](https://github.com/chrisryugj/kordoc)은 HWPX·HWP 공문서를 만들고 고치는 MCP예요. 플러그인이 있으면
+kordoc이 쓴 파일이 그 자리에서 OpenRAG에 들어가요. 문서 폴더로 옮기지 않아도 바로 검색돼요.
+
+```text
+> kordoc으로 부산 출장 결과 보고서를 HWPX로 만들어 줘 …
+  (kordoc 결과 바로 아래) OpenRAG: 부산출장_결과보고.hwpx 저장했어요. 버킷 docs
+> 사내 문서에서 찾아서 답해줘: 부산 지사 항온항습기 교체 비용
+  → 첫 결과: 부산출장_결과보고, 4,300,000원
+```
+
+- kordoc 연결은 따로 해요: `npx -y kordoc setup`, 또는 `claude mcp add kordoc -- npx -y kordoc mcp`
+  (Codex는 `codex mcp add kordoc -- npx -y kordoc mcp`). MCP 이름에 `kordoc`이 들어 있으면 알아봐요.
+- 저장하는 도구: `generate_document`, `fill_form`, `patch_document`, `convert_to_hwpx`, `place_seal`,
+  `add_memo`, `redact_document`. 저장하는 종류는 문서 폴더와 같아요(hwpx, hwp, md, pdf, docx, pptx, html, xlsx, csv).
+- 같은 경로에 다시 쓰면 이전 문서를 바꿔요. 검색에는 새 내용만 나와요. 내용이 같으면 그대로 둬요.
+- 서버가 꺼져 있거나 키가 틀리면 경고 한 줄만 보이고 kordoc 결과는 그대로예요.
+- 끄기: Claude Code는 플러그인 설정의 `kordoc 문서 자동 저장`, Codex는 `OPENRAG_KORDOC_AUTOSAVE=false`.
+- kordoc이 서버의 문서 폴더 안에 쓴다면 그 폴더 경로를 설정 `docs_dir`(Codex는 `OPENRAG_DOCS_DIR`)에 넣으세요.
+  그 안의 파일은 폴더 감시에 맡기고 두 번 올리지 않아요.
+
+위 예시는 Claude Code에서 kordoc 4.25.11로 실제로 해 본 것을 줄인 거예요. Codex에서도 같은 방식으로 저장과 검색을
+확인했어요. 저장에는 0.3~3.6초 걸렸어요.
+
+### Docufinder(Anything)와 같이 쓰기
+
+[Docufinder](https://github.com/chrisryugj/Docufinder)(앱 이름 Anything)는 PC에서 문서 본문을 키워드로 찾는
+Windows·macOS 앱이에요. 밖에서 부를 수 있는 API나 플러그인이 없어서, OpenRAG와는 **같은 폴더를 함께 보는
+방식**으로 붙여요.
+
+- Docufinder의 "폴더 추가"에 OpenRAG 문서 폴더(`OPENRAG_DOCS_DIR`)를 넣어요. 사람은 Docufinder로 키워드를
+  찾고, AI는 같은 파일을 OpenRAG로 찾아요. 파일은 그 폴더 한 곳에서만 관리하면 돼요.
+- Docufinder 답변 아래 "MD 저장"이나 검색 결과의 "Markdown으로 저장"으로 만든 파일을 OpenRAG 문서 폴더에
+  저장하면 30초 안에 OpenRAG에도 들어가요.
+- 서버가 다른 PC에 있으면 문서 폴더를 공유 드라이브에 두고 양쪽이 같은 폴더를 보게 해요.
+
+Docufinder와는 시험하지 못했어요. 이 환경에 앱을 설치하지 않았어요.
+
+### 그 밖의 MCP 클라이언트
+
+HTTP MCP에 헤더를 넣을 수 있는 도구면 주소 `http://<서버>:8080/mcp`와 `Authorization: Bearer orag_…` 헤더만
+있으면 돼요. Cursor 예시는 [README](../README.md)에 있어요. VS Code(`.vscode/mcp.json`)는 이렇게 써요.
+
+```json
+{
+  "servers": {
+    "openrag": {
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": { "Authorization": "Bearer orag_…" }
+    }
+  }
+}
+```
+
+Cursor와 VS Code는 시험하지 못했어요.

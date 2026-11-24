@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openrag",
+  "version": "0.1.0",
+  "description": "사내 문서 검색 OpenRAG의 설치·운영 마법사와, kordoc으로 만든 문서를 만들자마자 OpenRAG에 저장하는 훅.",
+  "author": {
+    "name": "schift-io",
+    "url": "https://github.com/schift-io"
+  },
+  "homepage": "https://github.com/schift-io/openrag",
+  "repository": "https://github.com/schift-io/openrag",
+  "license": "Apache-2.0",
+  "keywords": ["rag", "search", "korean", "hwp", "hwpx", "kordoc", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "onboardingSkill": "./skills/openrag-setup/SKILL.md",
+      "interface": {
+        "displayName": "OpenRAG",
+        "shortDescription": "사내 문서 검색 서버 설치와 kordoc 문서 자동 저장",
+        "longDescription": "OpenRAG 서버를 Docker로 띄우고 Codex에 MCP로 연결하는 마법사, 그리고 kordoc으로 만든 HWPX·HWP 문서를 바로 OpenRAG에 넣어 검색되게 하는 훅.",
+        "developerName": "schift-io",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://github.com/schift-io/openrag",
+        "defaultPrompt": [
+          "OpenRAG 설치해줘",
+          "사내 문서에서 찾아서 답해줘: 출장비 기준"
+        ]
+      }
+    }
+  }
+}

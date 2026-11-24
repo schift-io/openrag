@@ -6,7 +6,11 @@ description: OpenRAG 설치·운영 마법사. 이 저장소에서 OpenRAG 서�
 # OpenRAG 설치 마법사
 
 사용자를 대신해 설치를 진행하는 마법사 역할을 한다. 명령은 직접 실행하고, 사용자에게는 결정할 것만 묻는다.
-자세한 설명이 필요하면 `docs/guide.md`(3·4·5·7·13장)를 연다.
+자세한 설명이 필요하면 `docs/guide.md`(3·4·5·7·13·15장)를 연다.
+
+플러그인으로 불려서 지금 폴더에 `docker/docker-compose.yml`이 없으면, 저장소를 어디에 받을지 묻고
+`git clone https://github.com/schift-io/openrag <폴더>`로 받은 뒤 그 폴더에서 진행한다. 이미 받아 둔 곳이 있으면
+거기로 간다. 아래 명령은 모두 그 저장소 루트에서 실행한다.
 
 ## 원칙
 
@@ -136,12 +140,16 @@ docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents f
 
 등록 명령은 사용자 PC 설정을 바꾸므로, 실행해도 되는지 먼저 묻는다.
 
-- **Claude Code**: init 출력의 `connect.claude`를 그대로 실행한다. 이미 `openrag`가 등록돼 있다는 오류가 나면
-  `claude mcp remove openrag -s user`로 지우고 다시 등록해도 되는지 묻는다. 등록 뒤에는 Claude Code를 새로
-  시작해야 도구가 보인다고 알린다.
+- **Claude Code**: OpenRAG 플러그인이 설치돼 있으면(`claude plugin list`에 `openrag@openrag`) `claude mcp add`를
+  하지 않는다. 같은 서버가 두 번 붙기 때문이다. 대신 사용자에게 `/plugin configure openrag@openrag`에서 서버 주소와
+  키를 넣으라고 안내한다(키는 그 화면에 직접 넣게 하고 채팅에 옮겨 적지 않는다). 플러그인이 없으면 init 출력의
+  `connect.claude`를 그대로 실행한다. 이미 `openrag`가 등록돼 있다는 오류가 나면 `claude mcp remove openrag -s user`로
+  지우고 다시 등록해도 되는지 묻는다. 어느 쪽이든 Claude Code를 새로 시작해야 도구가 보인다고 알린다.
 - **Codex**: `connect.codex`는 `OPENRAG_API_KEY` 환경 변수를 쓴다. `codex mcp add …` 부분을 실행하고, 키를
   셸 설정 파일에 넣어도 되는지 물은 뒤 `export OPENRAG_API_KEY=…` 한 줄을 추가한다(거절하면 직접 넣는 방법만
-  알려 준다).
+  알려 준다). Codex용 OpenRAG 플러그인의 kordoc 자동 저장도 이 키를 쓴다. 서버 주소가
+  `http://127.0.0.1:8080`이 아니면 같은 곳에 `export OPENRAG_URL=<접속 주소>`도 넣는다.
+- kordoc을 쓰는 사용자면 kordoc으로 만든 문서를 바로 저장하는 플러그인 기능(가이드 15장)을 한 줄로 알려 준다.
 - 마법사를 다른 PC에서 쓸 사람이 있으면, 그 PC에서 실행할 명령으로 `connect.*` 줄을 넘겨준다.
 
 ## 8단계: 검색 확인

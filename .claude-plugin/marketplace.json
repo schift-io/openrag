@@ -1,0 +1,16 @@
+{
+  "name": "openrag",
+  "owner": {
+    "name": "schift-io",
+    "url": "https://github.com/schift-io"
+  },
+  "description": "OpenRAG 플러그인: 사내 문서 검색 MCP, 설치·운영 마법사, kordoc 문서 자동 저장",
+  "plugins": [
+    {
+      "name": "openrag",
+      "source": "./plugins/openrag",
+      "description": "OpenRAG 검색 MCP, 설치·운영 마법사, kordoc으로 만든 문서를 바로 OpenRAG에 저장하는 훅",
+      "category": "productivity"
+    }
+  ]
+}

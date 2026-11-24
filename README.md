@@ -57,6 +57,10 @@ claude mcp add --transport http --scope user openrag http://127.0.0.1:8080/mcp \
 
 이제 Claude Code에 "사내 문서에서 찾아서 답해줘: 부산 출장 숙박비 한도가 얼마야?"처럼 물어보면 돼요.
 
+Claude Code는 이 명령 대신 플러그인으로 붙여도 돼요(`/plugin marketplace add schift-io/openrag` →
+`/plugin install openrag@openrag`). 플러그인에는 MCP 연결, 설치 마법사, kordoc으로 만든 문서를 바로 OpenRAG에
+저장하는 기능이 들어 있어요. Codex 플러그인과 Docufinder 같이 쓰기는 [가이드 15장](docs/guide.md#15-다른-도구에-붙이기-플러그인-kordoc-docufinder)에 있어요.
+
 폐쇄망 구성, 문서 추가, 팀원 추가, 권한, 개인정보 처리, OCR, 문제 해결은
 **[사용 가이드](docs/guide.md)**에 순서대로 정리했어요.
 

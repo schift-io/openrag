@@ -1,0 +1,18 @@
+{
+  "description": "kordoc으로 문서를 만들거나 고치면 그 파일을 OpenRAG에 저장한다",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__.*kordoc.*__(generate_document|fill_form|patch_document|convert_to_hwpx|place_seal|add_memo|redact_document)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/kordoc-save.mjs\"",
+            "timeout": 120,
+            "statusMessage": "OpenRAG에 저장하는 중"
+          }
+        ]
+      }
+    ]
+  }
+}
