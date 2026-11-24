@@ -70,13 +70,18 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
 ### Then: set it up from inside the server container
 Nothing to install on the host: the API image ships the `openrag` CLI.
 ```bash
-# same -f files as the `up` above
-docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
+# same -f files as the `up` above; OPENRAG_DOCS_DIR (default: documents/ in the repo) is the
+# documents folder the server watches
 docker compose -f docker/docker-compose.yml exec openrag-api \
-  openrag init --slug acme --name "ACME" --docs /tmp/my-docs
+  openrag init --slug acme --name "ACME"
 ```
 `openrag init` creates the organization, a department and an admin (permission level 10), mints
-the admin's API key, creates the bucket `docs` and ingests every supported file under the folder.
+the admin's API key and creates the bucket `docs`. The server then keeps that bucket in step with
+the documents folder, scanning it every 30 seconds: new files are ingested, edited files replace
+their in-force copy, moved or renamed files keep their document (matched by SHA-256, nothing is
+embedded again), and deleted files go out of force while their records stay. It reads HWP, HWPX,
+MD, PDF, DOCX, PPTX and HTML by default (`OPENRAG_DOCS_TYPES`); more folders, each with its own
+bucket and types, go in `OPENRAG_DOCS_DIRS` (see the guide, section 7).
 It prints the key and two commands, `connect.claude` and `connect.codex`; run one on the machine
 with Claude Code or Codex (use `--public-url http://<server>:8080` when that is another machine).
 Then ask Claude Code about the documents: it searches them with `rag_search` and answers with the

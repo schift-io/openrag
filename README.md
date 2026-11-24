@@ -20,7 +20,9 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
   정해요. PostgreSQL의 행 단위 보안(RLS)이 막기 때문에, 권한 없는 문서는 검색 결과에도 나오지 않아요.
 - **개인정보는 AI로 나갈 때만 가려요.** 저장과 검색은 원문 그대로 하고, AI 모델로 가는 요청과 MCP 도구
   결과, 회사 밖 임베딩 서버로 보내는 문서에서만 주민등록번호·전화번호·이메일 같은 값을 토큰으로 바꿔요.
-- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, 스캔한 PDF와 이미지는 Schift OCR로 읽어요. 키워드
+- **문서 폴더를 지켜봐요.** 폴더에 파일을 넣거나 고치거나 지우면 30초 안에 검색에 반영돼요. 옮기거나 이름을
+  바꾼 파일은 내용 해시로 알아봐서 다시 읽지 않고, 지운 파일은 검색에서만 빼고 기록은 남겨요.
+- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, DOCX·PPTX·HTML도 읽어요. 스캔한 PDF와 이미지는 Schift OCR로 읽어요. 키워드
   검색은 한국어 형태소 분석(`pg_search` Lindera)을 써요.
 - **AI 모델을 들고 있지 않아요.** 답은 연결한 Claude Code·Codex가 쓰거나, 사내 LLM 서버(vLLM 등)를
   연결하면 서버가 직접 써요.
@@ -33,12 +35,12 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
 ```bash
 # 1) 서버 띄우기
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # 다시 띄울 때도 같은 값을 쓰니 적어 두세요
+export OPENRAG_DOCS_DIR=~/회사문서                    # 문서 폴더(생략하면 저장소의 documents/)
 docker compose -f docker/docker-compose.yml --profile app up -d
 
-# 2) 문서 넣고 첫 설정 (조직·관리자·API 키·버킷·문서를 한 번에)
-docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
+# 2) 첫 설정 (조직·관리자·API 키·버킷을 한 번에). 문서 폴더는 서버가 30초마다 읽어요
 docker compose -f docker/docker-compose.yml exec openrag-api \
-  openrag init --slug acme --name "ACME" --docs /tmp/my-docs
+  openrag init --slug acme --name "ACME"
 ```
 
 `init`은 마지막에 PC에서 실행할 연결 명령(`connect.claude`, `connect.codex`)을 출력해요.
@@ -71,7 +73,8 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
    ┌──────────────────────────────────▼──────────────────────────────────┐
    │ OpenRAG API (Rust, 프로세스 하나)                                     │
    │  • 권한: ARN + 권한 그룹 + 등급(1~10), PostgreSQL RLS                │
-   │  • 문서 읽기: kordoc(HWP 계열), PDF, Schift OCR(스캔·이미지)         │
+   │  • 문서 읽기: kordoc(HWP 계열), PDF, DOCX·PPTX·HTML, Schift OCR      │
+   │  • 문서 폴더: 30초마다 훑어 추가·수정·이동·삭제를 반영(SHA-256)      │
    │  • 개인정보 가드: allow · warn · mask · block                        │
    │  • 색인: 바뀐 내용만 다시 색인(SHA-256), 실패 3회면 격리             │
    │  • 검색: 256차원 벡터 검색(pg_pinecone), BM25는 선택                 │
@@ -135,10 +138,10 @@ stdio 방식(`openrag mcp --stdio`, `openrag-mcp`)은 데이터베이스에 직�
 
 | 명령 | 하는 일 |
 | --- | --- |
-| `openrag init` | 첫 설정 한 번에: 조직·관리자·API 키·버킷·문서, 연결 명령 출력 |
+| `openrag init` | 첫 설정 한 번에: 조직·관리자·API 키·버킷, 연결 명령 출력(`--docs`로 폴더를 한 번 넣을 수도 있어요) |
 | `openrag org init` | 조직·부서·관리자와 API 키만 만들기 |
 | `openrag bucket {create\|list}` | 버킷 만들기 / 보기 |
-| `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 문서 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요. 같은 폴더를 다시 넣으면 바뀐 파일만 들어가요 |
+| `openrag ingest <파일 또는 폴더> --bucket <버킷>` | 한 번만 넣기. `--scope`, `--auth-level`로 볼 사람을 정해요. 같은 폴더를 다시 넣으면 바뀐 파일만 들어가요. 계속 맞춰 두려면 문서 폴더(`OPENRAG_DOCS_DIR`)를 쓰세요 |
 | `openrag connect {claude\|codex}` | 이 서버를 Claude Code나 Codex에 등록(호스트에서 실행할 때) |
 | `openrag up --profile <standard\|airgap>` | docker compose로 스택 띄우기 |
 | `openrag index {engine\|mirror\|status\|retry}` | 벡터 엔진 바꾸기, 외부 복제, 색인 대기열 보기 |

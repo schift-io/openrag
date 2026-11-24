@@ -73,7 +73,7 @@ pub enum Command {
     Up(UpArgs),
     /// Run the HTTP API and Streamable HTTP MCP endpoint (POST /mcp)
     Serve(ServeArgs),
-    /// Ingest a file or a folder (HWP/HWPX/PDF/MD/TXT/PNG/JPG) into a bucket
+    /// Ingest a file or a folder (HWP/HWPX/PDF/DOCX/PPTX/HTML/MD/TXT/PNG/JPG) into a bucket
     Ingest(IngestArgs),
     /// Vector index engines, external mirrors and the indexing outbox
     #[command(subcommand)]
@@ -1257,6 +1257,7 @@ async fn shutdown_signal() {
 async fn cmd_serve(a: ServeArgs) -> Result<(), CliError> {
     let addr = resolve_bind_addr(a.bind)?;
     let state = AppState::from_env().await?;
+    crate::watch::start_from_env(&state)?;
     let router = crate::build_router(state);
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(addr = %addr, "openrag serve listening (HTTP API + POST /mcp)");
@@ -1303,9 +1304,7 @@ async fn apply_pipeline_file(state: &AppState, path: &Path) -> Result<(), CliErr
 }
 
 /// File extensions `openrag ingest` picks up from a folder.
-const INGEST_EXTENSIONS: &[&str] = &[
-    "hwp", "hwpx", "hml", "pdf", "md", "markdown", "txt", "png", "jpg", "jpeg", "webp",
-];
+const INGEST_EXTENSIONS: &[&str] = crate::watch::SUPPORTED_TYPES;
 
 /// The file itself, or every supported file under a folder (sorted, hidden entries skipped).
 fn ingest_targets(path: &Path) -> Result<Vec<PathBuf>, CliError> {

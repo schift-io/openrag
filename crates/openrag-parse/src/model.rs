@@ -14,6 +14,9 @@ pub enum DocumentFormat {
     Webp,
     Markdown,
     PlainText,
+    Docx,
+    Pptx,
+    Html,
 }
 
 impl DocumentFormat {
@@ -28,6 +31,9 @@ impl DocumentFormat {
             Self::Webp => "image/webp",
             Self::Markdown => "text/markdown",
             Self::PlainText => "text/plain",
+            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Self::Pptx => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            Self::Html => "text/html",
         }
     }
 
@@ -57,6 +63,15 @@ impl DocumentFormat {
             if m == "text/markdown" {
                 return Self::Markdown;
             }
+            if m.contains("wordprocessingml.document") {
+                return Self::Docx;
+            }
+            if m.contains("presentationml.presentation") {
+                return Self::Pptx;
+            }
+            if m.starts_with("text/html") || m.starts_with("application/xhtml") {
+                return Self::Html;
+            }
         }
 
         if let Some(ext) = filename
@@ -73,6 +88,9 @@ impl DocumentFormat {
                 "webp" => return Self::Webp,
                 "md" | "markdown" => return Self::Markdown,
                 "txt" => return Self::PlainText,
+                "docx" => return Self::Docx,
+                "pptx" => return Self::Pptx,
+                "html" | "htm" | "xhtml" => return Self::Html,
                 _ => {}
             }
         }
@@ -93,11 +111,14 @@ impl DocumentFormat {
             return Self::Hwp;
         }
         if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
-            return Self::Hwpx;
+            return crate::office::office_zip_kind(bytes).unwrap_or(Self::Hwpx);
         }
         let head = std::str::from_utf8(&bytes[..bytes.len().min(512)]).unwrap_or("");
         if head.contains("<HWPML") || head.contains("<hwpml") {
             return Self::Hml;
+        }
+        if crate::html::looks_like_html(bytes) {
+            return Self::Html;
         }
         Self::PlainText
     }

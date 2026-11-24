@@ -41,6 +41,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = ServerArgs::parse();
     let bind_addr = resolve_bind_addr(args.bind)?;
     let state = AppState::from_env().await?;
+    openrag_server::watch::start_from_env(&state)?;
     let router = build_router(state);
 
     let listener = TcpListener::bind(bind_addr).await?;

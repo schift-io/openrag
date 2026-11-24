@@ -49,6 +49,7 @@ cfb = "0.15"
 flate2 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 quick-xml = "0.42"
+encoding_rs = "0.8"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 # S3 request signing (sans-IO; requests go through reqwest)

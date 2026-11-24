@@ -25,6 +25,7 @@ pub mod llm_router;
 pub mod mcp;
 pub mod state;
 pub mod text_embed;
+pub mod watch;
 
 pub use state::{AppState, OpenRagMode};
 

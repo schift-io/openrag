@@ -33,3 +33,6 @@ __pycache__/
 
 # Tool caches
 .ruff_cache/
+
+# Documents folder the compose stack watches (OPENRAG_DOCS_DIR default)
+/documents/

@@ -108,6 +108,15 @@ services:
       OPENRAG_TEXT_EMBED_API_KEY: ${OPENRAG_TEXT_EMBED_API_KEY:-}
       OPENRAG_TEXT_EMBED_QUERY_PREFIX: ${OPENRAG_TEXT_EMBED_QUERY_PREFIX:-}
       OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX: ${OPENRAG_TEXT_EMBED_DOCUMENT_PREFIX:-}
+      # Watched document folders (paths inside this container): new files are ingested, changed
+      # ones replace their in-force copy, moved/renamed ones keep their document, deleted ones go
+      # out of force (records kept). A JSON list; entries may set their own bucket and types:
+      #   ["/docs", {"path": "/docs-hr", "bucket": "hr", "types": ["pdf", "hwp"]}]
+      # Every folder listed here needs a mount below. Empty: no watching.
+      OPENRAG_DOCS_DIRS: ${OPENRAG_DOCS_DIRS:-["/docs"]}
+      OPENRAG_DOCS_TYPES: ${OPENRAG_DOCS_TYPES:-hwp,hwpx,md,pdf,docx,pptx,html}
+      OPENRAG_DOCS_BUCKET: ${OPENRAG_DOCS_BUCKET:-docs}
+      OPENRAG_DOCS_SCAN_SECS: ${OPENRAG_DOCS_SCAN_SECS:-30}
       OPENRAG_SCHIFT_OCR_URL: ${OPENRAG_SCHIFT_OCR_URL:-}
       SCHIFT_OCR_API_KEY: ${SCHIFT_OCR_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
@@ -116,6 +125,10 @@ services:
       - "${OPENRAG_API_PORT:-8080}:8080"
     volumes:
       - ../configs:/app/configs:ro
+      # The documents folder on this machine (default: documents/ next to docker/), read-only.
+      # More folders: add a line per folder, e.g. `- /Volumes/NAS/규정:/docs/nas-규정:ro` (inside
+      # /docs, so it is watched as part of it) or a path of its own listed in OPENRAG_DOCS_DIRS.
+      - ${OPENRAG_DOCS_DIR:-../documents}:/docs:ro
 
 volumes:
   pg_data:

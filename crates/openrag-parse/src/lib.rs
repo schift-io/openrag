@@ -7,8 +7,10 @@
 )]
 
 pub mod aliases;
+pub mod html;
 pub mod hwp;
 pub mod model;
+pub mod office;
 pub mod ocr;
 pub mod pdf;
 pub mod s3;
@@ -16,6 +18,8 @@ pub mod store;
 pub mod thumbnail;
 
 pub use aliases::extract_parenthetical_aliases;
+pub use html::{html_to_markdown, parse_html};
+pub use office::{parse_docx, parse_pptx};
 pub use hwp::{escape_html, parse_hml, parse_hwp5, parse_hwp_family, parse_hwpx, sanitize_table_html, KordocCliConfig};
 pub use model::{
     sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrBlock, OcrExecutionTarget,
@@ -125,6 +129,9 @@ impl DocumentParser {
                 )
                 .await
             }
+            DocumentFormat::Docx => crate::office::parse_docx(bytes, filename),
+            DocumentFormat::Pptx => crate::office::parse_pptx(bytes, filename),
+            DocumentFormat::Html => crate::html::parse_html(bytes, filename),
             DocumentFormat::Markdown | DocumentFormat::PlainText => {
                 let text = std::str::from_utf8(bytes).map_err(|e| {
                     OpenRagError::Validation(format!("text document is not valid UTF-8: {e}"))

@@ -1539,6 +1539,7 @@ dependencies = [
  "base64 0.22.1",
  "cfb",
  "chrono",
+ "encoding_rs",
  "flate2",
  "image",
  "openrag-core",

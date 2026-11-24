@@ -6,10 +6,10 @@ OpenRAG를 처음 설치하는 분을 위한 안내예요. 위에서부터 순�
 - [1. OpenRAG가 하는 일](#1-openrag가-하는-일)
 - [2. 준비물](#2-준비물)
 - [3. 서버 띄우기](#3-서버-띄우기)
-- [4. 첫 설정: 조직·관리자·문서를 한 번에](#4-첫-설정-조직관리자문서를-한-번에)
+- [4. 첫 설정: 조직·관리자·키를 한 번에](#4-첫-설정-조직관리자키를-한-번에)
 - [5. Claude Code / Codex 연결](#5-claude-code--codex-연결)
 - [6. 질문하기](#6-질문하기)
-- [7. 문서 더 넣기](#7-문서-더-넣기)
+- [7. 문서 넣기·고치기·지우기](#7-문서-넣기고치기지우기)
 - [8. 팀원 추가와 권한](#8-팀원-추가와-권한)
 - [9. 개인정보는 이렇게 다뤄요](#9-개인정보는-이렇게-다뤄요)
 - [10. 스캔본 읽기(OCR)](#10-스캔본-읽기ocr)
@@ -27,9 +27,9 @@ OpenRAG를 처음 설치하는 분을 위한 안내예요. 위에서부터 순�
 쓰고, OpenRAG는 "누가 어떤 문서를 볼 수 있는지"를 지키면서 찾아 주는 역할이에요.
 
 ```text
-문서 폴더 ──(init · ingest)──▶ OpenRAG 서버 (PostgreSQL 안에 문서와 검색 색인)
-                                     ▲
-Claude Code / Codex ──(MCP: rag_search)──┘   찾은 문단을 근거로 답을 씀
+문서 폴더 ──(서버가 지켜보며 반영)──▶ OpenRAG 서버 (PostgreSQL 안에 문서와 검색 색인)
+                                          ▲
+Claude Code / Codex ──(MCP: rag_search)───────┘   찾은 문단을 근거로 답을 씀
 ```
 
 - 문서와 검색 색인은 회사 서버(PostgreSQL)에 있어요.
@@ -41,8 +41,9 @@ Claude Code / Codex ──(MCP: rag_search)──┘   찾은 문단을 근거�
 - **Docker**: Docker Desktop, 또는 Docker Engine과 Compose v2. 처음 띄울 때 이미지와 임베딩 모델(약 1.5GB)을
   받을 디스크 자리와, 임베딩 서버가 쓸 메모리 3GB쯤이 더 필요해요.
 - **질문할 PC의 Claude Code 또는 Codex**
-- **넣을 문서 폴더**: HWP, HWPX, HML, PDF, MD, TXT, PNG, JPG, WEBP를 읽어요. 하위 폴더까지 다 읽고,
-  이름이 `.`으로 시작하는 파일은 건너뛰어요.
+- **문서 폴더**: 서버가 이 폴더를 계속 지켜보면서 파일을 넣고, 고친 파일은 새 판으로 바꾸고, 지운 파일은
+  검색에서 빼요([7장](#7-문서-넣기고치기지우기)). 기본으로 HWP, HWPX, MD, PDF, DOCX, PPTX, HTML을 읽고,
+  하위 폴더까지 다 봐요.
 - (선택) **Schift OCR 키**: 스캔한 PDF나 사진(PNG, JPG, WEBP)에서 글자를 읽을 때 필요해요([10장](#10-스캔본-읽기ocr)).
 
 호스트에 따로 설치할 프로그램은 없어요. 설정에 쓰는 `openrag` 명령은 서버 이미지 안에 들어 있어요.
@@ -53,11 +54,14 @@ Claude Code / Codex ──(MCP: rag_search)──┘   찾은 문단을 근거�
 
 ```bash
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
+export OPENRAG_DOCS_DIR=~/회사문서      # 문서 폴더. 생략하면 저장소의 documents/ 폴더
 docker compose -f docker/docker-compose.yml --profile app up -d
 ```
 
-`OPENRAG_PII_KEK_HEX`는 서버가 쓰는 암호화 키예요. 서버를 다시 띄울 때도 **같은 값**을 넣어야 하니,
-처음 만든 값을 안전한 곳에 적어 두세요.
+- `OPENRAG_PII_KEK_HEX`는 서버가 쓰는 암호화 키예요. 서버를 다시 띄울 때도 **같은 값**을 넣어야 하니,
+  처음 만든 값을 안전한 곳에 적어 두세요.
+- `OPENRAG_DOCS_DIR`은 서버가 지켜볼 문서 폴더예요. 서버는 이 폴더를 읽기만 하고, 파일을 바꾸거나
+  지우지 않아요. 폴더를 여러 개 쓰는 방법은 [7장](#7-문서-넣기고치기지우기)에 있어요.
 
 컨테이너는 세 개가 떠요: 데이터베이스(`postgres`), 임베딩 서버(`local-embed`), API(`openrag-api`).
 처음 한 번은 오래 걸려요.
@@ -104,23 +108,29 @@ docker compose -f docker-compose.yml -f docker-compose.airgap.yml --profile app 
 이 구성으로 띄웠다면 아래 4·7장 명령의 `-f docker/docker-compose.yml` 자리에도 같은 `-f` 두 개를
 넣어 주세요.
 
-## 4. 첫 설정: 조직·관리자·문서를 한 번에
+## 4. 첫 설정: 조직·관리자·키를 한 번에
 
-문서 폴더를 서버 컨테이너로 복사하고, 컨테이너 안에서 `openrag init`을 실행해요.
+컨테이너 안에서 `openrag init`을 실행해요.
 
 ```bash
-docker compose -f docker/docker-compose.yml cp ./my-docs openrag-api:/tmp/my-docs
 docker compose -f docker/docker-compose.yml exec openrag-api \
-  openrag init --slug acme --name "ACME" --docs /tmp/my-docs
+  openrag init --slug acme --name "ACME"
 ```
 
-`init`이 하는 일은 다섯 가지예요.
+`init`이 하는 일은 네 가지예요.
 
 1. 조직(`acme`), 첫 부서, 관리자 계정(권한 등급 10)을 만들어요.
 2. 관리자용 API 키(`orag_…`)를 발급해요.
 3. 문서를 담을 버킷 `docs`를 만들어요.
-4. 폴더 안의 문서를 전부 넣어요.
-5. PC에서 실행할 연결 명령을 출력해요.
+4. PC에서 실행할 연결 명령을 출력해요.
+
+버킷이 생기면 서버가 문서 폴더를 읽기 시작해요. 폴더는 30초마다 훑으니 30초 안에 들어가기 시작해요.
+들어간 결과는 로그에서 볼 수 있어요.
+
+```bash
+docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents folder"
+# … documents folder synced bucket=docs added=6 replaced=0 moved=0 removed=0 failed=0
+```
 
 출력은 이렇게 생겼어요(일부 줄임).
 
@@ -128,7 +138,6 @@ docker compose -f docker/docker-compose.yml exec openrag-api \
 {
   "api_key": "orag_40b1…",
   "bucket": { "slug": "docs", "created": true },
-  "documents": { "ingested": 3, "failed": 0 },
   "connect": {
     "claude": "claude mcp add --transport http --scope user openrag http://127.0.0.1:8080/mcp --header 'Authorization: Bearer orag_40b1…'",
     "codex": "export OPENRAG_API_KEY='orag_40b1…' && codex mcp add openrag --url http://127.0.0.1:8080/mcp --bearer-token-env-var OPENRAG_API_KEY"
@@ -185,36 +194,90 @@ Claude Code에 평소처럼 물어보면 돼요. "사내 문서에서"라고 붙
 위 예시는 실제로 받은 답을 줄인 거예요. 답이 나오기까지 20초쯤 걸렸어요. Claude Code는 `rag_search`로 문단을
 찾은 뒤 그 문단을 근거로 답을 써요. 검색 결과에는 질문한 사람이 볼 수 있는 문서만 들어 있어요.
 
-## 7. 문서 더 넣기
+## 7. 문서 넣기·고치기·지우기
 
-`init` 때 받은 관리자 키로 넣어요. 키는 `-e OPENRAG_API_KEY`로 컨테이너에 넘겨요.
+문서 폴더(3장의 `OPENRAG_DOCS_DIR`)에서 파일을 다루기만 하면 돼요. 서버가 30초마다 폴더를 훑어서
+바뀐 대로 따라가요. 명령을 따로 칠 필요가 없어요.
+
+| 폴더에서 한 일 | OpenRAG에서 생기는 일 |
+| --- | --- |
+| 새 파일을 넣음 | 문서로 들어가요 |
+| 파일을 고침 | 고친 내용이 새 판으로 들어가요. 예전 판은 그 시각에 효력이 끝나서 검색에 나오지 않아요 |
+| 파일을 옮기거나 이름을 바꿈 | 같은 문서로 남아요. 다시 읽거나 임베딩하지 않고, 경로와 제목만 바뀌어요 |
+| 파일을 지움 | 검색에서 빠져요. 문서 기록은 지우지 않고 남겨요 |
+| 파일을 복사함 | 새 문서를 만들지 않아요. 내용이 같으니까요 |
+
+같은 파일인지는 파일 내용의 해시(SHA-256)로 알아봐요. 그래서 폴더를 옮기거나 이름을 바꿔도 같은 문서로
+남아요. 크기와 수정 시각이 그대로인 파일은 다시 읽지 않아서, 파일이 많아도 훑는 부담이 작아요. 서버를
+다시 켜도 이미 들어간 파일은 다시 넣지 않아요.
+
+폴더를 3초마다 훑게 해 놓고 재 봤더니, 바뀐 내용이 검색에 반영되기까지 이만큼 걸렸어요. 기본 간격(30초)에서는
+최대 30초쯤 더 걸려요.
+
+- 고친 파일: 2.9~5.6초
+- 옮긴 파일: 2.8초
+- 지운 파일: 2.8초
+- 새 파일: 3.4초
+
+### 읽는 파일 종류
+
+기본은 `hwp, hwpx, md, pdf, docx, pptx, html`이에요. 다른 파일은 폴더에 있어도 건너뛰어요. 바꾸려면
+`OPENRAG_DOCS_TYPES`에 적고 서버를 다시 띄워요.
+
+```bash
+export OPENRAG_DOCS_TYPES=hwp,hwpx,pdf,docx      # 이 네 가지만 읽기
+```
+
+적을 수 있는 종류는 hwp, hwpx, hml, pdf, md, markdown, txt, docx, pptx, html, htm, png, jpg, jpeg, webp예요.
+`md`를 적으면 `.markdown`도, `html`을 적으면 `.htm`도 같이 읽어요.
+
+이런 파일은 건너뛰어요.
+
+- 이름이 `.`으로 시작하는 파일과 폴더, Office 잠금 파일(`~$보고서.docx`)
+- 64MB보다 큰 파일
+- 2초 안에 바뀐 파일(아직 쓰는 중일 수 있어서요). 다음에 훑을 때 넣어요.
+- 읽다가 실패한 파일. 로그에 남기고, 파일이 바뀌면 다시 시도해요.
+
+### 폴더 여러 개
+
+`/docs` 아래에 붙인 폴더는 설정을 따로 바꾸지 않아도 같이 읽어요. `docker/docker-compose.yml`의
+`openrag-api` → `volumes`에 한 줄 더 적고 서버를 다시 띄우면 돼요.
+
+```yaml
+      - ${OPENRAG_DOCS_DIR:-../documents}:/docs:ro
+      - /Volumes/NAS/규정:/docs/nas-규정:ro          # 추가한 줄
+```
+
+폴더마다 버킷이나 파일 종류를 다르게 하려면, 그 폴더를 `/docs` 밖에 붙이고 `OPENRAG_DOCS_DIRS`에 적어요.
+목록은 JSON으로 써요.
+
+```yaml
+      - /srv/인사:/docs-hr:ro                         # volumes에 추가
+```
+
+```bash
+export OPENRAG_DOCS_DIRS='["/docs", {"path": "/docs-hr", "bucket": "hr", "types": ["pdf", "hwp"]}]'
+```
+
+볼 수 있는 사람은 버킷마다 정해요. 폴더에서 들어간 문서는 그 버킷의 권한을 따라요. 예를 들어 권한
+등급 5 이상만 보는 `hr` 버킷은 `init` 때 받은 관리자 키로 이렇게 만들어요([8장](#8-팀원-추가와-권한)).
 
 ```bash
 export OPENRAG_API_KEY=orag_…            # init이 준 관리자 키
-docker compose -f docker/docker-compose.yml cp ./new-docs openrag-api:/tmp/new-docs
 docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api \
-  openrag ingest /tmp/new-docs --bucket docs
+  openrag bucket create hr --auth-level 5
 ```
 
-파일 하나만 넣어도 되고 폴더째 넣어도 돼요. 볼 수 있는 사람을 좁히려면 옵션을 붙여요([8장](#8-팀원-추가와-권한)).
+### 폴더가 사라졌을 때
 
-```bash
-# 등급 5 이상만 볼 수 있는 문서
-... openrag ingest /tmp/secret --bucket docs --auth-level 5
-# 올린 사람과 같은 부서 관리자만 볼 수 있는 문서
-... openrag ingest /tmp/memo --bucket docs --scope private
-```
+- 폴더를 읽을 수 없으면 그 폴더의 문서를 그대로 둬요. NAS 연결이 끊긴 경우가 여기에 해당해요.
+- 파일이 두 개 이상 있던 폴더가 한꺼번에 비면 문서를 내리지 않고 로그에 남겨요. 마운트가 빠진 폴더도
+  빈 폴더로 보여서, 실수로 문서가 전부 내려가는 것을 막으려는 거예요. 폴더를 정말 비우려면 파일을 하나만
+  남기고 지운 뒤, 다음 훑기가 지나면 마지막 파일을 지우세요.
 
-폴더를 통째로 다시 넣어도 괜찮아요.
+### 글만 넣을 때
 
-- **바뀌지 않은 파일**은 건너뛰어요. 출력에 `"unchanged": true`로 표시돼요.
-- **내용이 바뀐 파일**은 이전 판을 대신해요. 출력의 `"supersedes"`에 이전 판의 문서 ID가 나오고,
-  이전 판은 그 시각에 효력이 끝나서 검색에 나오지 않아요.
-- 같은 문서인지는 **넣은 폴더 안에서의 경로**(예: `규정/출장비_규정.md`)로 판단해요. 그래서 다시 넣을
-  때도 같은 폴더를 넣어 주세요.
-
-텍스트 문서라면 Claude Code에 "이 내용을 사내 문서 `docs`에 넣어줘"라고 해도 돼요(`rag_ingest` 도구).
-이 방법은 글자만 넣을 수 있어서, PDF나 HWP 같은 파일은 위 명령으로 넣어야 해요.
+텍스트라면 Claude Code에 "이 내용을 사내 문서 `docs`에 넣어줘"라고 해도 돼요(`rag_ingest` 도구).
 
 ## 8. 팀원 추가와 권한
 
@@ -226,13 +289,14 @@ docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api 
 
 | 공개 범위 | 볼 수 있는 사람 |
 | --- | --- |
-| `org` | 조직 전체 (`init`이 넣은 문서의 기본값) |
+| `org` | 조직 전체 (`init`이 만든 `docs` 버킷의 기본값) |
 | `dept` | 같은 부서 |
 | `group` | 지정한 권한 그룹 |
 | `private` | 올린 사람, 그리고 같은 부서의 부서 관리자 |
 
-두 조건을 모두 통과해야 보여요. 예를 들어 실제로 등급 3인 팀원은 `--auth-level 5`로 넣은 문서를
-검색해도 찾지 못했고, 관리자는 찾았어요.
+두 조건을 모두 통과해야 보여요. 예를 들어 실제로 등급 3인 팀원은 등급 5로 넣은 문서를
+검색해도 찾지 못했고, 관리자는 찾았어요. 문서 폴더에서 들어간 문서는 그 버킷의 등급과 공개 범위를 따라요
+([7장](#7-문서-넣기고치기지우기)의 `hr` 버킷 예).
 
 ### 팀원 추가
 
@@ -309,7 +373,7 @@ OCR 모드는 문서 등급에 따라 자동으로 정해져요.
 | 5~7 | `private` | 학습에 쓰지 않아요. 결과는 Schift에 남아요 |
 | 8~10 | `zdr` | Schift에 아무것도 남기지 않아요 |
 
-학습에 쓰이면 안 되는 문서는 `--auth-level 5` 이상으로 넣으세요. 기준은
+학습에 쓰이면 안 되는 문서는 등급 5 이상인 버킷의 폴더에 넣으세요([7장](#7-문서-넣기고치기지우기)). 기준은
 `configs/pipeline.default.yaml`의 `ocr_mode_by_auth_level`에서 바꿀 수 있어요.
 
 ## 11. 검색 품질: 임베딩 서버
@@ -429,6 +493,11 @@ Docker가 쓰는 디스크가 꽉 찼어요. 모델(약 1.5GB)과 이미지를 �
 
 ### PDF를 넣었더니 `this PDF has no text layer (a scan?) and OCR is not configured`
 스캔한 PDF예요. OCR을 설정하고 다시 넣으세요([10장](#10-스캔본-읽기ocr)).
+
+### PDF가 안 들어가고 로그에 `invalid byte sequence for encoding "UTF8": 0x00`
+글꼴을 파일 안에 넣어 저장한 PDF는 지금 글자를 제대로 읽지 못해요. LibreOffice에서 저장한 PDF로 확인했고,
+Word나 한글에서 PDF로 저장한 파일도 같은 방식이라 같은 문제가 날 수 있어요(직접 시험하지는 못했어요).
+그동안은 원본(HWP, HWPX, DOCX)을 폴더에 넣어 주세요.
 
 ### 임베딩 모델을 바꾼 뒤 검색이 엉뚱한 문서를 가져옴
 이미 넣은 문서는 예전 모델로 만든 벡터로 남아 있어요([11장](#11-검색-품질-임베딩-서버)).
