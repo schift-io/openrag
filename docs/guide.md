@@ -94,8 +94,8 @@ docker compose -f docker/docker-compose.yml --profile app up -d
   `openrag-api`는 기다렸다가 떠요. 진행 상황은 아래 명령으로 볼 수 있어요.
 - 임베딩 서버는 메모리를 2.2GB쯤 써요.
 
-시험해 본 PC(Docker Desktop, macOS)에서는 모델을 받아서 준비되기까지 2분 41초가 걸렸어요. 회선 속도에
-따라 달라요.
+아무것도 받아 두지 않은 PC(Docker Desktop, macOS, 2026-11-24)에서 빌드에 3분 24초, 모델을 받아 준비되기까지
+1분 22초가 걸렸어요. 회선 속도와 CPU에 따라 달라요.
 
 ```bash
 docker compose -f docker/docker-compose.yml logs -f local-embed
