@@ -9,6 +9,10 @@ ARG PG_MAJOR
 ARG PG_PINECONE_REPO=https://github.com/pinecone-io/pg_pinecone.git
 ARG PG_PINECONE_REF=d860f6fd3a21733d75ed2cde2b5b5e71e79bd3ac
 ARG RUST_TOOLCHAIN=1.100.0
+# amd64 CPU baseline for pg_pinecone. x86-64-v2 (SSE4.2 + POPCNT) also runs on CPUs and VMs without AVX2,
+# such as Proxmox's default CPU type; pg_pinecone's distance and code-scan kernels still pick AVX-512 or AVX2
+# at runtime (pg_pinecone docs/runbook.md, "Self-builds"). x86-64-v3 would crash those machines.
+ARG PG_PINECONE_TARGET_CPU=x86-64-v2
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -34,7 +38,7 @@ RUN PGRX_VER=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
     && PGRX_VER="${PGRX_VER:-0.19.2}" \
     && cargo install cargo-pgrx --version "${PGRX_VER}" --locked \
     && cargo pgrx init --pg${PG_MAJOR} "$(which pg_config)" \
-    && if [ "${TARGETARCH}" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi \
+    && if [ "${TARGETARCH}" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=${PG_PINECONE_TARGET_CPU}"; fi \
     && cargo pgrx install --release --pg-config "$(which pg_config)"
 
 FROM paradedb/paradedb:${PARADEDB_VERSION}-pg${PG_MAJOR}
