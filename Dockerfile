@@ -13,8 +13,9 @@ FROM node:22.22.1-bookworm-slim AS kordoc
 WORKDIR /opt/kordoc
 # Copy pinned manifests first so npm ci stays cached across Rust source changes.
 COPY docker/kordoc/package.json docker/kordoc/package-lock.json ./
-# Install exact locked production dependencies without audit or funding noise.
-RUN npm ci --omit=dev --no-audit --no-fund
+# Install exact locked production dependencies without audit or funding noise. kordoc runs onnxruntime
+# on the CPU only, so skip the postinstall download of the CUDA and TensorRT providers.
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --omit=dev --no-audit --no-fund
 # Remove onnxruntime-node binaries for non-Linux OSes and other CPU architectures to shrink the image.
 RUN arch="$(node -p process.arch)" \
     && find /opt/kordoc/node_modules/onnxruntime-node/bin -mindepth 2 -maxdepth 2 -not -name linux -exec rm -rf {} + \
