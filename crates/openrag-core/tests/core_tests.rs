@@ -100,6 +100,30 @@ fn embed_document_title_defaults_and_parsing() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn store_chunker_defaults_and_parsing() -> Result<(), Box<dyn std::error::Error>> {
+    use openrag_core::ChunkerKind;
+
+    let base = include_str!("../../../configs/pipeline.default.yaml");
+    assert_eq!(PipelineConfig::from_yaml_str(base)?.store.chunker, ChunkerKind::Fixed);
+
+    let airgap = include_str!("../../../configs/pipeline.airgap.yaml");
+    assert_eq!(PipelineConfig::from_yaml_str(airgap)?.store.chunker, ChunkerKind::Fixed);
+
+    let structure = base.replace("chunker: fixed", "chunker: structure");
+    assert_ne!(structure, base);
+    assert_eq!(PipelineConfig::from_yaml_str(&structure)?.store.chunker, ChunkerKind::Structure);
+
+    let semantic = base.replace("chunker: fixed", "chunker: semantic");
+    assert_ne!(semantic, base);
+    assert_eq!(PipelineConfig::from_yaml_str(&semantic)?.store.chunker, ChunkerKind::Semantic);
+
+    let omitted = base.replace("  chunker: fixed\n", "");
+    assert_ne!(omitted, base);
+    assert_eq!(PipelineConfig::from_yaml_str(&omitted)?.store.chunker, ChunkerKind::Fixed);
+    Ok(())
+}
+
+#[test]
 fn invalid_configs_are_rejected() {
     let base = include_str!("../../../configs/pipeline.default.yaml");
 

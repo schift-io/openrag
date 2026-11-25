@@ -13,8 +13,8 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures_util::stream;
 use openrag_core::{
-    AccessScope, Arn, ArnResourceType, AuthLevel, ExternalMirrorBackend, FusionMode, GuardAction,
-    GuardDecision, GuardSurface, OpenRagError, PrincipalContext, Sensitivity,
+    AccessScope, Arn, ArnResourceType, AuthLevel, ChunkerKind, ExternalMirrorBackend, FusionMode,
+    GuardAction, GuardDecision, GuardSurface, OpenRagError, PrincipalContext, Sensitivity,
 };
 use openrag_db::{DbPool, RlsTransaction};
 use openrag_eval::{AbQueryInput, AbSearchEvaluator, AbSearchRequest, AbVariantConfig};
@@ -43,6 +43,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::auth::{cli_code_exchange, enforce_api_key_arn_scope, AuthPrincipal};
+use crate::chunking::chunk_page;
 use crate::error::ApiError;
 use crate::llm_router::{neutralize_literal_pii_tokens, run_chat_completion, LlmCompletionInput};
 use crate::state::{load_active_guard_policy, load_concept_lookup, AppState};
@@ -1070,7 +1071,14 @@ pub(crate) async fn ingest_document_into_bucket(
             Some(page.tables_html.join("\n"))
         };
 
-        let page_chunks = split_text_chunks(&page_raw_text, 1000, &doc_title);
+        let page_chunks = chunk_page(
+            pipeline.store.chunker,
+            &page_raw_text,
+            1000,
+            &doc_title,
+            state.text_embedder.as_ref(),
+        )
+        .await?;
         let embed_title = pipeline
             .store
             .embed_document_title
@@ -1598,6 +1606,7 @@ async fn sync_documents_handler(
         concept_lookup: &concept_lookup,
         uses_s3_vectors,
         embed_document_title: pipeline.store.embed_document_title,
+        chunker: pipeline.store.chunker,
         pending_wiki_archives: &mut pending_wiki_archives,
     };
 
@@ -1717,6 +1726,7 @@ struct SyncContext<'a> {
     concept_lookup: &'a InMemoryConceptAliasLookup,
     uses_s3_vectors: bool,
     embed_document_title: bool,
+    chunker: ChunkerKind,
     pending_wiki_archives: &'a mut Vec<(Uuid, String)>,
 }
 
@@ -2368,6 +2378,7 @@ async fn sync_corpus_item(
                         embed_model: state.text_embedder.model_name(),
                         embedder: state.text_embedder.as_ref(),
                         embed_document_title: ctx.embed_document_title,
+                        chunker: ctx.chunker,
                     },
                     &guarded_page_text,
                     &mut next_chunk_idx,
@@ -2414,6 +2425,7 @@ async fn sync_corpus_item(
                         embed_model: state.text_embedder.model_name(),
                         embedder: state.text_embedder.as_ref(),
                         embed_document_title: ctx.embed_document_title,
+                        chunker: ctx.chunker,
                     },
                     &guarded_page_text,
                     &mut next_chunk_idx,
@@ -2612,6 +2624,7 @@ async fn sync_corpus_item(
                 embed_model: state.text_embedder.model_name(),
                 embedder: state.text_embedder.as_ref(),
                 embed_document_title: ctx.embed_document_title,
+                chunker: ctx.chunker,
             },
             &guarded_page_text,
             &mut next_chunk_idx,
@@ -2662,6 +2675,7 @@ struct SyncChunkInsertCtx<'a> {
     embed_model: &'a str,
     embedder: &'a dyn TextEmbedder,
     embed_document_title: bool,
+    chunker: ChunkerKind,
 }
 
 async fn insert_sync_page(
@@ -2722,7 +2736,14 @@ async fn insert_sync_page_chunks(
     next_chunk_idx: &mut i32,
 ) -> Result<usize, OpenRagError> {
     let sanitized_page_text = neutralize_literal_pii_tokens(guarded_page_text);
-    let chunks = split_text_chunks(&sanitized_page_text, 1000, ctx.title);
+    let chunks = chunk_page(
+        ctx.chunker,
+        &sanitized_page_text,
+        1000,
+        ctx.title,
+        ctx.embedder,
+    )
+    .await?;
     let embed_title = ctx.embed_document_title.then_some(ctx.title);
     let mut inserted = 0usize;
     for chunk_text in chunks {
@@ -3972,36 +3993,6 @@ async fn has_s3_vectors_binding(
     Ok(exists)
 }
 
-fn split_text_chunks(text: &str, max_chars: usize, fallback_title: &str) -> Vec<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return vec![fallback_title.to_string()];
-    }
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= max_chars {
-        return vec![trimmed.to_string()];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0usize;
-    let overlap = (max_chars / 10).min(100);
-    while start < chars.len() {
-        let end = (start + max_chars).min(chars.len());
-        let piece: String = chars[start..end].iter().collect();
-        let piece_trimmed = piece.trim();
-        if !piece_trimmed.is_empty() {
-            chunks.push(piece_trimmed.to_string());
-        }
-        if end == chars.len() {
-            break;
-        }
-        start = end.saturating_sub(overlap);
-    }
-    if chunks.is_empty() {
-        chunks.push(fallback_title.to_string());
-    }
-    chunks
-}
-
 pub(crate) fn normalize_tags_dedup(raw: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for t in raw {
@@ -4276,6 +4267,7 @@ pub(crate) fn map_sqlx_err(context: &'static str) -> impl FnOnce(sqlx::Error) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunking::split_text_chunks;
 
     #[test]
     fn layer1_neutralize_handles_chunks_and_frontmatter_titles() {

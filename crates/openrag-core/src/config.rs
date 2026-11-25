@@ -129,6 +129,15 @@ pub enum ExternalMirrorBackend {
     Usearch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkerKind {
+    #[default]
+    Fixed,
+    Structure,
+    Semantic,
+}
+
 const fn default_embed_document_title() -> bool {
     true
 }
@@ -148,6 +157,9 @@ pub struct StoreConfig {
     /// Include the document title when embedding corpus chunks.
     #[serde(default = "default_embed_document_title")]
     pub embed_document_title: bool,
+    /// Page chunking strategy (`fixed`, `structure`, or `semantic`).
+    #[serde(default)]
+    pub chunker: ChunkerKind,
 }
 
 /// pg_pinecone (native engine) search settings, set on each search transaction with `SET LOCAL`.

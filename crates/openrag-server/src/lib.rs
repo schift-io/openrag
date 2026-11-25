@@ -19,6 +19,7 @@ pub mod api_docs;
 pub mod api_members;
 pub mod api_studio;
 pub mod auth;
+pub mod chunking;
 pub mod egress;
 pub mod cli;
 pub mod error;

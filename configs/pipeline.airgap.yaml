@@ -69,6 +69,8 @@ store:
   outbox_max_attempts: 3
   # Include the document title when embedding corpus chunks.
   embed_document_title: true
+  # Page chunking strategy: fixed, structure, or semantic.
+  chunker: fixed
   # pg_pinecone search: share of clusters probed per query and exact re-ranking pool (x100 rows).
   # 0 keeps pg_pinecone's own value.
   pg_pinecone_search:

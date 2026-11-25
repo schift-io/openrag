@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use openrag_core::{
-    AuthLevel, ExternalMirrorBackend, FusionMode, GuardAction, GuardConfig, GuardDecision,
-    GuardRuleConfig, GuardRuleKind, GuardSurface, LlmConfig, MemoryConfig, OcrModeRule,
-    OpenRagError, OptimizationStrategy, ParseConfig, PgPineconeEngine, PiiConfig, PipelineConfig,
-    PipelineProfile, RetrieveConfig, SearchSpaceConfig, SecurityGateConfig, Sensitivity,
-    StoreConfig, ThumbnailConfig,
+    AuthLevel, ChunkerKind, ExternalMirrorBackend, FusionMode, GuardAction, GuardConfig,
+    GuardDecision, GuardRuleConfig, GuardRuleKind, GuardSurface, LlmConfig, MemoryConfig,
+    OcrModeRule, OpenRagError, OptimizationStrategy, ParseConfig, PgPineconeEngine, PiiConfig,
+    PipelineConfig, PipelineProfile, RetrieveConfig, SearchSpaceConfig, SecurityGateConfig,
+    Sensitivity, StoreConfig, ThumbnailConfig,
 };
 use openrag_db::DbPool;
 use openrag_eval::{InMemoryEvalStore, PgEvalStore};
@@ -663,6 +663,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
             embed_document_title: true,
+            chunker: ChunkerKind::Fixed,
         },
         retrieve: RetrieveConfig {
             spaces: vec![

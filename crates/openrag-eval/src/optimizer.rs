@@ -3,9 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use openrag_core::{
-    AuthLevel, ExternalMirrorBackend, FusionMode, GuardAction, GuardConfig, GuardRuleConfig,
-    GuardRuleKind, GuardSurface, LlmConfig, MemoryBackendKind, MemoryConfig, OcrModeRule,
-    OpenRagError, OptimizationStrategy, ParseConfig, PgPineconeEngine, PipelineConfig,
+    AuthLevel, ChunkerKind, ExternalMirrorBackend, FusionMode, GuardAction, GuardConfig,
+    GuardRuleConfig, GuardRuleKind, GuardSurface, LlmConfig, MemoryBackendKind, MemoryConfig,
+    OcrModeRule, OpenRagError, OptimizationStrategy, ParseConfig, PgPineconeEngine, PipelineConfig,
     PipelineProfile, PiiConfig, PrincipalContext, RetrieveConfig, SecurityGateConfig, Sensitivity,
     StoreConfig, ThumbnailConfig,
 };
@@ -111,6 +111,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
             embed_document_title: true,
+            chunker: ChunkerKind::Fixed,
         },
         retrieve: RetrieveConfig {
             spaces: vec![
@@ -318,6 +319,7 @@ struct TolerantStoreConfig {
     outbox_max_attempts: Option<u32>,
     pg_pinecone_search: Option<openrag_core::PgPineconeSearchConfig>,
     embed_document_title: Option<bool>,
+    chunker: Option<ChunkerKind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +518,9 @@ pub fn parse_pipeline_yaml_with_profile(
         }
         if let Some(v) = st.embed_document_title {
             cfg.store.embed_document_title = v;
+        }
+        if let Some(v) = st.chunker {
+            cfg.store.chunker = v;
         }
     }
 
