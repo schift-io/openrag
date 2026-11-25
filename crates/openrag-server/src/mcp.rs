@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, HOST, ORIGIN};
-use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use base64::Engine as _;
 use openrag_core::{
     AccessScope, Arn, ArnResourceType, AuthLevel, MemoryBackendKind, OpenRagError,
     PrincipalContext,
@@ -45,6 +46,10 @@ use uuid::Uuid;
 use crate::api_core::{resolve_bucket_rls, resolve_org_and_dept_paths};
 use crate::auth::{authenticate_bearer_token, enforce_api_key_arn_scope, AuthPrincipal, TrustedPrincipal};
 use crate::llm_router::{neutralize_literal_pii_tokens, seal_text_for_llm};
+use crate::mcp_skills;
+use crate::mcp_tasks::{default_task_store, PrincipalKey};
+#[doc(hidden)]
+pub use crate::mcp_tasks::{TaskHookFn, TaskHookOutcome, TaskStore};
 use crate::state::AppState;
 
 /// The exact, ordered MCP tool registry.
@@ -67,15 +72,37 @@ pub const MCP_TOOL_NAMES: [&str; 16] = [
     "concept_resolve",
 ];
 
+pub const MODERN_PROTOCOL_VERSIONS: [&str; 1] = ["2026-07-28"];
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const METHOD_HEADER: &str = "mcp-method";
+const NAME_HEADER: &str = "mcp-name";
+
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+const EXT_SKILLS: &str = "io.modelcontextprotocol/skills";
+const EXT_TASKS: &str = "io.modelcontextprotocol/tasks";
+
+const CACHE_TTL_MS: u64 = 300_000;
+const CACHE_SCOPE_PRIVATE: &str = "private";
+
+const BASE64_SENTINEL_PREFIX: &str = "=?base64?";
+const BASE64_SENTINEL_SUFFIX: &str = "?=";
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
+const JSONRPC_INTERNAL_ERROR: i64 = -32603;
+pub const JSONRPC_HEADER_MISMATCH: i64 = -32020;
+pub const JSONRPC_MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+pub const JSONRPC_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+const LEGACY_INSTRUCTIONS: &str = "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Search the way a careful researcher would: split a question with several parts or conditions into one rag_search per part; for vague or descriptive questions also pass hypothetical_answer (a short passage worded like the document you expect); when results are weak, retry with other wording, synonyms or the formal term; when a hit is relevant but cut off, read its whole page with rag_get_page. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card; to find a specific value in it, pass find (and column) rather than paging through every row. rag_list_documents shows what is in a bucket.";
 
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DISPATCH_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -134,6 +161,62 @@ pub struct McpEngine {
     transport: McpTransport,
     state: StateSource,
     caller: CallerSource,
+    tasks: Arc<TaskStore>,
+    task_hook: Option<TaskHookFn>,
+}
+
+struct RpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+impl RpcError {
+    fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn with_data(code: i64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+
+    fn unsupported_version(requested: &str) -> Self {
+        let mut supported: Vec<&str> = Vec::with_capacity(
+            MODERN_PROTOCOL_VERSIONS.len() + SUPPORTED_PROTOCOL_VERSIONS.len(),
+        );
+        supported.extend_from_slice(&MODERN_PROTOCOL_VERSIONS);
+        supported.extend_from_slice(&SUPPORTED_PROTOCOL_VERSIONS);
+        Self::with_data(
+            JSONRPC_UNSUPPORTED_PROTOCOL_VERSION,
+            "Unsupported protocol version",
+            json!({
+                "supported": supported,
+                "requested": requested,
+            }),
+        )
+    }
+
+    fn missing_tasks_capability() -> Self {
+        Self::with_data(
+            JSONRPC_MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "Missing required client capability",
+            json!({
+                "requiredCapabilities": {
+                    "extensions": {
+                        EXT_TASKS: {},
+                    }
+                }
+            }),
+        )
+    }
 }
 
 struct ToolCtx {
@@ -198,6 +281,8 @@ impl McpEngine {
             transport: McpTransport::Http,
             state: StateSource::Ready(state),
             caller: CallerSource::Principal(Box::new(principal)),
+            tasks: default_task_store(),
+            task_hook: None,
         }
     }
 
@@ -211,6 +296,8 @@ impl McpEngine {
                 key: opts.api_key.filter(|k| !k.trim().is_empty()),
                 expected_principal: opts.principal_id,
             },
+            tasks: default_task_store(),
+            task_hook: None,
         }
     }
 
@@ -223,7 +310,23 @@ impl McpEngine {
                 key: opts.api_key.filter(|k| !k.trim().is_empty()),
                 expected_principal: opts.principal_id,
             },
+            tasks: default_task_store(),
+            task_hook: None,
         }
+    }
+
+    /// Replaces the task store used by this engine (for isolated tests).
+    #[doc(hidden)]
+    pub fn with_task_store(mut self, tasks: Arc<TaskStore>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
+    /// Injects a test hook future for matching `tools/call` requests.
+    #[doc(hidden)]
+    pub fn with_task_hook(mut self, hook: TaskHookFn) -> Self {
+        self.task_hook = Some(hook);
+        self
     }
 
     /// Handles one decoded JSON-RPC payload (single message or batch).
@@ -284,6 +387,17 @@ impl McpEngine {
         }
 
         let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
+
+        // Dual-era dispatch: `initialize` is always legacy; any other request carrying
+        // `params._meta["io.modelcontextprotocol/protocolVersion"]` speaks modern MCP.
+        if method != "initialize" && modern_protocol_version_in_params(&params).is_some() {
+            let outcome = self.handle_modern(method, &params).await;
+            return Some(match outcome {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id_val, "result": result }),
+                Err(err) => rpc_error_response(id_val, err),
+            });
+        }
+
         let outcome = match method {
             "initialize" => Ok(initialize_result(&params)),
             "ping" => Ok(json!({})),
@@ -298,36 +412,297 @@ impl McpEngine {
         })
     }
 
-    async fn tools_call(&self, params: &Value) -> Result<Value, (i64, String)> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or((JSONRPC_INVALID_PARAMS, "tools/call requires a string 'name'".to_string()))?;
-        if !MCP_TOOL_NAMES.contains(&name) {
-            return Err((JSONRPC_INVALID_PARAMS, format!("unknown tool: {name}")));
+    async fn handle_modern(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        let Some(version) = modern_protocol_version_in_params(params).and_then(Value::as_str) else {
+            return Err(RpcError::new(
+                JSONRPC_INVALID_PARAMS,
+                format!("_meta['{META_PROTOCOL_VERSION}'] must be a string"),
+            ));
+        };
+        if !MODERN_PROTOCOL_VERSIONS.contains(&version) {
+            return Err(RpcError::unsupported_version(version));
         }
-        let args = match params.get("arguments") {
-            None | Some(Value::Null) => Map::new(),
-            Some(Value::Object(m)) => m.clone(),
-            Some(_) => {
-                return Err((
-                    JSONRPC_INVALID_PARAMS,
-                    "tools/call 'arguments' must be an object".to_string(),
+
+        // Capabilities are stateless and read per request; nothing is remembered across calls.
+        let client_caps = extract_client_capabilities(params)?;
+
+        match method {
+            "server/discover" => Ok(finalize_modern_result(discover_result(), "complete", true)),
+            "tools/list" => {
+                validate_optional_cursor(params)?;
+                Ok(finalize_modern_result(
+                    json!({ "tools": tool_definitions() }),
+                    "complete",
+                    true,
                 ))
             }
-        };
+            "tools/call" => self.modern_tools_call(params, &client_caps).await,
+            "resources/list" => {
+                validate_optional_cursor(params)?;
+                let payload = mcp_skills::list_resources()
+                    .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+                Ok(finalize_modern_result(payload, "complete", true))
+            }
+            "resources/templates/list" => {
+                validate_optional_cursor(params)?;
+                Ok(finalize_modern_result(
+                    mcp_skills::list_resource_templates(),
+                    "complete",
+                    true,
+                ))
+            }
+            "resources/read" => {
+                let uri = required_str_param(params, "uri", "resources/read")?;
+                let payload = mcp_skills::read_resource(uri)
+                    .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?
+                    .ok_or_else(|| {
+                        RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown resource URI: {uri}"))
+                    })?;
+                Ok(finalize_modern_result(payload, "complete", true))
+            }
+            "skills/list" => {
+                validate_optional_cursor(params)?;
+                let payload = mcp_skills::list_skills()
+                    .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+                Ok(finalize_modern_result(payload, "complete", true))
+            }
+            "skills/get" => {
+                let uri = required_str_param(params, "uri", "skills/get")?;
+                let payload = mcp_skills::get_skill(uri)
+                    .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?
+                    .ok_or_else(|| {
+                        RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown skill URI: {uri}"))
+                    })?;
+                Ok(finalize_modern_result(payload, "complete", true))
+            }
+            "tasks/get" => self.tasks_get(params, &client_caps).await,
+            "tasks/update" => self.tasks_update(params, &client_caps).await,
+            "tasks/cancel" => self.tasks_cancel(params, &client_caps).await,
+            _ => Err(RpcError::new(
+                JSONRPC_METHOD_NOT_FOUND,
+                format!("method not found: {method}"),
+            )),
+        }
+    }
 
+    async fn modern_tools_call(
+        &self,
+        params: &Value,
+        client_caps: &Map<String, Value>,
+    ) -> Result<Value, RpcError> {
+        let (name, args) = parse_tool_call_params(params)?;
+        let supports_tasks = client_supports_tasks(client_caps);
+
+        if let Some(hook) = &self.task_hook {
+            if let Some(fut) = hook(name, &args) {
+                if supports_tasks {
+                    let owner = match self.resolve_principal_key().await {
+                        Ok(owner) => owner,
+                        Err(fail) => {
+                            return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                        }
+                    };
+                    if let Some((task_id, create_payload)) =
+                        self.tasks.try_create(owner, Some(format!("Running {name}...")))
+                    {
+                        let tasks = Arc::clone(&self.tasks);
+                        let tid = task_id.clone();
+                        let join = tokio::spawn(async move {
+                            match fut.await {
+                                TaskHookOutcome::ToolOk(v) => {
+                                    let res =
+                                        finalize_modern_result(tool_success(v), "complete", false);
+                                    tasks.complete(&tid, res);
+                                }
+                                TaskHookOutcome::ToolErr { code, message } => {
+                                    let res = finalize_modern_result(
+                                        tool_error(&ToolFailure::new(code, message)),
+                                        "complete",
+                                        false,
+                                    );
+                                    tasks.complete(&tid, res);
+                                }
+                                TaskHookOutcome::RpcErr { code, message } => {
+                                    tasks.fail(
+                                        &tid,
+                                        json!({ "code": code, "message": message }),
+                                        Some(message),
+                                    );
+                                }
+                            }
+                        });
+                        self.tasks.set_abort_handle(&task_id, join.abort_handle());
+                        return Ok(finalize_modern_result(create_payload, "task", false));
+                    }
+                }
+                return match fut.await {
+                    TaskHookOutcome::ToolOk(v) => {
+                        Ok(finalize_modern_result(tool_success(v), "complete", false))
+                    }
+                    TaskHookOutcome::ToolErr { code, message } => Ok(finalize_modern_result(
+                        tool_error(&ToolFailure::new(code, message)),
+                        "complete",
+                        false,
+                    )),
+                    TaskHookOutcome::RpcErr { code, message } => Err(RpcError::new(code, message)),
+                };
+            }
+        }
+
+        let is_ingest_file = name == "rag_ingest"
+            && args
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| !p.trim().is_empty());
+        let is_watch_scan =
+            name == "docs_status" && args.get("scan").and_then(Value::as_bool) == Some(true);
+
+        if supports_tasks && (is_ingest_file || is_watch_scan) {
+            let ctx = match self.resolve_ctx().await {
+                Ok(ctx) => ctx,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let owner = PrincipalKey {
+                org_id: ctx.principal.org_id,
+                principal_id: ctx.principal.principal_id,
+            };
+            let initial_msg = if is_ingest_file {
+                "Ingesting file..."
+            } else {
+                "Scanning documents folders..."
+            };
+            if let Some((task_id, create_payload)) =
+                self.tasks.try_create(owner, Some(initial_msg.to_string()))
+            {
+                let tasks = Arc::clone(&self.tasks);
+                let tid = task_id.clone();
+                let tool_name = name.to_string();
+                let join = tokio::spawn(async move {
+                    let raw_outcome = if is_watch_scan {
+                        docs_status_scan_task(&ctx, &tasks, &tid).await
+                    } else {
+                        call_tool(&ctx, &tool_name, &args).await
+                    };
+                    let final_outcome = match raw_outcome {
+                        Ok(value) => seal_for_ai(&ctx, value).await,
+                        Err(fail) => Err(fail),
+                    };
+                    let tool_res = match final_outcome {
+                        Ok(value) => tool_success(value),
+                        Err(fail) => tool_error(&fail),
+                    };
+                    tasks.complete(&tid, finalize_modern_result(tool_res, "complete", false));
+                });
+                self.tasks.set_abort_handle(&task_id, join.abort_handle());
+                return Ok(finalize_modern_result(create_payload, "task", false));
+            }
+        }
+
+        let sync_result = self
+            .tools_call_parsed(name, &args)
+            .await;
+        Ok(finalize_modern_result(sync_result, "complete", false))
+    }
+
+    async fn tasks_get(
+        &self,
+        params: &Value,
+        client_caps: &Map<String, Value>,
+    ) -> Result<Value, RpcError> {
+        if !client_supports_tasks(client_caps) {
+            return Err(RpcError::missing_tasks_capability());
+        }
+        let task_id = required_str_param(params, "taskId", "tasks/get")?;
+        let owner = self.resolve_principal_key().await.map_err(|_| {
+            RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown or expired taskId: {task_id}"))
+        })?;
+        let task = self.tasks.get(task_id, owner).ok_or_else(|| {
+            RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown or expired taskId: {task_id}"))
+        })?;
+        Ok(finalize_modern_result(task, "complete", false))
+    }
+
+    async fn tasks_update(
+        &self,
+        params: &Value,
+        client_caps: &Map<String, Value>,
+    ) -> Result<Value, RpcError> {
+        if !client_supports_tasks(client_caps) {
+            return Err(RpcError::missing_tasks_capability());
+        }
+        let task_id = required_str_param(params, "taskId", "tasks/update")?;
+        if !params.get("inputResponses").is_some_and(Value::is_object) {
+            return Err(RpcError::new(
+                JSONRPC_INVALID_PARAMS,
+                "tasks/update requires an object 'inputResponses'",
+            ));
+        }
+        let owner = self.resolve_principal_key().await.map_err(|_| {
+            RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown or expired taskId: {task_id}"))
+        })?;
+        if !self.tasks.acknowledge_update(task_id, owner) {
+            return Err(RpcError::new(
+                JSONRPC_INVALID_PARAMS,
+                format!("unknown or expired taskId: {task_id}"),
+            ));
+        }
+        Ok(finalize_modern_result(json!({}), "complete", false))
+    }
+
+    async fn tasks_cancel(
+        &self,
+        params: &Value,
+        client_caps: &Map<String, Value>,
+    ) -> Result<Value, RpcError> {
+        if !client_supports_tasks(client_caps) {
+            return Err(RpcError::missing_tasks_capability());
+        }
+        let task_id = required_str_param(params, "taskId", "tasks/cancel")?;
+        let owner = self.resolve_principal_key().await.map_err(|_| {
+            RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown or expired taskId: {task_id}"))
+        })?;
+        if !self.tasks.cancel(task_id, owner) {
+            return Err(RpcError::new(
+                JSONRPC_INVALID_PARAMS,
+                format!("unknown or expired taskId: {task_id}"),
+            ));
+        }
+        Ok(finalize_modern_result(json!({}), "complete", false))
+    }
+
+    async fn resolve_principal_key(&self) -> Result<PrincipalKey, ToolFailure> {
+        if let CallerSource::Principal(p) = &self.caller {
+            return Ok(PrincipalKey {
+                org_id: p.org_id,
+                principal_id: p.principal_id,
+            });
+        }
+        let ctx = self.resolve_ctx().await?;
+        Ok(PrincipalKey {
+            org_id: ctx.principal.org_id,
+            principal_id: ctx.principal.principal_id,
+        })
+    }
+
+    async fn tools_call(&self, params: &Value) -> Result<Value, (i64, String)> {
+        let (name, args) = parse_tool_call_params(params).map_err(|e| (e.code, e.message))?;
+        Ok(self.tools_call_parsed(name, &args).await)
+    }
+
+    async fn tools_call_parsed(&self, name: &str, args: &Map<String, Value>) -> Value {
         let outcome = match self.resolve_ctx().await {
-            Ok(ctx) => match call_tool(&ctx, name, &args).await {
+            Ok(ctx) => match call_tool(&ctx, name, args).await {
                 Ok(value) => seal_for_ai(&ctx, value).await,
                 Err(fail) => Err(fail),
             },
             Err(fail) => Err(fail),
         };
-        Ok(match outcome {
+        match outcome {
             Ok(value) => tool_success(value),
             Err(fail) => tool_error(&fail),
-        })
+        }
     }
 
     /// Builds the lazily-initialized stdio state. Kept out of `handle_message` so the
@@ -410,6 +785,132 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
+fn rpc_error_response(id: Value, err: RpcError) -> Value {
+    let mut error_obj = json!({
+        "code": err.code,
+        "message": err.message,
+    });
+    if let (Some(obj), Some(data)) = (error_obj.as_object_mut(), err.data) {
+        obj.insert("data".into(), data);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": error_obj,
+    })
+}
+
+fn modern_protocol_version_in_params(params: &Value) -> Option<&Value> {
+    params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
+}
+
+fn modern_protocol_version_in_msg(msg: &Value) -> Option<&Value> {
+    if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+        return None;
+    }
+    msg.get("params").and_then(modern_protocol_version_in_params)
+}
+
+fn extract_client_capabilities(params: &Value) -> Result<Map<String, Value>, RpcError> {
+    match params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(META_CLIENT_CAPABILITIES))
+    {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err(RpcError::new(
+            JSONRPC_INVALID_PARAMS,
+            format!("_meta['{META_CLIENT_CAPABILITIES}'] must be an object"),
+        )),
+    }
+}
+
+fn client_supports_tasks(client_caps: &Map<String, Value>) -> bool {
+    client_caps
+        .get("extensions")
+        .and_then(Value::as_object)
+        .and_then(|ext| ext.get(EXT_TASKS))
+        .is_some_and(Value::is_object)
+}
+
+fn validate_optional_cursor(params: &Value) -> Result<(), RpcError> {
+    match params.get("cursor") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if s.is_empty() => Ok(()),
+        _ => Err(RpcError::new(JSONRPC_INVALID_PARAMS, "invalid cursor")),
+    }
+}
+
+fn required_str_param<'a>(params: &'a Value, field: &str, method: &str) -> Result<&'a str, RpcError> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(JSONRPC_INVALID_PARAMS, format!("{method} requires a string '{field}'")))
+}
+
+fn parse_tool_call_params(params: &Value) -> Result<(&str, Map<String, Value>), RpcError> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(JSONRPC_INVALID_PARAMS, "tools/call requires a string 'name'"))?;
+    if !MCP_TOOL_NAMES.contains(&name) {
+        return Err(RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown tool: {name}")));
+    }
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(m)) => m.clone(),
+        Some(_) => {
+            return Err(RpcError::new(
+                JSONRPC_INVALID_PARAMS,
+                "tools/call 'arguments' must be an object",
+            ))
+        }
+    };
+    Ok((name, args))
+}
+
+fn server_info() -> Value {
+    json!({ "name": "openrag", "version": env!("CARGO_PKG_VERSION") })
+}
+
+fn finalize_modern_result(mut result: Value, result_type: &str, cacheable: bool) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("resultType".into(), json!(result_type));
+        if cacheable {
+            obj.insert("ttlMs".into(), json!(CACHE_TTL_MS));
+            obj.insert("cacheScope".into(), json!(CACHE_SCOPE_PRIVATE));
+        }
+        let meta = obj
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert(META_SERVER_INFO.into(), server_info());
+        }
+    }
+    result
+}
+
+fn discover_result() -> Value {
+    json!({
+        "supportedVersions": MODERN_PROTOCOL_VERSIONS,
+        "capabilities": {
+            "tools": {},
+            "resources": {},
+            "extensions": {
+                EXT_SKILLS: {},
+                EXT_TASKS: {},
+            },
+        },
+        "instructions": format!(
+            "{LEGACY_INSTRUCTIONS} For a full search workflow guide, read the openrag-search skill at skill://openrag-search/SKILL.md."
+        ),
+    })
+}
+
 fn initialize_result(params: &Value) -> Value {
     let requested = params.get("protocolVersion").and_then(Value::as_str);
     let version = requested
@@ -418,8 +919,8 @@ fn initialize_result(params: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "openrag", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Search the way a careful researcher would: split a question with several parts or conditions into one rag_search per part; for vague or descriptive questions also pass hypothetical_answer (a short passage worded like the document you expect); when results are weak, retry with other wording, synonyms or the formal term; when a hit is relevant but cut off, read its whole page with rag_get_page. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card; to find a specific value in it, pass find (and column) rather than paging through every row. rag_list_documents shows what is in a bucket.",
+        "serverInfo": server_info(),
+        "instructions": LEGACY_INSTRUCTIONS,
     })
 }
 
@@ -1316,6 +1817,81 @@ async fn docs_status(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, 
     Ok(status)
 }
 
+/// Asynchronous task runner for `docs_status` with `scan: true`: triggers a scan and
+/// polls `/v2/watch` until no bucket is scanning, reporting progress in `statusMessage`.
+async fn docs_status_scan_task(
+    ctx: &ToolCtx,
+    tasks: &TaskStore,
+    task_id: &str,
+) -> Result<Value, ToolFailure> {
+    let started_at = chrono::Utc::now();
+    let scan = dispatch(ctx, Method::POST, "/v2/watch/scan", DispatchBody::Empty).await?;
+
+    let grace_start = Instant::now();
+    let mut saw_scanning = false;
+    let mut status = dispatch(ctx, Method::GET, "/v2/watch", DispatchBody::Empty).await?;
+
+    loop {
+        let (scanning_summary, finished_after) = inspect_watch_scan(&status, started_at);
+        if let Some(summary) = scanning_summary {
+            saw_scanning = true;
+            tasks.set_status_message(task_id, summary);
+        } else if saw_scanning
+            || finished_after
+            || grace_start.elapsed() >= Duration::from_secs(2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        status = dispatch(ctx, Method::GET, "/v2/watch", DispatchBody::Empty).await?;
+    }
+
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("scan".into(), scan);
+    }
+    Ok(status)
+}
+
+fn inspect_watch_scan(
+    status: &Value,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> (Option<String>, bool) {
+    let Some(buckets) = status.get("buckets").and_then(Value::as_object) else {
+        return (None, false);
+    };
+    let mut scanning_parts = Vec::new();
+    let mut finished_after = false;
+    for (slug, info) in buckets {
+        let state = info.get("state").and_then(Value::as_str).unwrap_or_default();
+        if state == "scanning" {
+            if let Some(prog) = info.get("progress").and_then(Value::as_array) {
+                if prog.len() == 2 {
+                    let done = prog[0].as_u64().unwrap_or(0);
+                    let total = prog[1].as_u64().unwrap_or(0);
+                    scanning_parts.push(format!("{slug}: {done}/{total}"));
+                    continue;
+                }
+            }
+            scanning_parts.push(format!("{slug}: scanning"));
+        }
+        if let Some(fin) = info
+            .get("last_scan_finished_at")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            if fin.with_timezone(&chrono::Utc) >= started_at {
+                finished_after = true;
+            }
+        }
+    }
+    let summary = if scanning_parts.is_empty() {
+        None
+    } else {
+        Some(format!("Scanning {}", scanning_parts.join(", ")))
+    };
+    (summary, finished_after)
+}
+
 async fn rag_ask(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
     let query = arg_str_req(args, "query")?;
     let model = arg_str_opt(args, "mode")?
@@ -2091,6 +2667,214 @@ fn contains_method(msg: &Value, method: &str) -> bool {
     }
 }
 
+fn is_valid_http_header_value(raw: &str) -> bool {
+    raw.bytes().all(|b| b == b'\t' || (0x20..=0x7E).contains(&b))
+}
+
+fn decode_mcp_header_value(raw: &str) -> Result<String, &'static str> {
+    if !is_valid_http_header_value(raw) {
+        return Err("header contains invalid characters");
+    }
+    if let Some(rest) = raw.strip_prefix(BASE64_SENTINEL_PREFIX) {
+        if let Some(b64) = rest.strip_suffix(BASE64_SENTINEL_SUFFIX) {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|_| "invalid Base64 sentinel encoding")?;
+            return String::from_utf8(bytes)
+                .map_err(|_| "Base64 sentinel decoded to invalid UTF-8");
+        }
+    }
+    Ok(raw.to_string())
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, &'static str> {
+    let mut iter = headers.get_all(name).iter();
+    let Some(first) = iter.next() else {
+        return Ok(None);
+    };
+    if iter.next().is_some() {
+        return Err("duplicate header");
+    }
+    let text = first.to_str().map_err(|_| "header is not valid ASCII")?;
+    Ok(Some(text))
+}
+
+/// Validates required Streamable HTTP headers for a modern (`2026-07-28`) request.
+fn validate_modern_http_headers(
+    headers: &HeaderMap,
+    msg: &Value,
+) -> Result<(), (StatusCode, Value)> {
+    // Notifications have no request header requirements in 2026-07-28.
+    if msg.get("id").is_none() {
+        return Ok(());
+    }
+    let req_id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(meta_ver) = modern_protocol_version_in_msg(msg).and_then(Value::as_str) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            rpc_error(
+                req_id,
+                JSONRPC_INVALID_PARAMS,
+                &format!("_meta['{META_PROTOCOL_VERSION}'] must be a string"),
+            ),
+        ));
+    };
+
+    match single_header(headers, PROTOCOL_VERSION_HEADER) {
+        Ok(Some(hdr_ver)) if is_valid_http_header_value(hdr_ver) && hdr_ver == meta_ver => {}
+        Ok(Some(hdr_ver)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    &format!(
+                        "Header mismatch: MCP-Protocol-Version '{hdr_ver}' does not match body '{meta_ver}'"
+                    ),
+                ),
+            ));
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    "Header mismatch: missing required MCP-Protocol-Version header",
+                ),
+            ));
+        }
+        Err(reason) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    &format!("Header mismatch: invalid MCP-Protocol-Version header ({reason})"),
+                ),
+            ));
+        }
+    }
+
+    match single_header(headers, METHOD_HEADER) {
+        Ok(Some(hdr_method)) if is_valid_http_header_value(hdr_method) && hdr_method == method => {}
+        Ok(Some(hdr_method)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    &format!(
+                        "Header mismatch: Mcp-Method '{hdr_method}' does not match body '{method}'"
+                    ),
+                ),
+            ));
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    "Header mismatch: missing required Mcp-Method header",
+                ),
+            ));
+        }
+        Err(reason) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    &format!("Header mismatch: invalid Mcp-Method header ({reason})"),
+                ),
+            ));
+        }
+    }
+
+    if !MODERN_PROTOCOL_VERSIONS.contains(&meta_ver) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            rpc_error_response(req_id, RpcError::unsupported_version(meta_ver)),
+        ));
+    }
+
+    // Per Streamable HTTP (tools/call, resources/read) and Tasks extension (tasks/*).
+    let expected_name_field = match method {
+        "tools/call" => Some("name"),
+        "resources/read" => Some("uri"),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => Some("taskId"),
+        _ => None,
+    };
+
+    if let Some(field) = expected_name_field {
+        let raw_hdr = match single_header(headers, NAME_HEADER) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    rpc_error(
+                        req_id,
+                        JSONRPC_HEADER_MISMATCH,
+                        "Header mismatch: missing required Mcp-Name header",
+                    ),
+                ));
+            }
+            Err(reason) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    rpc_error(
+                        req_id,
+                        JSONRPC_HEADER_MISMATCH,
+                        &format!("Header mismatch: invalid Mcp-Name header ({reason})"),
+                    ),
+                ));
+            }
+        };
+        let decoded = decode_mcp_header_value(raw_hdr).map_err(|reason| {
+            (
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id.clone(),
+                    JSONRPC_HEADER_MISMATCH,
+                    &format!("Header mismatch: invalid Mcp-Name header ({reason})"),
+                ),
+            )
+        })?;
+        let body_val = msg
+            .get("params")
+            .and_then(|p| p.get(field))
+            .and_then(Value::as_str);
+        if body_val != Some(decoded.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                rpc_error(
+                    req_id,
+                    JSONRPC_HEADER_MISMATCH,
+                    "Header mismatch: Mcp-Name header does not match request body",
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn modern_http_error_status(payload: &Value) -> Option<StatusCode> {
+    let code = payload.pointer("/error/code").and_then(Value::as_i64)?;
+    match code {
+        JSONRPC_HEADER_MISMATCH
+        | JSONRPC_MISSING_REQUIRED_CLIENT_CAPABILITY
+        | JSONRPC_UNSUPPORTED_PROTOCOL_VERSION
+        | JSONRPC_INVALID_REQUEST => Some(StatusCode::BAD_REQUEST),
+        JSONRPC_METHOD_NOT_FOUND => Some(StatusCode::NOT_FOUND),
+        _ => None,
+    }
+}
+
 async fn mcp_post_handler(
     State(state): State<Arc<AppState>>,
     AuthPrincipal(principal): AuthPrincipal,
@@ -2103,14 +2887,6 @@ async fn mcp_post_handler(
             &json!({ "error": "forbidden", "message": "Origin not allowed for /mcp" }),
         );
     }
-    if let Some(v) = headers.get(PROTOCOL_VERSION_HEADER).and_then(|v| v.to_str().ok()) {
-        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&v.trim()) {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &rpc_error(Value::Null, JSONRPC_INVALID_REQUEST, "unsupported MCP-Protocol-Version"),
-            );
-        }
-    }
 
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -2121,6 +2897,53 @@ async fn mcp_post_handler(
             )
         }
     };
+
+    if modern_protocol_version_in_msg(&msg).is_some() {
+        if let Err((status, err_body)) = validate_modern_http_headers(&headers, &msg) {
+            return json_response(status, &err_body);
+        }
+        let engine = McpEngine::for_http(state, principal);
+        let reply = engine.handle_message(msg).await;
+        return match reply {
+            None => StatusCode::ACCEPTED.into_response(),
+            Some(payload) => {
+                if let Some(status) = modern_http_error_status(&payload) {
+                    return json_response(status, &payload);
+                }
+                let accept = headers
+                    .get(ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let wants_sse_only =
+                    accept.contains("text/event-stream") && !accept.contains("application/json");
+                if wants_sse_only {
+                    let data = serde_json::to_string(&payload).unwrap_or_default();
+                    let mut r =
+                        (StatusCode::OK, format!("event: message\ndata: {data}\n\n")).into_response();
+                    r.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                    r.headers_mut().insert(
+                        HeaderName::from_static("x-accel-buffering"),
+                        HeaderValue::from_static("no"),
+                    );
+                    r
+                } else {
+                    json_response(StatusCode::OK, &payload)
+                }
+            }
+        };
+    }
+
+    // Legacy Streamable HTTP path (unchanged).
+    if let Some(v) = headers.get(PROTOCOL_VERSION_HEADER).and_then(|v| v.to_str().ok()) {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&v.trim()) {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &rpc_error(Value::Null, JSONRPC_INVALID_REQUEST, "unsupported MCP-Protocol-Version"),
+            );
+        }
+    }
 
     let is_init = contains_method(&msg, "initialize");
     let incoming_session = headers
@@ -2305,7 +3128,11 @@ where
             StdioFrame::Message(bytes, framing) => {
                 let reply = match serde_json::from_slice::<Value>(&bytes) {
                     Ok(msg) => {
-                        if contains_method(&msg, "tools/call") {
+                        if contains_method(&msg, "tools/call")
+                            || contains_method(&msg, "tasks/get")
+                            || contains_method(&msg, "tasks/update")
+                            || contains_method(&msg, "tasks/cancel")
+                        {
                             engine.ensure_state().await;
                         }
                         engine.handle_message(msg).await
@@ -2362,6 +3189,386 @@ mod tests {
         assert!(!origin_allowed(&h));
         h.insert(ORIGIN, HeaderValue::from_static("https://rag.internal"));
         assert!(origin_allowed(&h));
+    }
+
+    #[test]
+    fn base64_sentinel_header_decoding() {
+        assert_eq!(decode_mcp_header_value("rag_search"), Ok("rag_search".to_string()));
+        assert_eq!(
+            decode_mcp_header_value("=?base64?SGVsbG8sIOS4lueVjA==?="),
+            Ok("Hello, 世界".to_string())
+        );
+        assert_eq!(
+            decode_mcp_header_value("=?base64?IHBhZGRlZCA=?="),
+            Ok(" padded ".to_string())
+        );
+        assert_eq!(
+            decode_mcp_header_value("=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="),
+            Ok("=?base64?literal?=".to_string())
+        );
+        assert!(decode_mcp_header_value("=?base64?***not-base64***?=").is_err());
+        assert!(decode_mcp_header_value("=?base64?/w==?=").is_err());
+    }
+
+    fn test_principal() -> Result<PrincipalContext, OpenRagError> {
+        Ok(PrincipalContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            AuthLevel::new(5)?,
+        ))
+    }
+
+    async fn send_mcp_http(
+        app: &Router,
+        principal: Option<&PrincipalContext>,
+        method: Method,
+        headers: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<(StatusCode, HeaderMap, Value), String> {
+        let mut builder = Request::builder().method(method).uri("/mcp");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let raw_body = match body {
+            Some(v) => {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+                serde_json::to_vec(&v).map_err(|e| e.to_string())?
+            }
+            None => Vec::new(),
+        };
+        let mut req = builder
+            .body(Body::from(raw_body))
+            .map_err(|e| e.to_string())?;
+        if let Some(p) = principal {
+            req.extensions_mut().insert(TrustedPrincipal(p.clone()));
+        }
+        let resp = match app.clone().oneshot(req).await {
+            Ok(r) => r,
+            Err(never) => match never {},
+        };
+        let status = resp.status();
+        let resp_headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), MAX_DISPATCH_BODY_BYTES)
+            .await
+            .map_err(|e| e.to_string())?;
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(&bytes).to_string())
+            })
+        };
+        Ok((status, resp_headers, json))
+    }
+
+    #[tokio::test]
+    async fn http_legacy_session_works_unchanged() -> Result<(), String> {
+        let state = AppState::new_offline_for_test().map_err(|e| e.to_string())?;
+        let app = crate::build_router(state);
+        let p1 = test_principal().map_err(|e| e.to_string())?;
+        let p2 = test_principal().map_err(|e| e.to_string())?;
+
+        // Unauthenticated fails closed with 401.
+        let (st, _, _) = send_mcp_http(
+            &app,
+            None,
+            Method::POST,
+            &[],
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // Legacy initialize mints Mcp-Session-Id.
+        let (st, hdrs, body) = send_mcp_http(
+            &app,
+            Some(&p1),
+            Method::POST,
+            &[],
+            Some(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "legacy", "version": "1"}}})),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
+        assert!(body["result"].get("resultType").is_none());
+        let sid = hdrs
+            .get(SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| "missing Mcp-Session-Id".to_string())?
+            .to_string();
+
+        // Subsequent legacy call echoes Mcp-Session-Id.
+        let (st, hdrs, body) = send_mcp_http(
+            &app,
+            Some(&p1),
+            Method::POST,
+            &[(SESSION_HEADER, &sid)],
+            Some(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            hdrs.get(SESSION_HEADER).and_then(|v| v.to_str().ok()),
+            Some(sid.as_str())
+        );
+        assert_eq!(body["result"]["tools"].as_array().map_or(0, Vec::len), 16);
+        assert!(body["result"].get("resultType").is_none());
+
+        // Another principal cannot ride the legacy session.
+        let (st, _, _) = send_mcp_http(
+            &app,
+            Some(&p2),
+            Method::POST,
+            &[(SESSION_HEADER, &sid)],
+            Some(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // GET -> 405, DELETE -> 204.
+        let (st, _, _) = send_mcp_http(&app, Some(&p1), Method::GET, &[], None).await?;
+        assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+        let (st, _, _) =
+            send_mcp_http(&app, Some(&p1), Method::DELETE, &[(SESSION_HEADER, &sid)], None).await?;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_modern_header_validation_and_statelessness() -> Result<(), String> {
+        let state = AppState::new_offline_for_test().map_err(|e| e.to_string())?;
+        let app = crate::build_router(state);
+        let p = test_principal().map_err(|e| e.to_string())?;
+
+        let modern_meta = |ver: &str| {
+            json!({
+                META_PROTOCOL_VERSION: ver,
+                META_CLIENT_CAPABILITIES: {},
+            })
+        };
+
+        let discover_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": modern_meta("2026-07-28") }
+        });
+
+        // Missing MCP-Protocol-Version -> 400 -32020.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[(METHOD_HEADER, "server/discover")],
+            Some(discover_body.clone()),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_HEADER_MISMATCH);
+
+        // Missing Mcp-Method -> 400 -32020.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[(PROTOCOL_VERSION_HEADER, "2026-07-28")],
+            Some(discover_body.clone()),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_HEADER_MISMATCH);
+
+        // Mismatched MCP-Protocol-Version -> 400 -32020.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2025-06-18"),
+                (METHOD_HEADER, "server/discover"),
+            ],
+            Some(discover_body.clone()),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_HEADER_MISMATCH);
+
+        // Valid discover ignores Mcp-Session-Id and never emits one.
+        let (st, hdrs, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (METHOD_HEADER, "server/discover"),
+                (SESSION_HEADER, "bogus-session-must-be-ignored"),
+            ],
+            Some(discover_body),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert!(hdrs.get(SESSION_HEADER).is_none());
+        assert_eq!(body["result"]["resultType"], "complete");
+
+        // Unsupported version (matching header and _meta) -> 400 -32022 with data.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2099-01-01"),
+                (METHOD_HEADER, "server/discover"),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "server/discover",
+                "params": { "_meta": modern_meta("2099-01-01") }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(
+            body["error"]["data"]["supported"],
+            json!(["2026-07-28", "2025-06-18", "2025-03-26", "2024-11-05"])
+        );
+        assert_eq!(body["error"]["data"]["requested"], "2099-01-01");
+
+        // Missing Mcp-Name on tools/call -> 400 -32020.
+        let call_body = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_search",
+                "arguments": { "query": "test" },
+                "_meta": modern_meta("2026-07-28")
+            }
+        });
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (METHOD_HEADER, "tools/call"),
+            ],
+            Some(call_body.clone()),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_HEADER_MISMATCH);
+
+        // Mismatched Mcp-Name on tools/call -> 400 -32020.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (METHOD_HEADER, "tools/call"),
+                (NAME_HEADER, "other_tool"),
+            ],
+            Some(call_body),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_HEADER_MISMATCH);
+
+        // Base64 sentinel Mcp-Name accepted on resources/read.
+        let skill_uri = "skill://openrag-search/SKILL.md";
+        let b64_uri = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(skill_uri.as_bytes())
+        );
+        let (st, hdrs, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (METHOD_HEADER, "resources/read"),
+                (NAME_HEADER, &b64_uri),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/read",
+                "params": {
+                    "uri": skill_uri,
+                    "_meta": modern_meta("2026-07-28")
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert!(hdrs.get(SESSION_HEADER).is_none());
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(body["result"]["contents"][0]["uri"], skill_uri);
+
+        // skills/get does NOT require Mcp-Name header.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&p),
+            Method::POST,
+            &[
+                (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (METHOD_HEADER, "skills/get"),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "skills/get",
+                "params": {
+                    "uri": skill_uri,
+                    "_meta": modern_meta("2026-07-28")
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["result"]["skill"]["uri"], skill_uri);
+
+        // Unknown modern method -> 404 -32601.
+        for unknown in ["ping", "logging/setLevel", "resources/subscribe", "resources/directory/read"] {
+            let (st, _, body) = send_mcp_http(
+                &app,
+                Some(&p),
+                Method::POST,
+                &[
+                    (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                    (METHOD_HEADER, unknown),
+                ],
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": unknown,
+                    "params": { "_meta": modern_meta("2026-07-28") }
+                })),
+            )
+            .await?;
+            assert_eq!(st, StatusCode::NOT_FOUND, "method={unknown}");
+            assert_eq!(body["error"]["code"], JSONRPC_METHOD_NOT_FOUND);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_store_prunes_finished_tasks_after_ttl() -> Result<(), String> {
+        let store = TaskStore::with_limits(25, 10, 32);
+        let owner = PrincipalKey {
+            org_id: Uuid::new_v4(),
+            principal_id: Uuid::new_v4(),
+        };
+        let (tid, _) = store
+            .try_create(owner, None)
+            .ok_or_else(|| "expected task creation".to_string())?;
+        store.complete(&tid, json!({"resultType": "complete", "content": []}));
+        assert!(store.get(&tid, owner).is_some());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(store.get(&tid, owner).is_none());
+        Ok(())
     }
 }
 
