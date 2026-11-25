@@ -137,6 +137,12 @@ impl<B: RetrieveBackend> HybridRetriever<B> {
         let exec_input = BackendExecutionInput {
             clean_query: parsed.clean_query.clone(),
             explicit_query_vector: req.query_vector.clone(),
+            hypothetical_answer: req
+                .hypothetical_answer
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string),
             bucket_id: req.bucket_id,
             spaces: params.spaces.clone(),
             effective_tag_filter,

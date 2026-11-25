@@ -419,7 +419,7 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "openrag", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card; to find a specific value in it, pass find (and column) rather than paging through every row. rag_list_documents shows what is in a bucket.",
+        "instructions": "OpenRAG knowledge tools. Every call runs as the authenticated principal: results are filtered by ARN scope, permission groups, permission level and row-level security, and text passes the PII/Safe-Word guard. Search with rag_search; each hit's source.path names the original file. Search the way a careful researcher would: split a question with several parts or conditions into one rag_search per part; for vague or descriptive questions also pass hypothetical_answer (a short passage worded like the document you expect); when results are weak, retry with other wording, synonyms or the formal term; when a hit is relevant but cut off, read its whole page with rag_get_page. Excel and CSV files are indexed as catalog cards (sheets, columns, value ranges, first rows): when a hit has source.kind = spreadsheet, read the rows you need with rag_read_sheet instead of guessing from the card; to find a specific value in it, pass find (and column) rather than paging through every row. rag_list_documents shows what is in a bucket.",
     })
 }
 
@@ -501,7 +501,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "rag_search",
             "Search documents",
-            "Vector search (with concept expansion) over the documents you may read. By default only documents in force now are returned (expired, not-yet-effective, superseded and older revisions are dropped); pass as_of for another reference date. If nothing in force matches, non-current matches come back separately in not_in_force with their validity — never present those as current. Omit 'bucket' to search every bucket you can access. Inline #tag / tag:name in the query filters by tag.",
+            "Vector search (with concept expansion) over the documents you may read. By default only documents in force now are returned (expired, not-yet-effective, superseded and older revisions are dropped); pass as_of for another reference date. If nothing in force matches, non-current matches come back separately in not_in_force with their validity — never present those as current. Omit 'bucket' to search every bucket you can access. Inline #tag / tag:name in the query filters by tag. Split a question with several parts or conditions into one search per part, and retry weak results with other wording or synonyms.",
             schema(
                 json!({
                     "query": str_prop("Search query"),
@@ -515,6 +515,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "expand_tag_aliases": { "type": "boolean", "description": "Expand tags through concept aliases" },
                     "latest_revision_only": { "type": "boolean", "description": "Default true: only documents in force at the reference time. false also returns expired/scheduled/superseded/older revisions, each labeled in 'validity'" },
                     "as_of": { "type": "string", "description": "Reference date (YYYY-MM-DD or RFC 3339), e.g. the date an event happened. Default: now. Future dates surface scheduled documents." },
+                    "hypothetical_answer": str_prop("Optional, for vague or descriptive questions: two or three sentences that would answer the question, worded the way a company document would put it. Used only to find similar passages; it is never shown or stored, so a plausible guess is fine. Report facts only from the results."),
                 }),
                 &["query"],
             ),
@@ -1123,6 +1124,14 @@ async fn rag_search(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, T
         arg_bool_opt(args, "expand_tag_aliases")?.map(|v| json!(v)),
     );
     insert_opt(&mut body, "as_of", as_of.map(|d| json!(d.to_rfc3339())));
+    insert_opt(
+        &mut body,
+        "hypothetical_answer",
+        arg_str_opt(args, "hypothetical_answer")?
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .map(|h| json!(h)),
+    );
     body.insert("latest_revision_only".into(), json!(in_force_only));
     let bucket = arg_str_opt(args, "bucket")?
         .map(|b| b.trim().to_string())
