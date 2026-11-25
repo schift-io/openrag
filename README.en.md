@@ -39,7 +39,7 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
 ```
 
 1. **`pg_pinecone` 3-Engine + `256d` Multi-Space + S3 Vectors/OSS**: Table-level switching between `native` (RaBitQ IVF, zero external account), `pgvector` (HNSW), and `remote` (Pinecone Serverless) without changing SQL queries, plus optional Amazon S3 Vectors (per-tenant STS bucket-ARN isolation) and OSS vector adapters.
-2. **Korean Document Ecosystem Native**: Table-preserving HWP/HWPX/HML parsing (`kordoc`), Schift OCR with automatic confidentiality mode guard (`share` / `private` / `zdr` / local vLLM) and `schift-dewarp`, plus ParadeDB `pg_search` Tantivy BM25 with Lindera Korean morphology (`pg_trgm` + `tsvector` fallback when compiled extensions are absent locally).
+2. **Korean Document Ecosystem Native**: Table-preserving HWP/HWPX/HML and PDF parsing (`kordoc`); scanned PDF pages are read inside the server by kordoc's local Korean OCR, whose models ship in the image. Only photos and pages kordoc cannot read go to Schift OCR, with automatic confidentiality mode guard (`share` / `private` / `zdr` / local vLLM) and `schift-dewarp`, plus ParadeDB `pg_search` Tantivy BM25 with Lindera Korean morphology (`pg_trgm` + `tsvector` fallback when compiled extensions are absent locally).
 3. **Zero-Trust 3-Axis IAM, Fail-Closed RLS & PII/Safe-Word Guard**:
    - Unified authorization across **ARN** (`arn:openrag:<org>:<dept_path>:<scope>:<type>:L<1..10>/<id>`), **Permission Groups** (`iam.groups`, `iam.group_members`, `iam.resource_group_bindings`), and **Permission Levels** (`auth_level 1..10`), enforcing Explicit Deny > Allow and strict `dept_admin` vs `peer` isolation on `private` resources in PostgreSQL Fail-Closed RLS (`FORCE ROW LEVEL SECURITY`) and Rust `openrag-iam`.
    - 2-Stage AES-256-GCM PII Capsule (`schift-ko-pii-v7`, optional `ko-pii`, custom dictionaries), **Configurable PII & Safe-Word Guard** (`allow` | `warn` | `mask` | `block` across `inbound_query`, `llm_egress`, `mcp_egress`, `ingestion_gate`), and **Cascade Redaction** (text + thumbnail BBox black-box pixel masking + immutable audit trail).
@@ -127,7 +127,7 @@ Spin up an ephemeral local PostgreSQL 17 cluster, apply `migrations/000_init.sql
 
 ## Configuration (`configs/`)
 
-- `configs/pipeline.default.yaml` — Standard profile (`256d`, `pg_pinecone: native`, `kordoc`, Schift OCR with `auth_level` mode guard, `schift_v7` PII Capsule, `pii.guard` PII & Safe-Word rules, RRF `k=60`, `L8+` local vLLM routing).
+- `configs/pipeline.default.yaml` — Standard profile (`256d`, `pg_pinecone: native`, `kordoc` for HWP and PDF with local OCR, `structure` chunking, Schift OCR with `auth_level` mode guard, `schift_v7` PII Capsule, `pii.guard` PII & Safe-Word rules, RRF `k=60`, `L8+` local vLLM routing).
 - `configs/pipeline.airgap.yaml` — Air-gapped profile (local OCR/vLLM/256d embedder, strict `default_action: block` guard, `local_only_min_auth_level: 1`).
 - `configs/search_space.example.yaml` — AutoRAG greedy node search space with mandatory `require_zero_pii_leak: true` and `require_zero_arn_violation: true` security gates.
 
@@ -167,6 +167,8 @@ All YAML profiles map 1:1 to typed Rust structs in `openrag-core` with `#[serde(
 
 OpenRAG exposes identical RAG, Wiki, Memory, and Guard capabilities over both **Local Stdio MCP** (`openrag mcp --stdio` / `openrag-mcp`) and **Streamable HTTP MCP** (`/mcp`). Every tool call enforces the caller's ARN, Permission Group, Permission Level, PostgreSQL RLS, and PII/Safe-Word Guard.
 
+The HTTP endpoint speaks MCP 2026-07-28 next to 2025-06-18, 2025-03-26 and 2024-11-05. Clients on 2026-07-28 also get a search skill (`skill://openrag-search/SKILL.md`), tasks for long calls (folder scans, file ingest), a consent prompt (elicitation) before any page is sent to the remote Schift OCR, and, when the server sets `OPENRAG_MCP_FILE_UPLOADS=1`, file uploads to `rag_ingest` (inline up to 4 MiB, out-of-band up to 64 MiB). File uploads are off by default.
+
 ### LLM
 
 OpenRAG bundles no LLM. By default the MCP client is the LLM: Claude Code, Codex or Cursor calls
@@ -200,9 +202,9 @@ after a label (`성명:`, `담당자:`, …) or an attached title (`김민준과
 text is not.
 
 ### Exposed MCP Tools (16)
-- `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in)
+- `rag_search` — `256d` vector search over chunks, wiki and memory with citations (BM25 fusion and the page-thumbnail space are opt-in); the calling AI may pass `hypothetical_answer` for vague questions
 - `rag_ask` — Grounded RAG Q&A through the policy-enforced LLM router
-- `rag_ingest` — Ingest document/text with scope, permission groups, and clearance level
+- `rag_ingest` — Ingest document/text with scope, permission groups, and clearance level; over HTTP it takes the file itself when file uploads are on
 - `rag_get_page` — Fetch redacted page text, thumbnail URI, and `bbox_norm_1000` coordinates
 - `rag_list_documents` — Documents in a bucket (original path, revision, in force or not)
 - `rag_read_sheet` — Rows of an Excel/CSV file; spreadsheets are indexed as catalog cards and read on demand, or searched for a value with `find`
