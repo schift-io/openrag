@@ -53,6 +53,7 @@ User / External AI (Claude Desktop/Code, Cursor, Codex, Docufinder, Kordoc)
 ### Option A: Standard Docker Stack
 ```bash
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # keep it: it wraps the PII vault keys
+mkdir -p "${OPENRAG_DOCS_DIR:-documents}"            # create the watched folder first, or Docker makes it root-owned
 docker compose -f docker/docker-compose.yml --profile app up -d postgres openrag-api
 ```
 

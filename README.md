@@ -37,6 +37,7 @@ Claude Code나 Codex가 있다면 저장소 폴더에서 `/openrag-setup`(Codex�
 # 1) 서버 띄우기
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)   # 다시 띄울 때도 같은 값을 쓰니 적어 두세요
 export OPENRAG_DOCS_DIR=~/회사문서                    # 문서 폴더(생략하면 저장소의 documents/)
+mkdir -p "${OPENRAG_DOCS_DIR:-documents}"            # 먼저 만들어 두세요. 없으면 Docker가 root 소유로 만들어요
 docker compose -f docker/docker-compose.yml --profile app up -d
 
 # 2) 첫 설정 (조직·관리자·API 키·버킷을 한 번에). 문서 폴더는 서버가 30초마다 읽어요

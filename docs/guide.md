@@ -40,7 +40,7 @@ Claude Code / Codex ──(MCP: rag_search)───────┘   찾은 문
 ## 2. 준비물
 
 - **Docker**: Docker Desktop, 또는 Docker Engine과 Compose v2. 처음 띄울 때 Docker 디스크가 12GB쯤 비어 있어야
-  해요. 이미지 3.8GB, 빌드 캐시 6GB쯤, 임베딩 모델 1.5GB가 들어가요. 빌드 캐시는 다 뜬 뒤 지워도 돼요. 임베딩
+  해요. 이미지 3.8~4.5GB(`docker system df` 기준), 빌드 캐시 6GB쯤, 임베딩 모델 1.5GB가 들어가요. 빌드 캐시는 다 뜬 뒤 지워도 돼요. 임베딩
   서버가 쓸 메모리도 3GB쯤 더 필요해요.
 - **질문할 PC의 Claude Code 또는 Codex**
 - **문서 폴더**: 서버가 이 폴더를 계속 지켜보면서 파일을 넣고, 고친 파일은 새 판으로 바꾸고, 지운 파일은
@@ -80,6 +80,7 @@ MCP 등록처럼 PC 설정을 바꾸는 일은 먼저 물어봐요. `docker/.env
 ```bash
 export OPENRAG_PII_KEK_HEX=$(openssl rand -hex 32)
 export OPENRAG_DOCS_DIR=~/회사문서      # 문서 폴더. 생략하면 저장소의 documents/ 폴더
+mkdir -p "${OPENRAG_DOCS_DIR:-documents}"   # 폴더를 먼저 만들어 두세요(아래 설명)
 docker compose -f docker/docker-compose.yml --profile app up -d
 ```
 
@@ -87,6 +88,8 @@ docker compose -f docker/docker-compose.yml --profile app up -d
   처음 만든 값을 안전한 곳에 적어 두세요.
 - `OPENRAG_DOCS_DIR`은 서버가 지켜볼 문서 폴더예요. 서버는 이 폴더를 읽기만 하고, 파일을 바꾸거나
   지우지 않아요. 폴더를 여러 개 쓰는 방법은 [7장](#7-문서-넣기고치기지우기)에 있어요.
+- 문서 폴더는 `up` 전에 만들어 두세요. 없는 채로 띄우면 Linux에서는 Docker가 그 폴더를 root 소유로 만들어서,
+  그 안에 파일을 넣을 수 없어요.
 
 컨테이너는 세 개가 떠요: 데이터베이스(`postgres`), 임베딩 서버(`local-embed`), API(`openrag-api`).
 처음 한 번은 오래 걸려요.
@@ -97,7 +100,8 @@ docker compose -f docker/docker-compose.yml --profile app up -d
 - 임베딩 서버는 메모리를 2.2GB쯤 써요.
 
 아무것도 받아 두지 않은 PC(Docker Desktop, macOS, 2026-11-24)에서 빌드에 3분 24초, 모델을 받아 준비되기까지
-1분 22초가 걸렸어요. 회선 속도와 CPU에 따라 달라요.
+1분 22초가 걸렸어요. Linux(Docker Engine 기본 빌더, 캐시 없이 빌드, 2026-11-25)에서는 빌드에 11분 24초,
+띄운 뒤 준비되기까지 1분 17초가 걸렸어요. 회선 속도와 CPU에 따라 달라요.
 
 ```bash
 docker compose -f docker/docker-compose.yml logs -f local-embed
@@ -172,7 +176,8 @@ docker compose -f docker/docker-compose.yml logs openrag-api | grep "documents f
 
 - **`api_key`는 관리자 키**예요. 문서를 더 넣거나 팀원을 추가할 때 다시 써요. 비밀번호처럼 보관하세요.
 - 키를 잃어버리면 `init`을 한 번 더 실행하면 돼요. 조직과 버킷은 그대로 두고 새 키만 발급해요.
-- `config.not_saved`라는 줄이 보이면 정상이에요. 컨테이너 안에는 설정 파일을 저장할 곳이 없어서 그래요.
+- `config.not_saved`라는 줄이 보이면 정상이에요. 컨테이너 안에서는 설정 파일을 쓸 권한이 없어서(`Permission denied`)
+  그래요. 키와 연결 명령은 위 출력에 다 있어요.
 
 자주 바꾸는 옵션은 이래요.
 
@@ -324,12 +329,14 @@ jpg, jpeg, webp예요. 예전 형식(doc, ppt, xls)은 읽지 못해요.
 
 ```bash
 export OPENRAG_API_KEY=orag_…            # init이 준 관리자 키
-E="docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY openrag-api"
+E="docker compose -f docker/docker-compose.yml exec -e OPENRAG_API_KEY -e OPENRAG_API_URL=http://127.0.0.1:8080 openrag-api"
 $E openrag docs list                     # 문서 목록(원본 경로, 판, 효력, 문단 수). --query 일부, --all 예전 판까지
 $E openrag docs status                   # 폴더별 파일 수, 문서 수, 실패한 파일과 이유, 진행 중인 반영
 $E openrag docs scan                     # 30초 기다리지 않고 지금 훑기
 ```
 
+- `OPENRAG_API_URL`은 명령이 컨테이너 안에서 돌고 있는 서버에 물어보게 해요. 빼면 `docs status`는 폴더를 지켜보는
+  서버를 못 보고 `"watching": false`라고 잘못 답해요.
 - 파일을 한꺼번에 많이 넣으면 로그와 `docs status`에 진행 상황이 나와요(`done / total`).
 - 검색 결과와 목록의 `source.path`는 원본 파일을 이 PC의 경로로 보여 줘요(`OPENRAG_DOCS_DIR`에서 계산). 7장
   방식으로 붙인 다른 폴더는 `OPENRAG_DOCS_DIRS` 항목에 `"host": "/Volumes/NAS/규정"`처럼 적어 주면 그 경로로 나와요.
@@ -418,7 +425,7 @@ $E openrag key list                 # 키 목록(앞 몇 글자만, 주인, 상�
 $E openrag key revoke <키 ID>        # 바로 막기. 그 키로 오는 요청은 401
 ```
 
-(`$E`는 7장의 `docker compose … exec -e OPENRAG_API_KEY openrag-api`예요.) 관리자가 아닌 사람은 자기 키만 보고
+(`$E`는 7장의 `docker compose … exec -e OPENRAG_API_KEY -e OPENRAG_API_URL=http://127.0.0.1:8080 openrag-api`예요.) 관리자가 아닌 사람은 자기 키만 보고
 막을 수 있어요.
 
 ## 9. 개인정보는 이렇게 다뤄요
@@ -593,7 +600,13 @@ vLLM처럼 OpenAI 호환 API를 주는 서버면 돼요. 등급 8 이상 문서�
 Docker에 Compose가 없어요. Ubuntu의 `docker.io` 패키지에는 Compose가 들어 있지 않아요(Ubuntu 24.04에서 확인).
 `sudo apt install docker-compose-v2`로 넣고 `docker compose version`이 나오는지 보세요. Docker 공식 저장소로
 설치했다면 패키지 이름이 `docker-compose-plugin`이에요. Ubuntu 패키지의 Compose 2.40.3이 이 저장소의 compose
-파일을 읽는 것까지 확인했고, 그 패키지로 서버를 띄워 보지는 못했어요.
+파일을 읽는 것까지 확인했고, 그 패키지로 서버를 띄워 보지는 못했어요. 패키지를 못 넣는 곳에서는 Compose 단독
+실행 파일(GitHub `docker/compose` 릴리스)을 받아 `docker compose` 대신 써도 돼요. v5.8.0으로 처음부터 빌드해 띄우고
+검색까지 확인했어요(Ubuntu 24.04, 2026-11-25).
+
+### 문서 폴더에 파일을 넣을 수 없음(`Permission denied`)
+문서 폴더가 없는 채로 서버를 띄워서, Docker가 그 폴더를 root 소유로 만들었어요(Linux). `sudo chown "$USER" <문서 폴더>`로
+주인을 바꾸면 돼요. 폴더를 먼저 만들어 두면(`mkdir -p`) 이렇게 되지 않아요.
 
 ### `required variable OPENRAG_PII_KEK_HEX is missing a value`
 3장의 `export OPENRAG_PII_KEK_HEX=…`를 빠뜨렸어요. 처음 만든 값을 그대로 다시 넣으세요.
@@ -618,7 +631,7 @@ Codex를 실행한 셸에 `OPENRAG_API_KEY`가 없을 가능성이 커요. `echo
 보세요. 받는 중이었다면 다 받은 뒤 3장 명령을 한 번 더 실행하면 `openrag-api`가 떠요.
 
 ### `no space left on device`
-Docker가 쓰는 디스크가 꽉 찼어요. 처음 띄울 때는 12GB쯤 필요해요(이미지 3.8GB, 빌드 캐시 6GB쯤, 모델 1.5GB).
+Docker가 쓰는 디스크가 꽉 찼어요. 처음 띄울 때는 12GB쯤 필요해요(이미지 3.8~4.5GB, 빌드 캐시 6GB쯤, 모델 1.5GB).
 `docker system df`로 무엇이 자리를 차지하는지 보세요. 빌드 캐시(`Build Cache`)가 크면 `docker builder prune -a`로
 지울 수 있어요. 다른 프로젝트의 빌드 캐시도 같이 지워지니, 다음 빌드가 조금 느려지는 것 말고는 문제없어요. 그래도
 모자라면 Docker Desktop 설정에서 디스크 크기를 늘리세요. 자리를 만든 뒤 같은 `up -d` 명령을 다시 실행해요. 처음

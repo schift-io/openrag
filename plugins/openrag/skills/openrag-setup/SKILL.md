@@ -170,8 +170,9 @@ curl -s http://127.0.0.1:<API 포트>/mcp \
 ## 설치 뒤에 하는 일
 
 관리자 키가 필요하다. `docker/.openrag-init.json`에 있으면 거기서 읽고, 없으면 사용자에게 받거나 init을 다시
-실행해 새로 받는다. 아래 `$E`는 `docker compose -f docker/docker-compose.yml exec -T -e OPENRAG_API_KEY openrag-api`다
-(`OPENRAG_API_KEY`에 관리자 키를 넣고 실행). HTTPS를 켰으면 모든 compose 명령에 `-f docker/docker-compose.https.yml`을 더한다.
+실행해 새로 받는다. 아래 `$E`는 `docker compose -f docker/docker-compose.yml exec -T -e OPENRAG_API_KEY -e OPENRAG_API_URL=http://127.0.0.1:8080 openrag-api`다
+(`OPENRAG_API_KEY`에 관리자 키를 넣고 실행). `OPENRAG_API_URL`을 빼면 `docs status`·`docs scan`이 돌고 있는 서버를 못 보고
+`"watching": false`로 잘못 답한다. HTTPS를 켰으면 모든 compose 명령에 `-f docker/docker-compose.https.yml`을 더한다.
 
 - **상태 점검**: `$E openrag docs status` — 폴더별 파일 수, 문서 수, 실패한 파일과 이유, 진행 중인 반영.
   실패 이유별로 가이드 13장(스캔 PDF·OCR), 9장(비밀값 차단)을 안내한다. 지금 바로 훑으려면 `$E openrag docs scan`.
