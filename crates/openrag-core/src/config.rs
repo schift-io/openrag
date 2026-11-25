@@ -22,10 +22,22 @@ pub struct OcrModeRule {
     pub required_mode: Sensitivity,
 }
 
+fn default_pdf_engine() -> String {
+    "kordoc".to_string()
+}
+
+const fn default_kordoc_ocr() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParseConfig {
     pub hwp_engine: String,
+    #[serde(default = "default_pdf_engine")]
+    pub pdf_engine: String,
+    #[serde(default = "default_kordoc_ocr")]
+    pub kordoc_ocr: bool,
     pub ocr_engine: String,
     pub dewarp_enabled: bool,
     pub pdf_native_enabled: bool,
@@ -139,7 +151,7 @@ pub enum ChunkerKind {
 }
 
 const fn default_embed_document_title() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,7 +166,7 @@ pub struct StoreConfig {
     pub outbox_max_attempts: u32,
     #[serde(default)]
     pub pg_pinecone_search: PgPineconeSearchConfig,
-    /// Include the document title when embedding corpus chunks.
+    /// Include the document title when embedding corpus chunks (default off).
     #[serde(default = "default_embed_document_title")]
     pub embed_document_title: bool,
     /// Page chunking strategy (`fixed`, `structure`, or `semantic`).

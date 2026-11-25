@@ -33,6 +33,8 @@ pub fn default_pipeline_config() -> PipelineConfig {
         profile: PipelineProfile::Standard,
         parse: ParseConfig {
             hwp_engine: "kordoc".into(),
+            pdf_engine: "kordoc".into(),
+            kordoc_ocr: true,
             ocr_engine: "schift_ocr".into(),
             dewarp_enabled: true,
             pdf_native_enabled: true,
@@ -110,7 +112,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
-            embed_document_title: true,
+            embed_document_title: false,
             chunker: ChunkerKind::Fixed,
         },
         retrieve: RetrieveConfig {
@@ -275,6 +277,9 @@ enum OcrModeMapOrList {
 struct TolerantParseConfig {
     #[serde(alias = "hwp")]
     hwp_engine: Option<String>,
+    #[serde(alias = "pdf")]
+    pdf_engine: Option<String>,
+    kordoc_ocr: Option<bool>,
     #[serde(alias = "ocr")]
     ocr_engine: Option<String>,
     #[serde(alias = "dewarp")]
@@ -395,6 +400,12 @@ pub fn parse_pipeline_yaml_with_profile(
     if let Some(p) = doc.parse {
         if let Some(v) = p.hwp_engine {
             cfg.parse.hwp_engine = v;
+        }
+        if let Some(v) = p.pdf_engine {
+            cfg.parse.pdf_engine = v;
+        }
+        if let Some(v) = p.kordoc_ocr {
+            cfg.parse.kordoc_ocr = v;
         }
         if let Some(v) = p.ocr_engine {
             cfg.parse.ocr_engine = v;

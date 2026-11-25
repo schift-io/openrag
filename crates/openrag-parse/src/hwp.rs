@@ -19,6 +19,8 @@ use crate::model::{sha256_hex_bytes, sha256_hex_str, DocumentFormat, ParsedDocum
 pub struct KordocCliConfig {
     pub bin_path: Option<PathBuf>,
     pub timeout: Duration,
+    /// Longer timeout for PDFs because local OCR on large scans can take minutes.
+    pub pdf_timeout: Duration,
 }
 
 impl Default for KordocCliConfig {
@@ -26,6 +28,7 @@ impl Default for KordocCliConfig {
         Self {
             bin_path: None,
             timeout: Duration::from_secs(30),
+            pdf_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -183,23 +186,24 @@ pub async fn parse_hwp_family(
     }
 }
 
+/// Resolves the kordoc CLI binary from explicit config, `OPENRAG_KORDOC_BIN`, or `PATH`.
+pub(crate) fn resolve_kordoc_bin(kordoc: Option<&KordocCliConfig>) -> Option<PathBuf> {
+    let bin = kordoc
+        .and_then(|c| c.bin_path.clone())
+        .or_else(|| std::env::var_os("OPENRAG_KORDOC_BIN").map(PathBuf::from))
+        .or_else(|| find_on_path("kordoc"))?;
+    bin.exists().then_some(bin)
+}
+
 async fn try_kordoc_cli(
     bytes: &[u8],
     filename: Option<&str>,
     format: DocumentFormat,
     kordoc: Option<&KordocCliConfig>,
 ) -> Result<Option<ParsedDocument>, OpenRagError> {
-    let bin = kordoc
-        .and_then(|c| c.bin_path.clone())
-        .or_else(|| std::env::var_os("OPENRAG_KORDOC_BIN").map(PathBuf::from))
-        .or_else(|| find_on_path("kordoc"));
-
-    let Some(bin_path) = bin else {
+    let Some(bin_path) = resolve_kordoc_bin(kordoc) else {
         return Ok(None);
     };
-    if !bin_path.exists() {
-        return Ok(None);
-    }
 
     let timeout = kordoc.map_or_else(|| Duration::from_secs(30), |c| c.timeout);
     let ext = match format {
@@ -277,7 +281,7 @@ fn find_on_path(bin_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn extract_tables_from_text(text: &str) -> Vec<String> {
+pub(crate) fn extract_tables_from_text(text: &str) -> Vec<String> {
     let mut tables = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<table") {

@@ -596,6 +596,8 @@ pub fn default_pipeline_config() -> PipelineConfig {
         profile: PipelineProfile::Standard,
         parse: ParseConfig {
             hwp_engine: "kordoc".into(),
+            pdf_engine: "kordoc".into(),
+            kordoc_ocr: true,
             ocr_engine: "schift_ocr".into(),
             dewarp_enabled: true,
             pdf_native_enabled: true,
@@ -662,7 +664,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
-            embed_document_title: true,
+            embed_document_title: false,
             chunker: ChunkerKind::Fixed,
         },
         retrieve: RetrieveConfig {

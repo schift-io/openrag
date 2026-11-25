@@ -97,6 +97,8 @@ async fn live_parse_persist_under_rls_and_peer_isolation() -> Result<(), Box<dyn
 
     let parse_cfg = ParseConfig {
         hwp_engine: "kordoc".into(),
+        pdf_engine: "kordoc".into(),
+        kordoc_ocr: true,
         ocr_engine: "schift_ocr".into(),
         dewarp_enabled: true,
         pdf_native_enabled: true,

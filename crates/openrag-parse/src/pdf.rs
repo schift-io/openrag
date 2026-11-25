@@ -423,6 +423,8 @@ pub(crate) mod tests {
     pub(crate) fn test_parse_cfg() -> ParseConfig {
         ParseConfig {
             hwp_engine: "kordoc".into(),
+            pdf_engine: "kordoc".into(),
+            kordoc_ocr: true,
             ocr_engine: "schift_ocr".into(),
             dewarp_enabled: false,
             pdf_native_enabled: true,
