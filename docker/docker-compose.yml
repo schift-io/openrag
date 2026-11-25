@@ -1,3 +1,6 @@
+# Fixed project name: volumes and the network are openrag_* whatever the folder is called.
+name: openrag
+
 services:
   postgres:
     build:
