@@ -37,6 +37,12 @@ pub enum OpenRagError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("remote OCR consent required ({pages_needing_ocr} of {total_pages} pages)")]
+    RemoteOcrConsentRequired {
+        pages_needing_ocr: usize,
+        total_pages: usize,
+    },
+
     #[error("external adapter error ({adapter}): {message}")]
     ExternalAdapter { adapter: String, message: String },
 

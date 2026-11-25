@@ -915,3 +915,773 @@ async fn modern_tasks_lifecycle_isolation_cancel_and_cap() -> anyhow::Result<()>
 
     Ok(())
 }
+
+// ============================================================================
+// Part B (Elicitation over MRTR & Tasks) and Part C (File Uploads) offline tests
+// ============================================================================
+
+#[tokio::test]
+async fn mcp_part_b_elicitation_mrtr_sync_and_request_state_guards() -> anyhow::Result<()> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use http::StatusCode;
+    use openrag_server::mcp::{IngestDispatchHook, IngestDispatchRequest};
+    use std::sync::Mutex;
+
+    let recorded: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec_clone = Arc::clone(&recorded);
+    let hook: IngestDispatchHook = Arc::new(move |req: IngestDispatchRequest| {
+        let rec = Arc::clone(&rec_clone);
+        Box::pin(async move {
+            if let Ok(mut guard) = rec.lock() {
+                guard.push(req.remote_ocr.clone());
+            }
+            if req.remote_ocr.as_deref() == Some("ask") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "remote_ocr_consent_required",
+                        "code": "remote_ocr_consent_required",
+                        "message": "2 of 5 pages require consent",
+                        "pages_needing_ocr": 2,
+                        "total_pages": 5,
+                    }),
+                ));
+            }
+            Ok((
+                StatusCode::CREATED,
+                json!({
+                    "document_id": Uuid::new_v4(),
+                    "file_name": req.file_name,
+                    "remote_ocr": req.remote_ocr,
+                }),
+            ))
+        })
+    });
+
+    let state = AppState::new_offline_for_test()?.with_mcp_ingest_hook(hook);
+    let org_id = Uuid::new_v4();
+    let alice = PrincipalContext::new(org_id, Uuid::new_v4(), AuthLevel::new(5)?);
+    let bob = PrincipalContext::new(org_id, Uuid::new_v4(), AuthLevel::new(5)?);
+    let alice_engine = McpEngine::for_stdio_with_principal(Arc::clone(&state), alice);
+    let bob_engine = McpEngine::for_stdio_with_principal(Arc::clone(&state), bob);
+
+    let tmp = tempfile::tempdir()?;
+    let pdf_path = tmp.path().join("report.pdf");
+    std::fs::write(&pdf_path, b"%PDF-1.4\nfake")?;
+    let pdf_str = pdf_path.display().to_string();
+
+    // 1. Client without elicitation -> no remote_ocr field, completes directly.
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "_meta": modern_meta("2026-07-28", json!({}))
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_modern_envelope(&resp["result"], "complete", false);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(resp["result"]["structuredContent"]["remote_ocr"], Value::Null);
+
+    // 2. Client with URL-only elicitation -> never emits form elicitation/create.
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "_meta": modern_meta("2026-07-28", json!({ "elicitation": { "url": {} } }))
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_modern_envelope(&resp["result"], "complete", false);
+    assert_eq!(resp["result"]["isError"], false);
+
+    // 3. Client with empty `elicitation: {}` (counts as form) -> InputRequiredResult!
+    let elicit_empty_caps = json!({ "elicitation": {} });
+    let elicit_full_caps = json!({ "roots": { "listChanged": true }, "elicitation": { "form": {}, "url": {} } });
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "_meta": modern_meta("2026-07-28", elicit_empty_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_modern_envelope(&resp["result"], "input_required", false);
+    let elicit = &resp["result"]["inputRequests"]["remote_ocr"];
+    assert_eq!(elicit["method"], "elicitation/create");
+    assert_eq!(elicit["params"]["mode"], "form");
+    assert_eq!(
+        elicit["params"]["message"],
+        "report.pdf: 2 of 5 pages have no readable text. Send those pages to Schift OCR, a cloud service, to read them? If not, they are stored without text."
+    );
+    assert_eq!(elicit["params"]["requestedSchema"]["properties"]["send"]["type"], "boolean");
+    assert_eq!(elicit["params"]["requestedSchema"]["properties"]["send"]["title"], "Send to Schift OCR");
+    assert_eq!(elicit["params"]["requestedSchema"]["properties"]["send"]["default"], false);
+    assert_eq!(elicit["params"]["requestedSchema"]["required"], json!(["send"]));
+    let state_1 = resp["result"]["requestState"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing requestState"))?
+        .to_string();
+
+    // 4. Tampered requestState -> -32602.
+    let (p_b64, s_b64) = state_1
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("expected dot in requestState"))?;
+    let mut sig = URL_SAFE_NO_PAD.decode(s_b64)?;
+    sig[0] ^= 0x55;
+    let tampered = format!("{p_b64}.{}", URL_SAFE_NO_PAD.encode(sig));
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "requestState": tampered,
+                "inputResponses": { "remote_ocr": { "action": "accept", "content": { "send": true } } },
+                "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // 5. Other principal presenting alice's requestState -> -32602.
+    let resp = bob_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "requestState": state_1,
+                "inputResponses": { "remote_ocr": { "action": "accept", "content": { "send": true } } },
+                "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // 6. Missing response -> re-asks with fresh requestState, consumes old one.
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "requestState": state_1,
+                "inputResponses": { "ignored_unknown": { "action": "accept" } },
+                "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_modern_envelope(&resp["result"], "input_required", false);
+    let state_2 = resp["result"]["requestState"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing re-asked requestState"))?
+        .to_string();
+    assert_ne!(state_1, state_2);
+
+    // Replaying consumed state_1 -> -32602.
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "requestState": state_1,
+                "inputResponses": { "remote_ocr": { "action": "accept", "content": { "send": true } } },
+                "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // 7. Accept with send: true (ignoring extra unknown key) -> remote_ocr=allow!
+    let resp = alice_engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "requestState": state_2,
+                "inputResponses": {
+                    "remote_ocr": { "action": "accept", "content": { "send": true } },
+                    "extra_key": { "action": "decline" }
+                },
+                "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected response"))?;
+    assert_modern_envelope(&resp["result"], "complete", false);
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(resp["result"]["structuredContent"]["remote_ocr"], "allow");
+
+    // 8. Accept with send: false, decline, and cancel.
+    for (idx, (input_resp, expect_is_err, expect_remote_ocr)) in [
+        (json!({ "action": "accept", "content": { "send": false } }), false, Some("deny")),
+        (json!({ "action": "decline" }), false, Some("deny")),
+        (json!({ "action": "cancel" }), true, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let init = alice_engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 20 + idx,
+                "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "path": pdf_str },
+                    "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+                }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected init response"))?;
+        assert_eq!(init["result"]["resultType"], "input_required");
+        let rs = init["result"]["requestState"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing requestState"))?;
+
+        let retry = alice_engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 30 + idx,
+                "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "path": pdf_str },
+                    "requestState": rs,
+                    "inputResponses": { "remote_ocr": input_resp },
+                    "_meta": modern_meta("2026-07-28", elicit_full_caps.clone())
+                }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected retry response"))?;
+        assert_modern_envelope(&retry["result"], "complete", false);
+        assert_eq!(retry["result"]["isError"], expect_is_err);
+        if let Some(expected) = expect_remote_ocr {
+            assert_eq!(retry["result"]["structuredContent"]["remote_ocr"], expected);
+        } else {
+            let txt = retry["result"]["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(txt.contains("cancelled"), "expected cancelled message: {txt}");
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_part_b_elicitation_inside_task_lifecycle() -> anyhow::Result<()> {
+    use http::StatusCode;
+    use openrag_server::mcp::{IngestDispatchHook, IngestDispatchRequest};
+
+    let hook: IngestDispatchHook = Arc::new(|req: IngestDispatchRequest| {
+        Box::pin(async move {
+            if req.remote_ocr.as_deref() == Some("ask") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "remote_ocr_consent_required",
+                        "code": "remote_ocr_consent_required",
+                        "message": "1 of 3 pages require consent",
+                        "pages_needing_ocr": 1,
+                        "total_pages": 3,
+                    }),
+                ));
+            }
+            Ok((
+                StatusCode::CREATED,
+                json!({
+                    "document_id": Uuid::new_v4(),
+                    "remote_ocr": req.remote_ocr,
+                }),
+            ))
+        })
+    });
+
+    let state = AppState::new_offline_for_test()?.with_mcp_ingest_hook(hook);
+    let store = Arc::new(TaskStore::new());
+    let alice = PrincipalContext::new(Uuid::new_v4(), Uuid::new_v4(), AuthLevel::new(5)?);
+    let engine = McpEngine::for_stdio_with_principal(state, alice).with_task_store(store);
+
+    let tmp = tempfile::tempdir()?;
+    let pdf_path = tmp.path().join("scan.pdf");
+    std::fs::write(&pdf_path, b"%PDF-1.4\nscan")?;
+    let pdf_str = pdf_path.display().to_string();
+
+    let caps = json!({
+        "elicitation": { "form": {}, "url": {} },
+        "extensions": { "io.modelcontextprotocol/tasks": {} }
+    });
+
+    // 1. Start task -> returns CreateTaskResult with working.
+    let create = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected create response"))?;
+    assert_modern_envelope(&create["result"], "task", false);
+    assert_eq!(create["result"]["status"], "working");
+    let task_id = create["result"]["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing taskId"))?
+        .to_string();
+
+    // 2. Poll tasks/get until input_required with key `remote_ocr-1`.
+    let mut input_task = Value::Null;
+    for _ in 0..40 {
+        let r = engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tasks/get",
+                "params": { "taskId": task_id, "_meta": modern_meta("2026-07-28", caps.clone()) }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected tasks/get"))?;
+        if r["result"]["status"] == "input_required" {
+            input_task = r["result"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(input_task["status"], "input_required");
+    assert_eq!(
+        input_task["inputRequests"]["remote_ocr-1"]["method"],
+        "elicitation/create"
+    );
+
+    // 3. Unknown key on tasks/update is ignored; task remains input_required.
+    let upd_ignored = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tasks/update",
+            "params": {
+                "taskId": task_id,
+                "inputResponses": { "stale_key": { "action": "accept", "content": { "send": true } } },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected tasks/update"))?;
+    assert_modern_envelope(&upd_ignored["result"], "complete", false);
+    let still_waiting = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tasks/get",
+            "params": { "taskId": task_id, "_meta": modern_meta("2026-07-28", caps.clone()) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected tasks/get"))?;
+    assert_eq!(still_waiting["result"]["status"], "input_required");
+    assert!(still_waiting["result"]["inputRequests"]["remote_ocr-1"].is_object());
+
+    // 4. Malformed answer on remote_ocr-1 -> re-asks with unique key `remote_ocr-2`!
+    let _ = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tasks/update",
+            "params": {
+                "taskId": task_id,
+                "inputResponses": { "remote_ocr-1": { "action": "accept" } },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await;
+    let mut second_ask = Value::Null;
+    for _ in 0..40 {
+        let r = engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tasks/get",
+                "params": { "taskId": task_id, "_meta": modern_meta("2026-07-28", caps.clone()) }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected tasks/get"))?;
+        if r["result"]["status"] == "input_required"
+            && r["result"]["inputRequests"].get("remote_ocr-2").is_some()
+        {
+            second_ask = r["result"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(second_ask["inputRequests"]["remote_ocr-2"].is_object());
+    assert!(second_ask["inputRequests"].get("remote_ocr-1").is_none());
+
+    // 5. Answer remote_ocr-2 with accept/true -> completes with remote_ocr=allow!
+    let upd_ok = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tasks/update",
+            "params": {
+                "taskId": task_id,
+                "inputResponses": { "remote_ocr-2": { "action": "accept", "content": { "send": true } } },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected tasks/update"))?;
+    assert_modern_envelope(&upd_ok["result"], "complete", false);
+
+    let mut completed = Value::Null;
+    for _ in 0..40 {
+        let r = engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tasks/get",
+                "params": { "taskId": task_id, "_meta": modern_meta("2026-07-28", caps.clone()) }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected tasks/get"))?;
+        if r["result"]["status"] == "completed" {
+            completed = r["result"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["result"]["isError"], false);
+    assert_eq!(completed["result"]["structuredContent"]["remote_ocr"], "allow");
+
+    // 6. Cancel in task -> completed with isError: true.
+    let create2 = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": { "bucket": "docs", "path": pdf_str },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected create2"))?;
+    let tid2 = create2["result"]["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing tid2"))?
+        .to_string();
+    for _ in 0..40 {
+        let r = engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tasks/get",
+                "params": { "taskId": tid2, "_meta": modern_meta("2026-07-28", caps.clone()) }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected get2"))?;
+        if r["result"]["status"] == "input_required" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let _ = engine
+        .handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tasks/update",
+            "params": {
+                "taskId": tid2,
+                "inputResponses": { "remote_ocr-1": { "action": "cancel" } },
+                "_meta": modern_meta("2026-07-28", caps.clone())
+            }
+        }))
+        .await;
+    let mut cancelled_done = Value::Null;
+    for _ in 0..40 {
+        let r = engine
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tasks/get",
+                "params": { "taskId": tid2, "_meta": modern_meta("2026-07-28", caps.clone()) }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected get2 done"))?;
+        if r["result"]["status"] == "completed" {
+            cancelled_done = r["result"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(cancelled_done["status"], "completed");
+    assert_eq!(cancelled_done["result"]["isError"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_part_c_flag_gating_discover_tools_list_and_inline_validation() -> anyhow::Result<()> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+    use http::StatusCode;
+    use openrag_server::mcp::{IngestDispatchHook, IngestDispatchRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&hook_calls);
+    let hook: IngestDispatchHook = Arc::new(move |req: IngestDispatchRequest| {
+        let calls = Arc::clone(&calls_clone);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                StatusCode::CREATED,
+                json!({
+                    "file_name": req.file_name,
+                    "mime_type": req.mime_type,
+                    "bytes_len": req.bytes.len(),
+                }),
+            ))
+        })
+    });
+
+    let base_state = AppState::new_offline_for_test()?.with_mcp_ingest_hook(hook);
+    let off_state = base_state.with_mcp_file_uploads(false);
+    let on_state = base_state.with_mcp_file_uploads(true);
+    let alice = PrincipalContext::new(Uuid::new_v4(), Uuid::new_v4(), AuthLevel::new(5)?);
+
+    let files_caps = json!({ "extensions": { "io.modelcontextprotocol/files": { "upload": {} } } });
+
+    // 1. Flag OFF -> discover and tools/list unchanged even if client declares files extension.
+    let http_off = McpEngine::for_http(Arc::clone(&off_state), alice.clone());
+    let disc_off = http_off
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": { "_meta": modern_meta("2026-07-28", files_caps.clone()) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected discover"))?;
+    assert!(disc_off["result"]["capabilities"]["extensions"]
+        .get("io.modelcontextprotocol/files")
+        .is_none());
+    let list_off = http_off
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": { "_meta": modern_meta("2026-07-28", files_caps.clone()) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected list"))?;
+    assert_eq!(list_off["result"]["tools"], json!(tool_definitions()));
+
+    // 2. Flag ON -> HTTP discover advertises upload + maxInlineBytes; stdio omits upload.
+    let http_on = McpEngine::for_http(Arc::clone(&on_state), alice.clone());
+    let stdio_on = McpEngine::for_stdio_with_principal(Arc::clone(&on_state), alice);
+
+    let disc_http = http_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "server/discover",
+            "params": { "_meta": modern_meta("2026-07-28", json!({})) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected http discover"))?;
+    assert_eq!(
+        disc_http["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/files"],
+        json!({ "upload": {}, "maxInlineBytes": 4_194_304 })
+    );
+
+    let disc_stdio = stdio_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "server/discover",
+            "params": { "_meta": modern_meta("2026-07-28", json!({})) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected stdio discover"))?;
+    assert_eq!(
+        disc_stdio["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/files"],
+        json!({ "maxInlineBytes": 4_194_304 })
+    );
+
+    // 3. Flag ON -> tools/list adds `file` ONLY when client declared files extension.
+    let list_no_decl = http_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/list",
+            "params": { "_meta": modern_meta("2026-07-28", json!({})) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected list"))?;
+    assert_eq!(list_no_decl["result"]["tools"], json!(tool_definitions()));
+
+    let list_with_decl = http_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/list",
+            "params": { "_meta": modern_meta("2026-07-28", files_caps.clone()) }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected list"))?;
+    let ingest_tool = list_with_decl["result"]["tools"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"] == "rag_ingest"))
+        .ok_or_else(|| anyhow::anyhow!("rag_ingest missing"))?;
+    let file_prop = &ingest_tool["inputSchema"]["properties"]["file"];
+    assert_eq!(file_prop["x-mcp-file"]["maxSize"], 67_108_864);
+    assert!(file_prop["x-mcp-file"]["accept"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "application/pdf") && a.iter().any(|v| v == ".hwpx")));
+    assert_eq!(file_prop["required"], json!(["id", "mimeType", "size"]));
+
+    // 4. Inline OK (even WITHOUT declaring files extension!) with name sanitization + digest.
+    let raw_bytes = b"Hello inline document!";
+    let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(raw_bytes));
+    let b64 = STANDARD.encode(raw_bytes);
+    let ok_inline = http_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": {
+                    "bucket": "docs",
+                    "file": {
+                        "id": "f1",
+                        "name": "dir/sub\\notes.txt",
+                        "mimeType": "text/plain",
+                        "size": raw_bytes.len(),
+                        "digest": { "algorithm": "sha-256", "value": digest },
+                        "data": b64
+                    }
+                },
+                "_meta": modern_meta("2026-07-28", json!({}))
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected inline ok"))?;
+    assert_eq!(ok_inline["result"]["isError"], false);
+    assert_eq!(ok_inline["result"]["structuredContent"]["file_name"], "notes.txt");
+    assert_eq!(ok_inline["result"]["structuredContent"]["mime_type"], "text/plain");
+    assert_eq!(ok_inline["result"]["structuredContent"]["bytes_len"], raw_bytes.len());
+
+    // Dot/empty name falls back to "document".
+    let dot_name = http_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": {
+                    "bucket": "docs",
+                    "file": {
+                        "id": "f2",
+                        "name": "../..",
+                        "mimeType": "text/plain",
+                        "size": raw_bytes.len(),
+                        "data": b64
+                    }
+                },
+                "_meta": modern_meta("2026-07-28", json!({}))
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected dot name ok"))?;
+    assert_eq!(dot_name["result"]["isError"], false);
+    assert_eq!(dot_name["result"]["structuredContent"]["file_name"], "document");
+
+    let calls_before_errors = hook_calls.load(Ordering::SeqCst);
+
+    // 5. Every inline failure returns isError: true without running the tool.
+    let bad_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(b"different"));
+    let inline_bad_cases = [
+        // Undecodable base64
+        json!({ "id": "e1", "mimeType": "text/plain", "size": 5, "data": "***bad***" }),
+        // Null data
+        json!({ "id": "e2", "mimeType": "text/plain", "size": 5, "data": Value::Null }),
+        // Decoded length != size
+        json!({ "id": "e3", "mimeType": "text/plain", "size": 99, "data": b64 }),
+        // Size > maxInlineBytes (4 MiB)
+        json!({ "id": "e4", "mimeType": "text/plain", "size": 4_194_305, "data": b64 }),
+        // Size > maxSize (64 MiB)
+        json!({ "id": "e5", "mimeType": "text/plain", "size": 67_108_865, "data": b64 }),
+        // Digest mismatch
+        json!({ "id": "e6", "mimeType": "text/plain", "size": raw_bytes.len(), "digest": { "algorithm": "sha-256", "value": bad_digest }, "data": b64 }),
+        // Unsupported type
+        json!({ "id": "e7", "mimeType": "video/mp4", "size": raw_bytes.len(), "data": b64 }),
+        // Empty file with no data (must NOT issue upload target)
+        json!({ "id": "e8", "mimeType": "text/plain", "size": 0 }),
+    ];
+    for (i, file_val) in inline_bad_cases.into_iter().enumerate() {
+        let r = http_on
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 100 + i, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_val },
+                    "_meta": modern_meta("2026-07-28", files_caps.clone())
+                }
+            }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("expected error resp"))?;
+        assert_eq!(r["result"]["resultType"], "complete", "case {i}: {r:?}");
+        assert_eq!(r["result"]["isError"], true, "case {i}: {r:?}");
+    }
+
+    // Out-of-band over stdio -> isError telling client to use `path`.
+    let stdio_oob = stdio_on
+        .handle_message(json!({
+            "jsonrpc": "2.0", "id": 200, "method": "tools/call",
+            "params": {
+                "name": "rag_ingest",
+                "arguments": {
+                    "bucket": "docs",
+                    "file": { "id": "s1", "name": "a.pdf", "mimeType": "application/pdf", "size": 100 }
+                },
+                "_meta": modern_meta("2026-07-28", files_caps)
+            }
+        }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("expected stdio oob"))?;
+    assert_eq!(stdio_oob["result"]["isError"], true);
+    assert!(stdio_oob["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("path"));
+
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        calls_before_errors,
+        "none of the failed cases may invoke ingest"
+    );
+
+    Ok(())
+}

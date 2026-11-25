@@ -501,6 +501,7 @@ async fn studio_pipeline_test_handler(
             batch: false,
             ocr_task: OcrTask::Markdown,
             tenant_key: Some(principal.org_id.to_string()),
+            ..Default::default()
         },
     )
     .map_err(ApiError::from)?;

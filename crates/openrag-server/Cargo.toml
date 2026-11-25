@@ -58,6 +58,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

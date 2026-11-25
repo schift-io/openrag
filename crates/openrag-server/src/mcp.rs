@@ -16,19 +16,24 @@
 //! their queries inside `begin_rls_tx` and apply the API-key ARN scope.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path as FsPath;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, HOST, ORIGIN};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::http::header::{ACCEPT, ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{post, put};
 use axum::Router;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use chrono::Utc;
+use http_body_util::BodyExt as _;
 use openrag_core::{
     AccessScope, Arn, ArnResourceType, AuthLevel, MemoryBackendKind, OpenRagError,
     PrincipalContext,
@@ -38,6 +43,7 @@ use openrag_memory::{
     WikiPage, WikiStatus,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tower::ServiceExt;
@@ -46,11 +52,17 @@ use uuid::Uuid;
 use crate::api_core::{resolve_bucket_rls, resolve_org_and_dept_paths};
 use crate::auth::{authenticate_bearer_token, enforce_api_key_arn_scope, AuthPrincipal, TrustedPrincipal};
 use crate::llm_router::{neutralize_literal_pii_tokens, seal_text_for_llm};
+use crate::mcp_mrtr::{
+    canonical_args_sha256, random_token_128, sign_request_state, verify_request_state,
+    PutClaimError, RequestStateKind, RequestStatePayload, StagedUploadBinding, StagedUploadGuard,
+    MAX_FILE_UPLOAD_BYTES, MAX_INLINE_BYTES, REQUEST_STATE_TTL_SECS, REQUEST_STATE_VERSION,
+    UPLOAD_TARGET_TTL_SECS,
+};
 use crate::mcp_skills;
 use crate::mcp_tasks::{default_task_store, PrincipalKey};
 #[doc(hidden)]
 pub use crate::mcp_tasks::{TaskHookFn, TaskHookOutcome, TaskStore};
-use crate::state::AppState;
+use crate::state::{mcp_file_uploads_from_env, AppState};
 
 /// The exact, ordered MCP tool registry.
 pub const MCP_TOOL_NAMES: [&str; 16] = [
@@ -86,6 +98,68 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 const EXT_SKILLS: &str = "io.modelcontextprotocol/skills";
 const EXT_TASKS: &str = "io.modelcontextprotocol/tasks";
+const EXT_FILES: &str = "io.modelcontextprotocol/files";
+
+/// Supported media types and dot-extensions matching `openrag-parse`'s `DocumentFormat`.
+const MCP_FILE_ACCEPT: [&str; 35] = [
+    "application/pdf",
+    "application/vnd.hancom.hwpx",
+    "application/vnd.hancom.hml",
+    "application/x-hwp",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "text/markdown",
+    "text/plain",
+    "text/html",
+    "text/csv",
+    "text/tab-separated-values",
+    ".pdf",
+    ".hwpx",
+    ".hml",
+    ".hwp",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".xlsm",
+    ".csv",
+    ".tsv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".html",
+    ".htm",
+    ".xhtml",
+];
+
+/// Request details passed to an optional test hook intercepting `rag_ingest` file dispatch.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct IngestDispatchRequest {
+    pub bucket: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub remote_ocr: Option<String>,
+}
+
+/// Optional test hook intercepting the in-process REST dispatch of `rag_ingest` file uploads.
+#[doc(hidden)]
+pub type IngestDispatchHook = Arc<
+    dyn Fn(
+            IngestDispatchRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(StatusCode, Value), (StatusCode, Value)>> + Send>,
+        > + Send
+        + Sync,
+>;
 
 const CACHE_TTL_MS: u64 = 300_000;
 const CACHE_SCOPE_PRIVATE: &str = "private";
@@ -163,6 +237,7 @@ pub struct McpEngine {
     caller: CallerSource,
     tasks: Arc<TaskStore>,
     task_hook: Option<TaskHookFn>,
+    file_uploads_override: Option<bool>,
 }
 
 struct RpcError {
@@ -212,6 +287,22 @@ impl RpcError {
                 "requiredCapabilities": {
                     "extensions": {
                         EXT_TASKS: {},
+                    }
+                }
+            }),
+        )
+    }
+
+    fn missing_files_upload_capability() -> Self {
+        Self::with_data(
+            JSONRPC_MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "Missing required client capability",
+            json!({
+                "requiredCapabilities": {
+                    "extensions": {
+                        EXT_FILES: {
+                            "upload": {},
+                        },
                     }
                 }
             }),
@@ -277,12 +368,14 @@ impl From<OpenRagError> for ToolFailure {
 impl McpEngine {
     /// HTTP transport: the caller was already authenticated by the `/mcp` handler.
     pub fn for_http(state: Arc<AppState>, principal: PrincipalContext) -> Self {
+        let file_uploads_override = state.mcp_file_uploads_override;
         Self {
             transport: McpTransport::Http,
             state: StateSource::Ready(state),
             caller: CallerSource::Principal(Box::new(principal)),
             tasks: default_task_store(),
             task_hook: None,
+            file_uploads_override,
         }
     }
 
@@ -298,11 +391,13 @@ impl McpEngine {
             },
             tasks: default_task_store(),
             task_hook: None,
+            file_uploads_override: None,
         }
     }
 
     /// Stdio transport over an already-built state (used by tests and `openrag serve` embeds).
     pub fn for_stdio_with_state(state: Arc<AppState>, opts: StdioOptions) -> Self {
+        let file_uploads_override = state.mcp_file_uploads_override;
         Self {
             transport: McpTransport::Stdio,
             state: StateSource::Ready(state),
@@ -312,6 +407,21 @@ impl McpEngine {
             },
             tasks: default_task_store(),
             task_hook: None,
+            file_uploads_override,
+        }
+    }
+
+    /// Stdio transport over an already-built state with an injected principal (for offline tests).
+    #[doc(hidden)]
+    pub fn for_stdio_with_principal(state: Arc<AppState>, principal: PrincipalContext) -> Self {
+        let file_uploads_override = state.mcp_file_uploads_override;
+        Self {
+            transport: McpTransport::Stdio,
+            state: StateSource::Ready(state),
+            caller: CallerSource::Principal(Box::new(principal)),
+            tasks: default_task_store(),
+            task_hook: None,
+            file_uploads_override,
         }
     }
 
@@ -327,6 +437,23 @@ impl McpEngine {
     pub fn with_task_hook(mut self, hook: TaskHookFn) -> Self {
         self.task_hook = Some(hook);
         self
+    }
+
+    /// Overrides the `OPENRAG_MCP_FILE_UPLOADS` feature flag for isolated tests.
+    #[doc(hidden)]
+    pub fn with_file_uploads(mut self, enabled: bool) -> Self {
+        self.file_uploads_override = Some(enabled);
+        self
+    }
+
+    fn file_uploads_enabled(&self) -> bool {
+        if let Some(enabled) = self.file_uploads_override {
+            return enabled;
+        }
+        if let StateSource::Ready(s) = &self.state {
+            return s.mcp_file_uploads_enabled();
+        }
+        mcp_file_uploads_from_env()
     }
 
     /// Handles one decoded JSON-RPC payload (single message or batch).
@@ -427,11 +554,20 @@ impl McpEngine {
         let client_caps = extract_client_capabilities(params)?;
 
         match method {
-            "server/discover" => Ok(finalize_modern_result(discover_result(), "complete", true)),
+            "server/discover" => Ok(finalize_modern_result(
+                discover_result(self.transport, self.file_uploads_enabled()),
+                "complete",
+                true,
+            )),
             "tools/list" => {
                 validate_optional_cursor(params)?;
                 Ok(finalize_modern_result(
-                    json!({ "tools": tool_definitions() }),
+                    json!({
+                        "tools": tool_definitions_for_modern(
+                            self.file_uploads_enabled(),
+                            &client_caps,
+                        )
+                    }),
                     "complete",
                     true,
                 ))
@@ -493,6 +629,58 @@ impl McpEngine {
         let (name, args) = parse_tool_call_params(params)?;
         let supports_tasks = client_supports_tasks(client_caps);
 
+        let incoming_request_state = match params.get("requestState") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(RpcError::new(
+                    JSONRPC_INVALID_PARAMS,
+                    "requestState must be a string",
+                ));
+            }
+        };
+        let input_responses = match params.get("inputResponses") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(m)) => Some(m),
+            Some(_) => {
+                return Err(RpcError::new(
+                    JSONRPC_INVALID_PARAMS,
+                    "inputResponses must be an object",
+                ));
+            }
+        };
+
+        if let Some(state_token) = incoming_request_state {
+            let ctx = match self.resolve_ctx().await {
+                Ok(ctx) => ctx,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let owner = PrincipalKey {
+                org_id: ctx.principal.org_id,
+                principal_id: ctx.principal.principal_id,
+            };
+            let verified = verify_request_state(
+                &ctx.state.master_kek,
+                &ctx.state.mcp_nonces,
+                state_token,
+                owner,
+                name,
+                &args,
+                Utc::now().timestamp(),
+            )
+            .map_err(|_| {
+                RpcError::new(
+                    JSONRPC_INVALID_PARAMS,
+                    "invalid, expired, consumed, or mismatched requestState",
+                )
+            })?;
+            return self
+                .handle_rag_ingest_retry(ctx, &args, client_caps, verified, input_responses)
+                .await;
+        }
+
         if let Some(hook) = &self.task_hook {
             if let Some(fut) = hook(name, &args) {
                 if supports_tasks {
@@ -549,15 +737,14 @@ impl McpEngine {
             }
         }
 
-        let is_ingest_file = name == "rag_ingest"
-            && args
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|p| !p.trim().is_empty());
+        if name == "rag_ingest" {
+            return self.handle_rag_ingest_initial(&args, client_caps).await;
+        }
+
         let is_watch_scan =
             name == "docs_status" && args.get("scan").and_then(Value::as_bool) == Some(true);
 
-        if supports_tasks && (is_ingest_file || is_watch_scan) {
+        if supports_tasks && is_watch_scan {
             let ctx = match self.resolve_ctx().await {
                 Ok(ctx) => ctx,
                 Err(fail) => {
@@ -568,23 +755,14 @@ impl McpEngine {
                 org_id: ctx.principal.org_id,
                 principal_id: ctx.principal.principal_id,
             };
-            let initial_msg = if is_ingest_file {
-                "Ingesting file..."
-            } else {
-                "Scanning documents folders..."
-            };
-            if let Some((task_id, create_payload)) =
-                self.tasks.try_create(owner, Some(initial_msg.to_string()))
+            if let Some((task_id, create_payload)) = self
+                .tasks
+                .try_create(owner, Some("Scanning documents folders...".to_string()))
             {
                 let tasks = Arc::clone(&self.tasks);
                 let tid = task_id.clone();
-                let tool_name = name.to_string();
                 let join = tokio::spawn(async move {
-                    let raw_outcome = if is_watch_scan {
-                        docs_status_scan_task(&ctx, &tasks, &tid).await
-                    } else {
-                        call_tool(&ctx, &tool_name, &args).await
-                    };
+                    let raw_outcome = docs_status_scan_task(&ctx, &tasks, &tid).await;
                     let final_outcome = match raw_outcome {
                         Ok(value) => seal_for_ai(&ctx, value).await,
                         Err(fail) => Err(fail),
@@ -600,10 +778,818 @@ impl McpEngine {
             }
         }
 
-        let sync_result = self
-            .tools_call_parsed(name, &args)
-            .await;
+        let sync_result = self.tools_call_parsed(name, &args).await;
         Ok(finalize_modern_result(sync_result, "complete", false))
+    }
+
+    async fn handle_rag_ingest_initial(
+        &self,
+        args: &Map<String, Value>,
+        client_caps: &Map<String, Value>,
+    ) -> Result<Value, RpcError> {
+        let file_uploads = self.file_uploads_enabled();
+        let has_path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.trim().is_empty());
+        let has_text = args.get("text").is_some_and(|v| !v.is_null());
+        let has_file = file_uploads && args.get("file").is_some_and(|v| !v.is_null());
+
+        if !file_uploads {
+            if !has_path || has_text {
+                let sync_result = self.tools_call_parsed("rag_ingest", args).await;
+                return Ok(finalize_modern_result(sync_result, "complete", false));
+            }
+            let ctx = match self.resolve_ctx().await {
+                Ok(ctx) => ctx,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let meta = match parse_rag_ingest_common_args(args) {
+                Ok(m) => m,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let path_str = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            return self
+                .execute_modern_file_ingest(
+                    ctx,
+                    args,
+                    meta,
+                    IngestFileSource::Path(path_str),
+                    client_caps,
+                    None,
+                )
+                .await;
+        }
+
+        let source_count = usize::from(has_path) + usize::from(has_text) + usize::from(has_file);
+        if source_count == 0 {
+            return Ok(finalize_modern_result(
+                tool_error(&ToolFailure::invalid(
+                    "pass exactly one of 'text', 'path', or 'file'",
+                )),
+                "complete",
+                false,
+            ));
+        }
+        if source_count > 1 {
+            return Ok(finalize_modern_result(
+                tool_error(&ToolFailure::invalid(
+                    "pass exactly one of 'text', 'path', or 'file', not multiple",
+                )),
+                "complete",
+                false,
+            ));
+        }
+
+        if has_text {
+            let sync_result = self.tools_call_parsed("rag_ingest", args).await;
+            return Ok(finalize_modern_result(sync_result, "complete", false));
+        }
+
+        let meta = match parse_rag_ingest_common_args(args) {
+            Ok(m) => m,
+            Err(fail) => {
+                return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+            }
+        };
+
+        if has_path {
+            let ctx = match self.resolve_ctx().await {
+                Ok(ctx) => ctx,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let path_str = args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            return self
+                .execute_modern_file_ingest(
+                    ctx,
+                    args,
+                    meta,
+                    IngestFileSource::Path(path_str),
+                    client_caps,
+                    None,
+                )
+                .await;
+        }
+
+        // `file` branch (Part C).
+        let file = match parse_file_input(args.get("file")) {
+            Ok(f) => f,
+            Err(fail) => {
+                return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+            }
+        };
+
+        if let Some(raw_data) = file.data {
+            // Inline upload: accepted even if request did not declare the files extension.
+            let decoded = match decode_and_validate_inline_file(&file, raw_data) {
+                Ok(bytes) => bytes,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let ctx = match self.resolve_ctx().await {
+                Ok(ctx) => ctx,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            };
+            let payload = IngestFilePayload {
+                file_name: sanitize_upload_file_name(file.name.as_deref()),
+                mime_type: file.mime_type,
+                bytes: decoded,
+            };
+            return self
+                .execute_modern_file_ingest(
+                    ctx,
+                    args,
+                    meta,
+                    IngestFileSource::Bytes(payload),
+                    client_caps,
+                    None,
+                )
+                .await;
+        }
+
+        // Empty file with no `data`: never issue an upload target (spec MUST).
+        if file.size == 0 {
+            if let Some(expected_digest) = file.digest.as_deref() {
+                let actual = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
+                if actual != expected_digest {
+                    return Ok(finalize_modern_result(
+                        tool_error(&ToolFailure::new(
+                            "digest_mismatch",
+                            "empty file SHA-256 digest does not match declared digest",
+                        )),
+                        "complete",
+                        false,
+                    ));
+                }
+            }
+            return Ok(finalize_modern_result(
+                tool_error(&ToolFailure::invalid("cannot ingest empty 0-byte file")),
+                "complete",
+                false,
+            ));
+        }
+
+        // Out-of-band upload (`size > 0`, no `data`).
+        if self.transport == McpTransport::Stdio {
+            return Ok(finalize_modern_result(
+                tool_error(&ToolFailure::invalid(
+                    "out-of-band file uploads are not supported over stdio; pass 'path' instead",
+                )),
+                "complete",
+                false,
+            ));
+        }
+        if !client_declares_files_upload(client_caps) {
+            return Err(RpcError::missing_files_upload_capability());
+        }
+        if let Err(fail) = validate_file_metadata(&file) {
+            return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+        }
+
+        let ctx = match self.resolve_ctx().await {
+            Ok(ctx) => ctx,
+            Err(fail) => {
+                return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+            }
+        };
+        let owner = PrincipalKey {
+            org_id: ctx.principal.org_id,
+            principal_id: ctx.principal.principal_id,
+        };
+        let now_utc = Utc::now();
+        let target_expires = now_utc + chrono::Duration::seconds(UPLOAD_TARGET_TTL_SECS);
+        let state_expires = now_utc + chrono::Duration::seconds(REQUEST_STATE_TTL_SECS);
+        let upload_id = match ctx
+            .state
+            .mcp_uploads
+            .register(
+                owner,
+                file.size,
+                target_expires.timestamp(),
+                state_expires.timestamp(),
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(msg) => {
+                return Ok(finalize_modern_result(
+                    tool_error(&ToolFailure::new("too_many_pending_uploads", msg)),
+                    "complete",
+                    false,
+                ));
+            }
+        };
+
+        let nonce = random_token_128()
+            .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+        let state_payload = RequestStatePayload {
+            v: REQUEST_STATE_VERSION,
+            kind: RequestStateKind::Upload,
+            org_id: owner.org_id,
+            principal_id: owner.principal_id,
+            tool: "rag_ingest".to_string(),
+            args_sha256: canonical_args_sha256(args),
+            exp: state_expires.timestamp(),
+            nonce,
+            uploads: vec![StagedUploadBinding {
+                file_id: file.id.clone(),
+                upload_id: upload_id.clone(),
+                confirmed: false,
+            }],
+            upload_issued: true,
+            file_name: None,
+            pages_needing_ocr: None,
+            total_pages: None,
+        };
+        let state_token = sign_request_state(&ctx.state.master_kek, &state_payload)
+            .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+
+        let target = json!({
+            "fileId": file.id,
+            "path": format!("/uploads/{upload_id}"),
+            "method": "PUT",
+            "headers": {
+                "Content-Type": file.mime_type,
+            },
+            "credentials": "include",
+            "expiresAt": target_expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        });
+
+        Ok(finalize_modern_result(
+            json!({
+                "uploads": [target],
+                "requestState": state_token,
+            }),
+            "upload_required",
+            false,
+        ))
+    }
+
+    async fn handle_rag_ingest_retry(
+        &self,
+        ctx: ToolCtx,
+        args: &Map<String, Value>,
+        client_caps: &Map<String, Value>,
+        state_payload: RequestStatePayload,
+        input_responses: Option<&Map<String, Value>>,
+    ) -> Result<Value, RpcError> {
+        let owner = PrincipalKey {
+            org_id: ctx.principal.org_id,
+            principal_id: ctx.principal.principal_id,
+        };
+        let meta = match parse_rag_ingest_common_args(args) {
+            Ok(m) => m,
+            Err(fail) => {
+                return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+            }
+        };
+
+        match state_payload.kind {
+            RequestStateKind::Upload => {
+                if !self.file_uploads_enabled() {
+                    return Err(RpcError::new(
+                        JSONRPC_INVALID_PARAMS,
+                        "file uploads are disabled",
+                    ));
+                }
+                let file = match parse_file_input(args.get("file")) {
+                    Ok(f) => f,
+                    Err(fail) => {
+                        return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                    }
+                };
+                if let Err(fail) = validate_file_metadata(&file) {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+                let Some(binding) = state_payload
+                    .uploads
+                    .iter()
+                    .find(|u| u.file_id == file.id)
+                    .cloned()
+                else {
+                    return Err(RpcError::new(
+                        JSONRPC_INVALID_PARAMS,
+                        "requestState does not match file id",
+                    ));
+                };
+
+                // Step 2 (spec order): confirm staged bytes exist with exact size and digest
+                // before consuming the requestState.
+                let bytes = match load_and_verify_staged_upload(&ctx, owner, &binding.upload_id, &file).await {
+                    Ok(b) => b,
+                    Err(fail) => {
+                        return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                    }
+                };
+
+                // Step 3: consume requestState atomically before running tool or creating a task.
+                if !ctx.state.mcp_nonces.try_consume(
+                    &state_payload.nonce,
+                    state_payload.exp,
+                    Utc::now().timestamp(),
+                ) {
+                    return Err(RpcError::new(
+                        JSONRPC_INVALID_PARAMS,
+                        "requestState has already been consumed",
+                    ));
+                }
+
+                let guard = StagedUploadGuard::new(
+                    Arc::clone(&ctx.state.mcp_uploads),
+                    vec![binding.upload_id.clone()],
+                );
+                let confirmed = vec![StagedUploadBinding {
+                    file_id: binding.file_id,
+                    upload_id: binding.upload_id,
+                    confirmed: true,
+                }];
+                let payload = IngestFilePayload {
+                    file_name: sanitize_upload_file_name(file.name.as_deref()),
+                    mime_type: file.mime_type,
+                    bytes,
+                };
+                self.execute_modern_file_ingest(
+                    ctx,
+                    args,
+                    meta,
+                    IngestFileSource::Bytes(payload),
+                    client_caps,
+                    Some((guard, confirmed)),
+                )
+                .await
+            }
+            RequestStateKind::RemoteOcr => {
+                let decision = parse_remote_ocr_response(input_responses, "remote_ocr");
+                match decision {
+                    RemoteOcrElicitDecision::MissingOrMalformed => {
+                        if !ctx.state.mcp_nonces.try_consume(
+                            &state_payload.nonce,
+                            state_payload.exp,
+                            Utc::now().timestamp(),
+                        ) {
+                            return Err(RpcError::new(
+                                JSONRPC_INVALID_PARAMS,
+                                "requestState has already been consumed",
+                            ));
+                        }
+                        if !client_supports_elicitation_form(client_caps) {
+                            for u in &state_payload.uploads {
+                                ctx.state.mcp_uploads.remove_and_delete(&u.upload_id).await;
+                            }
+                            return Ok(finalize_modern_result(
+                                tool_error(&ToolFailure::new(
+                                    "elicitation_required",
+                                    "client did not declare form elicitation capability",
+                                )),
+                                "complete",
+                                false,
+                            ));
+                        }
+                        let file_name = state_payload
+                            .file_name
+                            .clone()
+                            .unwrap_or_else(|| "document".to_string());
+                        let pages_needing_ocr = state_payload.pages_needing_ocr.unwrap_or(1);
+                        let total_pages = state_payload.total_pages.unwrap_or(pages_needing_ocr);
+                        let new_exp = Utc::now().timestamp() + REQUEST_STATE_TTL_SECS;
+                        for u in &state_payload.uploads {
+                            ctx.state.mcp_uploads.extend_state_expiry(&u.upload_id, new_exp);
+                        }
+                        let next_state = RequestStatePayload {
+                            v: REQUEST_STATE_VERSION,
+                            kind: RequestStateKind::RemoteOcr,
+                            org_id: owner.org_id,
+                            principal_id: owner.principal_id,
+                            tool: "rag_ingest".to_string(),
+                            args_sha256: state_payload.args_sha256,
+                            exp: new_exp,
+                            nonce: random_token_128()
+                                .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?,
+                            uploads: state_payload.uploads,
+                            upload_issued: state_payload.upload_issued,
+                            file_name: Some(file_name.clone()),
+                            pages_needing_ocr: Some(pages_needing_ocr),
+                            total_pages: Some(total_pages),
+                        };
+                        let token = sign_request_state(&ctx.state.master_kek, &next_state)
+                            .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+                        Ok(build_remote_ocr_input_required_result(
+                            &file_name,
+                            pages_needing_ocr,
+                            total_pages,
+                            token,
+                        ))
+                    }
+                    RemoteOcrElicitDecision::Cancel => {
+                        if !ctx.state.mcp_nonces.try_consume(
+                            &state_payload.nonce,
+                            state_payload.exp,
+                            Utc::now().timestamp(),
+                        ) {
+                            return Err(RpcError::new(
+                                JSONRPC_INVALID_PARAMS,
+                                "requestState has already been consumed",
+                            ));
+                        }
+                        for u in &state_payload.uploads {
+                            ctx.state.mcp_uploads.remove_and_delete(&u.upload_id).await;
+                        }
+                        Ok(finalize_modern_result(
+                            tool_error(&ToolFailure::new(
+                                "cancelled",
+                                "Document was not ingested because the user cancelled remote OCR consent.",
+                            )),
+                            "complete",
+                            false,
+                        ))
+                    }
+                    RemoteOcrElicitDecision::Allow | RemoteOcrElicitDecision::Deny => {
+                        let remote_ocr_value = match decision {
+                            RemoteOcrElicitDecision::Allow => "allow",
+                            RemoteOcrElicitDecision::Deny => "deny",
+                            _ => "deny",
+                        };
+
+                        // Verify staged upload bytes (if any) before consuming the requestState.
+                        let payload = if !state_payload.uploads.is_empty() {
+                            let file = match parse_file_input(args.get("file")) {
+                                Ok(f) => f,
+                                Err(fail) => {
+                                    return Ok(finalize_modern_result(
+                                        tool_error(&fail),
+                                        "complete",
+                                        false,
+                                    ));
+                                }
+                            };
+                            let Some(binding) = state_payload
+                                .uploads
+                                .iter()
+                                .find(|u| u.file_id == file.id)
+                            else {
+                                return Err(RpcError::new(
+                                    JSONRPC_INVALID_PARAMS,
+                                    "requestState does not match file id",
+                                ));
+                            };
+                            let bytes = match load_and_verify_staged_upload(
+                                &ctx,
+                                owner,
+                                &binding.upload_id,
+                                &file,
+                            )
+                            .await
+                            {
+                                Ok(b) => b,
+                                Err(fail) => {
+                                    return Ok(finalize_modern_result(
+                                        tool_error(&fail),
+                                        "complete",
+                                        false,
+                                    ));
+                                }
+                            };
+                            IngestFilePayload {
+                                file_name: sanitize_upload_file_name(file.name.as_deref()),
+                                mime_type: file.mime_type,
+                                bytes,
+                            }
+                        } else if self.file_uploads_enabled()
+                            && args.get("file").is_some_and(|v| !v.is_null())
+                        {
+                            let file = match parse_file_input(args.get("file")) {
+                                Ok(f) => f,
+                                Err(fail) => {
+                                    return Ok(finalize_modern_result(
+                                        tool_error(&fail),
+                                        "complete",
+                                        false,
+                                    ));
+                                }
+                            };
+                            let Some(raw_data) = file.data else {
+                                return Err(RpcError::new(
+                                    JSONRPC_INVALID_PARAMS,
+                                    "missing file data on consent retry",
+                                ));
+                            };
+                            let bytes = match decode_and_validate_inline_file(&file, raw_data) {
+                                Ok(b) => b,
+                                Err(fail) => {
+                                    return Ok(finalize_modern_result(
+                                        tool_error(&fail),
+                                        "complete",
+                                        false,
+                                    ));
+                                }
+                            };
+                            IngestFilePayload {
+                                file_name: sanitize_upload_file_name(file.name.as_deref()),
+                                mime_type: file.mime_type,
+                                bytes,
+                            }
+                        } else {
+                            let path_str = args
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            match read_stdio_path_payload(&ctx, path_str).await {
+                                Ok(p) => p,
+                                Err(fail) => {
+                                    return Ok(finalize_modern_result(
+                                        tool_error(&fail),
+                                        "complete",
+                                        false,
+                                    ));
+                                }
+                            }
+                        };
+
+                        if !ctx.state.mcp_nonces.try_consume(
+                            &state_payload.nonce,
+                            state_payload.exp,
+                            Utc::now().timestamp(),
+                        ) {
+                            return Err(RpcError::new(
+                                JSONRPC_INVALID_PARAMS,
+                                "requestState has already been consumed",
+                            ));
+                        }
+
+                        // Always delete staged files afterwards whatever the ingest outcome.
+                        let _guard = StagedUploadGuard::new(
+                            Arc::clone(&ctx.state.mcp_uploads),
+                            state_payload
+                                .uploads
+                                .iter()
+                                .map(|u| u.upload_id.clone())
+                                .collect(),
+                        );
+
+                        let outcome =
+                            dispatch_rag_ingest_file(&ctx, &meta, &payload, Some(remote_ocr_value))
+                                .await;
+                        let tool_res = match outcome {
+                            IngestFileOutcome::Ok(val) => match seal_for_ai(&ctx, val).await {
+                                Ok(sealed) => tool_success(sealed),
+                                Err(fail) => tool_error(&fail),
+                            },
+                            IngestFileOutcome::ConsentRequired {
+                                pages_needing_ocr,
+                                total_pages,
+                                ..
+                            } => tool_error(&ToolFailure {
+                                code: "remote_ocr_consent_required".into(),
+                                message: format!(
+                                    "{pages_needing_ocr} of {total_pages} pages require remote OCR consent"
+                                ),
+                                status: Some(409),
+                            }),
+                            IngestFileOutcome::Err(fail) => tool_error(&fail),
+                        };
+                        Ok(finalize_modern_result(tool_res, "complete", false))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_modern_file_ingest(
+        &self,
+        ctx: ToolCtx,
+        args: &Map<String, Value>,
+        meta: RagIngestCommonArgs,
+        source: IngestFileSource,
+        client_caps: &Map<String, Value>,
+        staged: Option<(StagedUploadGuard, Vec<StagedUploadBinding>)>,
+    ) -> Result<Value, RpcError> {
+        let supports_tasks = client_supports_tasks(client_caps);
+        let wants_consent = client_supports_elicitation_form(client_caps);
+        let owner = PrincipalKey {
+            org_id: ctx.principal.org_id,
+            principal_id: ctx.principal.principal_id,
+        };
+
+        if supports_tasks {
+            if let Some((task_id, create_payload)) = self
+                .tasks
+                .try_create(owner, Some("Ingesting file...".to_string()))
+            {
+                let tasks = Arc::clone(&self.tasks);
+                let tid = task_id.clone();
+                let staged_guard = staged.map(|(g, _)| g);
+                let join = tokio::spawn(async move {
+                    // Dropping `_guard` deletes any staged upload file on completion or cancellation.
+                    let _guard = staged_guard;
+                    let payload = match source {
+                        IngestFileSource::Bytes(p) => p,
+                        IngestFileSource::Path(path_str) => {
+                            match read_stdio_path_payload(&ctx, &path_str).await {
+                                Ok(p) => p,
+                                Err(fail) => {
+                                    tasks.complete(
+                                        &tid,
+                                        finalize_modern_result(tool_error(&fail), "complete", false),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    let initial_remote_ocr = if wants_consent { Some("ask") } else { None };
+                    let mut outcome =
+                        dispatch_rag_ingest_file(&ctx, &meta, &payload, initial_remote_ocr).await;
+
+                    if wants_consent {
+                        while let IngestFileOutcome::ConsentRequired {
+                            file_name,
+                            pages_needing_ocr,
+                            total_pages,
+                        } = outcome
+                        {
+                            let elicit_req = build_remote_ocr_elicit_request(
+                                &file_name,
+                                pages_needing_ocr,
+                                total_pages,
+                            );
+                            let Some(rx) = tasks.request_input(
+                                &tid,
+                                "remote_ocr",
+                                elicit_req,
+                                Some("Waiting for remote OCR consent...".to_string()),
+                            ) else {
+                                return;
+                            };
+                            let Ok(answer) = rx.await else {
+                                return;
+                            };
+                            match parse_remote_ocr_answer(&answer) {
+                                RemoteOcrElicitDecision::Allow => {
+                                    outcome = dispatch_rag_ingest_file(
+                                        &ctx,
+                                        &meta,
+                                        &payload,
+                                        Some("allow"),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                RemoteOcrElicitDecision::Deny => {
+                                    outcome = dispatch_rag_ingest_file(
+                                        &ctx,
+                                        &meta,
+                                        &payload,
+                                        Some("deny"),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                RemoteOcrElicitDecision::Cancel => {
+                                    outcome = IngestFileOutcome::Err(ToolFailure::new(
+                                        "cancelled",
+                                        "Document was not ingested because the user cancelled remote OCR consent.",
+                                    ));
+                                    break;
+                                }
+                                RemoteOcrElicitDecision::MissingOrMalformed => {
+                                    outcome = IngestFileOutcome::ConsentRequired {
+                                        file_name,
+                                        pages_needing_ocr,
+                                        total_pages,
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    let tool_res = match outcome {
+                        IngestFileOutcome::Ok(val) => match seal_for_ai(&ctx, val).await {
+                            Ok(sealed) => tool_success(sealed),
+                            Err(fail) => tool_error(&fail),
+                        },
+                        IngestFileOutcome::ConsentRequired {
+                            pages_needing_ocr,
+                            total_pages,
+                            ..
+                        } => tool_error(&ToolFailure {
+                            code: "remote_ocr_consent_required".into(),
+                            message: format!(
+                                "{pages_needing_ocr} of {total_pages} pages require remote OCR consent"
+                            ),
+                            status: Some(409),
+                        }),
+                        IngestFileOutcome::Err(fail) => tool_error(&fail),
+                    };
+                    tasks.complete(&tid, finalize_modern_result(tool_res, "complete", false));
+                });
+                self.tasks.set_abort_handle(&task_id, join.abort_handle());
+                return Ok(finalize_modern_result(create_payload, "task", false));
+            }
+        }
+
+        // Synchronous path (Tasks not declared, or task cap reached).
+        let (mut staged_guard, confirmed_bindings) = match staged {
+            Some((g, b)) => (Some(g), b),
+            None => (None, Vec::new()),
+        };
+        let payload = match source {
+            IngestFileSource::Bytes(p) => p,
+            IngestFileSource::Path(path_str) => match read_stdio_path_payload(&ctx, &path_str).await {
+                Ok(p) => p,
+                Err(fail) => {
+                    return Ok(finalize_modern_result(tool_error(&fail), "complete", false));
+                }
+            },
+        };
+
+        let remote_ocr = if wants_consent { Some("ask") } else { None };
+        let outcome = dispatch_rag_ingest_file(&ctx, &meta, &payload, remote_ocr).await;
+
+        match outcome {
+            IngestFileOutcome::Ok(val) => {
+                let res = match seal_for_ai(&ctx, val).await {
+                    Ok(sealed) => tool_success(sealed),
+                    Err(fail) => tool_error(&fail),
+                };
+                Ok(finalize_modern_result(res, "complete", false))
+            }
+            IngestFileOutcome::ConsentRequired {
+                file_name,
+                pages_needing_ocr,
+                total_pages,
+            } => {
+                if !wants_consent {
+                    return Ok(finalize_modern_result(
+                        tool_error(&ToolFailure {
+                            code: "remote_ocr_consent_required".into(),
+                            message: format!(
+                                "{pages_needing_ocr} of {total_pages} pages require remote OCR consent"
+                            ),
+                            status: Some(409),
+                        }),
+                        "complete",
+                        false,
+                    ));
+                }
+
+                let new_exp = Utc::now().timestamp() + REQUEST_STATE_TTL_SECS;
+                let upload_issued = !confirmed_bindings.is_empty();
+                let next_state = RequestStatePayload {
+                    v: REQUEST_STATE_VERSION,
+                    kind: RequestStateKind::RemoteOcr,
+                    org_id: owner.org_id,
+                    principal_id: owner.principal_id,
+                    tool: "rag_ingest".to_string(),
+                    args_sha256: canonical_args_sha256(args),
+                    exp: new_exp,
+                    nonce: random_token_128()
+                        .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?,
+                    uploads: confirmed_bindings.clone(),
+                    upload_issued,
+                    file_name: Some(file_name.clone()),
+                    pages_needing_ocr: Some(pages_needing_ocr),
+                    total_pages: Some(total_pages),
+                };
+                let token = sign_request_state(&ctx.state.master_kek, &next_state)
+                    .map_err(|e| RpcError::new(JSONRPC_INTERNAL_ERROR, e))?;
+
+                // Keep staged file until the follow-up consent requestState expires or is consumed.
+                if let Some(ref mut guard) = staged_guard {
+                    guard.disarm();
+                }
+                for u in &confirmed_bindings {
+                    ctx.state.mcp_uploads.extend_state_expiry(&u.upload_id, new_exp);
+                }
+
+                Ok(build_remote_ocr_input_required_result(
+                    &file_name,
+                    pages_needing_ocr,
+                    total_pages,
+                    token,
+                ))
+            }
+            IngestFileOutcome::Err(fail) => {
+                Ok(finalize_modern_result(tool_error(&fail), "complete", false))
+            }
+        }
     }
 
     async fn tasks_get(
@@ -633,16 +1619,16 @@ impl McpEngine {
             return Err(RpcError::missing_tasks_capability());
         }
         let task_id = required_str_param(params, "taskId", "tasks/update")?;
-        if !params.get("inputResponses").is_some_and(Value::is_object) {
+        let Some(input_responses) = params.get("inputResponses").and_then(Value::as_object) else {
             return Err(RpcError::new(
                 JSONRPC_INVALID_PARAMS,
                 "tasks/update requires an object 'inputResponses'",
             ));
-        }
+        };
         let owner = self.resolve_principal_key().await.map_err(|_| {
             RpcError::new(JSONRPC_INVALID_PARAMS, format!("unknown or expired taskId: {task_id}"))
         })?;
-        if !self.tasks.acknowledge_update(task_id, owner) {
+        if !self.tasks.deliver_update(task_id, owner, input_responses) {
             return Err(RpcError::new(
                 JSONRPC_INVALID_PARAMS,
                 format!("unknown or expired taskId: {task_id}"),
@@ -837,6 +1823,41 @@ fn client_supports_tasks(client_caps: &Map<String, Value>) -> bool {
         .is_some_and(Value::is_object)
 }
 
+/// Form mode is supported when `elicitation` is `{}` (spec backwards-compat rule) or has a
+/// `form` object. URL-only `{ "url": {} }` does not support form mode.
+fn client_supports_elicitation_form(client_caps: &Map<String, Value>) -> bool {
+    let Some(elicit) = client_caps.get("elicitation").and_then(Value::as_object) else {
+        return false;
+    };
+    if elicit.is_empty() {
+        return true;
+    }
+    elicit.get("form").is_some_and(Value::is_object)
+}
+
+fn client_files_settings(client_caps: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    let settings = client_caps
+        .get("extensions")
+        .and_then(Value::as_object)
+        .and_then(|ext| ext.get(EXT_FILES))
+        .and_then(Value::as_object)?;
+    // Unknown `revision` disables the extension per spec SHOULD NOT.
+    if settings.get("revision").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    Some(settings)
+}
+
+fn client_declares_files(client_caps: &Map<String, Value>) -> bool {
+    client_files_settings(client_caps).is_some()
+}
+
+fn client_declares_files_upload(client_caps: &Map<String, Value>) -> bool {
+    client_files_settings(client_caps)
+        .and_then(|s| s.get("upload"))
+        .is_some_and(Value::is_object)
+}
+
 fn validate_optional_cursor(params: &Value) -> Result<(), RpcError> {
     match params.get("cursor") {
         None | Some(Value::Null) => Ok(()),
@@ -894,21 +1915,477 @@ fn finalize_modern_result(mut result: Value, result_type: &str, cacheable: bool)
     result
 }
 
-fn discover_result() -> Value {
+fn discover_result(transport: McpTransport, file_uploads_enabled: bool) -> Value {
+    let mut extensions = Map::new();
+    extensions.insert(EXT_SKILLS.into(), json!({}));
+    extensions.insert(EXT_TASKS.into(), json!({}));
+    if file_uploads_enabled {
+        let files_caps = match transport {
+            McpTransport::Http => json!({
+                "upload": {},
+                "maxInlineBytes": MAX_INLINE_BYTES,
+            }),
+            McpTransport::Stdio => json!({
+                "maxInlineBytes": MAX_INLINE_BYTES,
+            }),
+        };
+        extensions.insert(EXT_FILES.into(), files_caps);
+    }
     json!({
         "supportedVersions": MODERN_PROTOCOL_VERSIONS,
         "capabilities": {
             "tools": {},
             "resources": {},
-            "extensions": {
-                EXT_SKILLS: {},
-                EXT_TASKS: {},
-            },
+            "extensions": Value::Object(extensions),
         },
         "instructions": format!(
             "{LEGACY_INSTRUCTIONS} For a full search workflow guide, read the openrag-search skill at skill://openrag-search/SKILL.md."
         ),
     })
+}
+
+fn file_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "File to ingest (inline or out-of-band upload)",
+        "x-mcp-file": {
+            "accept": MCP_FILE_ACCEPT.as_slice(),
+            "maxSize": MAX_FILE_UPLOAD_BYTES,
+        },
+        "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "name": { "type": "string" },
+            "mimeType": { "type": "string" },
+            "size": { "type": "integer", "minimum": 0 },
+            "digest": {
+                "type": "object",
+                "properties": {
+                    "algorithm": { "const": "sha-256" },
+                    "value": { "type": "string" },
+                },
+                "required": ["algorithm", "value"],
+            },
+            "data": { "type": "string" },
+        },
+        "required": ["id", "mimeType", "size"],
+    })
+}
+
+fn tool_definitions_for_modern(
+    file_uploads_enabled: bool,
+    client_caps: &Map<String, Value>,
+) -> Vec<Value> {
+    let mut defs = tool_definitions();
+    if file_uploads_enabled && client_declares_files(client_caps) {
+        if let Some(ingest) = defs
+            .iter_mut()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("rag_ingest"))
+        {
+            if let Some(props) = ingest
+                .pointer_mut("/inputSchema/properties")
+                .and_then(Value::as_object_mut)
+            {
+                props.insert("file".into(), file_input_schema());
+            }
+        }
+    }
+    defs
+}
+
+fn build_remote_ocr_elicit_request(
+    file_name: &str,
+    pages_needing_ocr: u64,
+    total_pages: u64,
+) -> Value {
+    let message = format!(
+        "{file_name}: {pages_needing_ocr} of {total_pages} pages have no readable text. \
+         Send those pages to Schift OCR, a cloud service, to read them? \
+         If not, they are stored without text."
+    );
+    json!({
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": message,
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "send": {
+                        "type": "boolean",
+                        "title": "Send to Schift OCR",
+                        "description": "Send pages with no readable text to Schift OCR, a cloud OCR service.",
+                        "default": false,
+                    }
+                },
+                "required": ["send"],
+            }
+        }
+    })
+}
+
+fn build_remote_ocr_input_required_result(
+    file_name: &str,
+    pages_needing_ocr: u64,
+    total_pages: u64,
+    request_state: String,
+) -> Value {
+    finalize_modern_result(
+        json!({
+            "inputRequests": {
+                "remote_ocr": build_remote_ocr_elicit_request(
+                    file_name,
+                    pages_needing_ocr,
+                    total_pages,
+                ),
+            },
+            "requestState": request_state,
+        }),
+        "input_required",
+        false,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteOcrElicitDecision {
+    Allow,
+    Deny,
+    Cancel,
+    MissingOrMalformed,
+}
+
+fn parse_remote_ocr_answer(answer: &Value) -> RemoteOcrElicitDecision {
+    let Some(obj) = answer.as_object() else {
+        return RemoteOcrElicitDecision::MissingOrMalformed;
+    };
+    match obj.get("action").and_then(Value::as_str) {
+        Some("accept") => match obj
+            .get("content")
+            .and_then(Value::as_object)
+            .and_then(|c| c.get("send"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) => RemoteOcrElicitDecision::Allow,
+            Some(false) => RemoteOcrElicitDecision::Deny,
+            None => RemoteOcrElicitDecision::MissingOrMalformed,
+        },
+        Some("decline") => RemoteOcrElicitDecision::Deny,
+        Some("cancel") => RemoteOcrElicitDecision::Cancel,
+        _ => RemoteOcrElicitDecision::MissingOrMalformed,
+    }
+}
+
+fn parse_remote_ocr_response(
+    input_responses: Option<&Map<String, Value>>,
+    key: &str,
+) -> RemoteOcrElicitDecision {
+    match input_responses.and_then(|m| m.get(key)) {
+        Some(val) => parse_remote_ocr_answer(val),
+        None => RemoteOcrElicitDecision::MissingOrMalformed,
+    }
+}
+
+struct ParsedFileInput<'a> {
+    id: String,
+    name: Option<String>,
+    mime_type: String,
+    size: u64,
+    digest: Option<String>,
+    data: Option<&'a str>,
+}
+
+fn parse_file_input(val: Option<&Value>) -> Result<ParsedFileInput<'_>, ToolFailure> {
+    let Some(obj) = val.and_then(Value::as_object) else {
+        return Err(ToolFailure::invalid("'file' must be a FileInput object"));
+    };
+    let id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolFailure::invalid("'file.id' must be a string"))?;
+    let id_chars = id.chars().count();
+    if id_chars == 0 || id_chars > 128 {
+        return Err(ToolFailure::invalid(
+            "'file.id' must be between 1 and 128 characters",
+        ));
+    }
+    let mime_type = obj
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolFailure::invalid("'file.mimeType' must be a non-empty string"))?;
+    if !is_valid_media_type(mime_type) {
+        return Err(ToolFailure::invalid("'file.mimeType' is not a valid media type"));
+    }
+    let size = obj
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolFailure::invalid("'file.size' must be a non-negative integer"))?;
+    let name = match obj.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(ToolFailure::invalid("'file.name' must be a string")),
+    };
+    let digest = match obj.get("digest") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(d)) => {
+            if d.get("algorithm").and_then(Value::as_str) != Some("sha-256") {
+                return Err(ToolFailure::invalid(
+                    "'file.digest.algorithm' must be 'sha-256'",
+                ));
+            }
+            let val_str = d
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolFailure::invalid("'file.digest.value' must be a string"))?;
+            let decoded = URL_SAFE_NO_PAD.decode(val_str).map_err(|_| {
+                ToolFailure::invalid("'file.digest.value' must be unpadded base64url")
+            })?;
+            if decoded.len() != 32 {
+                return Err(ToolFailure::invalid(
+                    "'file.digest.value' must decode to 32-byte SHA-256",
+                ));
+            }
+            Some(val_str.to_string())
+        }
+        Some(_) => return Err(ToolFailure::invalid("'file.digest' must be an object")),
+    };
+
+    // Per spec, `data: null` is treated as undecodable inline data.
+    let data = if let Some(data_val) = obj.get("data") {
+        let Some(s) = data_val.as_str() else {
+            return Err(ToolFailure::invalid(
+                "'file.data' must be a base64 string",
+            ));
+        };
+        Some(s)
+    } else {
+        None
+    };
+
+    Ok(ParsedFileInput {
+        id: id.to_string(),
+        name,
+        mime_type: mime_type.to_string(),
+        size,
+        digest,
+        data,
+    })
+}
+
+fn is_valid_media_type(raw: &str) -> bool {
+    if !is_valid_http_header_value(raw) {
+        return false;
+    }
+    let base = raw.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = base.split_once('/') else {
+        return false;
+    };
+    let is_token = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                            | b'^' | b'_' | b'`' | b'|' | b'~'
+                    )
+            })
+    };
+    is_token(ty) && is_token(sub)
+}
+
+fn file_matches_accept(mime_type: &str, name: Option<&str>) -> bool {
+    let base_mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mime_accepted = matches!(
+        base_mime.as_str(),
+        "application/pdf"
+            | "application/vnd.hancom.hwpx"
+            | "application/vnd.hancom.hml"
+            | "application/x-hwp"
+            | "application/haansoft.hwp"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/webp"
+            | "text/markdown"
+            | "text/plain"
+            | "text/html"
+            | "application/xhtml+xml"
+            | "text/csv"
+            | "text/tab-separated-values"
+    );
+    if mime_accepted {
+        return true;
+    }
+    if base_mime == "application/octet-stream" {
+        if let Some(ext) = name
+            .and_then(|n| n.rsplit(['/', '\\']).next())
+            .and_then(|base| base.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()))
+        {
+            return matches!(
+                ext.as_str(),
+                "pdf"
+                    | "hwpx"
+                    | "hml"
+                    | "hwp"
+                    | "docx"
+                    | "pptx"
+                    | "xlsx"
+                    | "xlsm"
+                    | "csv"
+                    | "tsv"
+                    | "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "webp"
+                    | "md"
+                    | "markdown"
+                    | "txt"
+                    | "html"
+                    | "htm"
+                    | "xhtml"
+            );
+        }
+    }
+    false
+}
+
+fn validate_file_metadata(file: &ParsedFileInput<'_>) -> Result<(), ToolFailure> {
+    if file.size > MAX_FILE_UPLOAD_BYTES {
+        return Err(ToolFailure::invalid(format!(
+            "file exceeds the {} MiB maximum size",
+            MAX_FILE_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+    if !file_matches_accept(&file.mime_type, file.name.as_deref()) {
+        return Err(ToolFailure::invalid(format!(
+            "unsupported file type '{}'",
+            file.mime_type
+        )));
+    }
+    Ok(())
+}
+
+fn decode_and_validate_inline_file(
+    file: &ParsedFileInput<'_>,
+    raw_b64: &str,
+) -> Result<Vec<u8>, ToolFailure> {
+    if file.size > MAX_FILE_UPLOAD_BYTES {
+        return Err(ToolFailure::invalid("file size exceeds maxSize limit"));
+    }
+    if file.size > MAX_INLINE_BYTES as u64 {
+        return Err(ToolFailure::invalid("inline file exceeds maxInlineBytes limit"));
+    }
+    let max_b64_len = (MAX_INLINE_BYTES / 3 + 2) * 4;
+    if raw_b64.len() > max_b64_len {
+        return Err(ToolFailure::invalid("inline file data exceeds maxInlineBytes limit"));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64)
+        .map_err(|_| ToolFailure::invalid("inline file data is not valid RFC 4648 base64"))?;
+    if decoded.len() > MAX_INLINE_BYTES {
+        return Err(ToolFailure::invalid("inline file exceeds maxInlineBytes limit"));
+    }
+    if decoded.len() as u64 != file.size {
+        return Err(ToolFailure::invalid(format!(
+            "decoded inline file size ({}) does not match declared size ({})",
+            decoded.len(),
+            file.size
+        )));
+    }
+    if !file_matches_accept(&file.mime_type, file.name.as_deref()) {
+        return Err(ToolFailure::invalid(format!(
+            "unsupported file type '{}'",
+            file.mime_type
+        )));
+    }
+    if let Some(expected_digest) = file.digest.as_deref() {
+        let actual = URL_SAFE_NO_PAD.encode(Sha256::digest(&decoded));
+        if actual != expected_digest {
+            return Err(ToolFailure::new(
+                "digest_mismatch",
+                "inline file SHA-256 digest does not match declared digest",
+            ));
+        }
+    }
+    if decoded.is_empty() {
+        return Err(ToolFailure::invalid("cannot ingest empty 0-byte file"));
+    }
+    Ok(decoded)
+}
+
+fn sanitize_upload_file_name(name: Option<&str>) -> String {
+    let raw = name.unwrap_or("");
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    if base.is_empty() || base == "." || base == ".." {
+        "document".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+async fn load_and_verify_staged_upload(
+    ctx: &ToolCtx,
+    owner: PrincipalKey,
+    upload_id: &str,
+    file: &ParsedFileInput<'_>,
+) -> Result<Vec<u8>, ToolFailure> {
+    let Some(path) = ctx.state.mcp_uploads.get_uploaded_path(upload_id, owner) else {
+        return Err(ToolFailure::new(
+            "upload_missing",
+            "staged upload bytes were not found or upload did not complete",
+        ));
+    };
+    let meta = tokio::fs::metadata(&path).await.map_err(|_| {
+        ToolFailure::new(
+            "upload_missing",
+            "staged upload file is missing from storage",
+        )
+    })?;
+    if meta.len() != file.size {
+        return Err(ToolFailure::new(
+            "size_mismatch",
+            format!(
+                "staged file size ({}) does not match declared size ({})",
+                meta.len(),
+                file.size
+            ),
+        ));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|_| {
+        ToolFailure::new(
+            "upload_missing",
+            "failed reading staged upload file",
+        )
+    })?;
+    if bytes.len() as u64 != file.size {
+        return Err(ToolFailure::new(
+            "size_mismatch",
+            format!(
+                "staged file size ({}) does not match declared size ({})",
+                bytes.len(),
+                file.size
+            ),
+        ));
+    }
+    if let Some(expected_digest) = file.digest.as_deref() {
+        let actual = URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes));
+        if actual != expected_digest {
+            return Err(ToolFailure::new(
+                "digest_mismatch",
+                "staged file SHA-256 digest does not match declared digest",
+            ));
+        }
+    }
+    Ok(bytes)
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -1506,11 +2983,26 @@ pub(crate) fn build_multipart(
     file_bytes: &[u8],
     fields: &[(&str, String)],
 ) -> (String, Vec<u8>) {
+    build_multipart_with_mime(file_name, "application/octet-stream", file_bytes, fields)
+}
+
+/// `multipart/form-data` encoder with an explicit part `Content-Type`.
+fn build_multipart_with_mime(
+    file_name: &str,
+    mime_type: &str,
+    file_bytes: &[u8],
+    fields: &[(&str, String)],
+) -> (String, Vec<u8>) {
     let boundary = format!("openrag-{}", Uuid::new_v4().simple());
     let safe_name: String = file_name
         .chars()
         .map(|c| if c == '"' || c == '\\' || c.is_control() { '_' } else { c })
         .collect();
+    let safe_mime = if is_valid_media_type(mime_type) {
+        mime_type
+    } else {
+        "application/octet-stream"
+    };
     let mut out: Vec<u8> = Vec::with_capacity(file_bytes.len() + 512);
     for (name, value) in fields {
         out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1523,7 +3015,7 @@ pub(crate) fn build_multipart(
     out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     out.extend_from_slice(
         format!(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: {safe_mime}\r\n\r\n"
         )
         .as_bytes(),
     );
@@ -1950,10 +3442,21 @@ async fn rag_ask(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, Tool
     Ok(out)
 }
 
-async fn rag_ingest(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+struct RagIngestCommonArgs {
+    bucket: String,
+    title: Option<String>,
+    scope: Option<AccessScope>,
+    allowed: Vec<Uuid>,
+    denied: Vec<Uuid>,
+    level: Option<u64>,
+    tags: Vec<String>,
+    valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    revision: Option<i32>,
+}
+
+fn parse_rag_ingest_common_args(args: &Map<String, Value>) -> Result<RagIngestCommonArgs, ToolFailure> {
     let bucket = arg_str_req(args, "bucket")?;
-    let path = arg_str_opt(args, "path")?.filter(|p| !p.trim().is_empty());
-    let text = arg_str_opt(args, "text")?;
     let title = arg_str_opt(args, "title")?;
     let scope = arg_scope_opt(args, "access_scope")?;
     let allowed = arg_uuid_list_opt(args, "allowed_group_ids")?.unwrap_or_default();
@@ -1977,7 +3480,161 @@ async fn rag_ingest(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, T
         Some(0) => return Err(ToolFailure::invalid("'revision' must be >= 1")),
         Some(r) => Some(i32::try_from(r).map_err(|_| ToolFailure::invalid("'revision' is too large"))?),
     };
-    let uri = format!("/v2/buckets/{}/documents", pct_encode(bucket.trim()));
+    Ok(RagIngestCommonArgs {
+        bucket,
+        title,
+        scope,
+        allowed,
+        denied,
+        level,
+        tags,
+        valid_from,
+        valid_to,
+        revision,
+    })
+}
+
+enum IngestFileSource {
+    Path(String),
+    Bytes(IngestFilePayload),
+}
+
+struct IngestFilePayload {
+    file_name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+
+enum IngestFileOutcome {
+    Ok(Value),
+    ConsentRequired {
+        file_name: String,
+        pages_needing_ocr: u64,
+        total_pages: u64,
+    },
+    Err(ToolFailure),
+}
+
+async fn read_stdio_path_payload(ctx: &ToolCtx, path: &str) -> Result<IngestFilePayload, ToolFailure> {
+    if ctx.transport != McpTransport::Stdio {
+        return Err(ToolFailure::invalid(
+            "'path' is only available over the local stdio transport; send 'text' instead",
+        ));
+    }
+    let p = FsPath::new(path.trim());
+    let meta = tokio::fs::metadata(p)
+        .await
+        .map_err(|e| ToolFailure::invalid(format!("cannot read '{}': {e}", p.display())))?;
+    if !meta.is_file() {
+        return Err(ToolFailure::invalid(format!("'{}' is not a regular file", p.display())));
+    }
+    if meta.len() > MAX_DISPATCH_BODY_BYTES as u64 {
+        return Err(ToolFailure::invalid("file exceeds the 64 MiB ingestion limit"));
+    }
+    let bytes = tokio::fs::read(p)
+        .await
+        .map_err(|e| ToolFailure::invalid(format!("cannot read '{}': {e}", p.display())))?;
+    let file_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document")
+        .to_string();
+    Ok(IngestFilePayload {
+        file_name,
+        mime_type: "application/octet-stream".to_string(),
+        bytes,
+    })
+}
+
+async fn dispatch_rag_ingest_file(
+    ctx: &ToolCtx,
+    meta: &RagIngestCommonArgs,
+    payload: &IngestFilePayload,
+    remote_ocr: Option<&str>,
+) -> IngestFileOutcome {
+    let raw_res = if let Some(hook) = &ctx.state.mcp_ingest_hook {
+        hook(IngestDispatchRequest {
+            bucket: meta.bucket.trim().to_string(),
+            file_name: payload.file_name.clone(),
+            mime_type: payload.mime_type.clone(),
+            bytes: payload.bytes.clone(),
+            remote_ocr: remote_ocr.map(ToString::to_string),
+        })
+        .await
+    } else {
+        let uri = format!("/v2/buckets/{}/documents", pct_encode(meta.bucket.trim()));
+        let mut fields: Vec<(&str, String)> = Vec::new();
+        if let Some(t) = &meta.title {
+            fields.push(("title", t.clone()));
+        }
+        if let Some(s) = meta.scope {
+            fields.push(("access_scope", s.as_str().to_string()));
+        }
+        if let Some(l) = meta.level {
+            fields.push(("min_auth_level", l.to_string()));
+        }
+        fields.push(("allowed_group_ids", json!(meta.allowed).to_string()));
+        fields.push(("denied_group_ids", json!(meta.denied).to_string()));
+        if !meta.tags.is_empty() {
+            fields.push(("tags", json!(meta.tags).to_string()));
+        }
+        if let Some(d) = meta.valid_from {
+            fields.push(("valid_from", d.to_rfc3339()));
+        }
+        if let Some(d) = meta.valid_to {
+            fields.push(("valid_to", d.to_rfc3339()));
+        }
+        if let Some(r) = meta.revision {
+            fields.push(("revision", r.to_string()));
+        }
+        if let Some(consent) = remote_ocr {
+            fields.push(("remote_ocr", consent.to_string()));
+        }
+        let (boundary, body) = build_multipart_with_mime(
+            &payload.file_name,
+            &payload.mime_type,
+            &payload.bytes,
+            &fields,
+        );
+        dispatch_as(
+            &ctx.state,
+            &ctx.principal,
+            Method::POST,
+            &uri,
+            DispatchBody::Multipart { boundary, bytes: body },
+        )
+        .await
+    };
+
+    match raw_res {
+        Ok((_, val)) => IngestFileOutcome::Ok(val),
+        Err((StatusCode::CONFLICT, body))
+            if body.get("code").and_then(Value::as_str)
+                == Some("remote_ocr_consent_required") =>
+        {
+            let pages_needing_ocr = body
+                .get("pages_needing_ocr")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let total_pages = body
+                .get("total_pages")
+                .and_then(Value::as_u64)
+                .unwrap_or(pages_needing_ocr);
+            IngestFileOutcome::ConsentRequired {
+                file_name: payload.file_name.clone(),
+                pages_needing_ocr,
+                total_pages,
+            }
+        }
+        Err((status, body)) => IngestFileOutcome::Err(failure_from_http(status, &body)),
+    }
+}
+
+async fn rag_ingest(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    let meta = parse_rag_ingest_common_args(args)?;
+    let path = arg_str_opt(args, "path")?.filter(|p| !p.trim().is_empty());
+    let text = arg_str_opt(args, "text")?;
+    let uri = format!("/v2/buckets/{}/documents", pct_encode(meta.bucket.trim()));
 
     match (path, text) {
         (Some(_), Some(_)) => Err(ToolFailure::invalid("pass either 'path' or 'text', not both")),
@@ -1987,68 +3644,35 @@ async fn rag_ingest(ctx: &ToolCtx, args: &Map<String, Value>) -> Result<Value, T
                 return Err(ToolFailure::invalid("'text' must not be empty"));
             }
             let mut body = Map::new();
-            body.insert("title".into(), json!(title.unwrap_or_else(|| default_title(&text))));
+            body.insert("title".into(), json!(meta.title.unwrap_or_else(|| default_title(&text))));
             body.insert("text".into(), json!(text));
-            insert_opt(&mut body, "access_scope", scope.map(|s| json!(s.as_str())));
-            insert_opt(&mut body, "min_auth_level", level.map(|l| json!(l)));
-            body.insert("allowed_group_ids".into(), json!(allowed));
-            body.insert("denied_group_ids".into(), json!(denied));
-            body.insert("tags".into(), json!(tags));
-            insert_opt(&mut body, "valid_from", valid_from.map(|d| json!(d.to_rfc3339())));
-            insert_opt(&mut body, "valid_to", valid_to.map(|d| json!(d.to_rfc3339())));
-            insert_opt(&mut body, "revision", revision.map(|r| json!(r)));
+            insert_opt(&mut body, "access_scope", meta.scope.map(|s| json!(s.as_str())));
+            insert_opt(&mut body, "min_auth_level", meta.level.map(|l| json!(l)));
+            body.insert("allowed_group_ids".into(), json!(meta.allowed));
+            body.insert("denied_group_ids".into(), json!(meta.denied));
+            body.insert("tags".into(), json!(meta.tags));
+            insert_opt(&mut body, "valid_from", meta.valid_from.map(|d| json!(d.to_rfc3339())));
+            insert_opt(&mut body, "valid_to", meta.valid_to.map(|d| json!(d.to_rfc3339())));
+            insert_opt(&mut body, "revision", meta.revision.map(|r| json!(r)));
             dispatch(ctx, Method::POST, &uri, DispatchBody::Json(Value::Object(body))).await
         }
         (Some(path), None) => {
-            if ctx.transport != McpTransport::Stdio {
-                return Err(ToolFailure::invalid(
-                    "'path' is only available over the local stdio transport; send 'text' instead",
-                ));
+            let payload = read_stdio_path_payload(ctx, &path).await?;
+            match dispatch_rag_ingest_file(ctx, &meta, &payload, None).await {
+                IngestFileOutcome::Ok(val) => Ok(val),
+                IngestFileOutcome::ConsentRequired {
+                    pages_needing_ocr,
+                    total_pages,
+                    ..
+                } => Err(ToolFailure {
+                    code: "remote_ocr_consent_required".into(),
+                    message: format!(
+                        "{pages_needing_ocr} of {total_pages} pages require remote OCR consent"
+                    ),
+                    status: Some(409),
+                }),
+                IngestFileOutcome::Err(fail) => Err(fail),
             }
-            let p = FsPath::new(path.trim());
-            let meta = tokio::fs::metadata(p)
-                .await
-                .map_err(|e| ToolFailure::invalid(format!("cannot read '{}': {e}", p.display())))?;
-            if !meta.is_file() {
-                return Err(ToolFailure::invalid(format!("'{}' is not a regular file", p.display())));
-            }
-            if meta.len() > MAX_DISPATCH_BODY_BYTES as u64 {
-                return Err(ToolFailure::invalid("file exceeds the 64 MiB ingestion limit"));
-            }
-            let bytes = tokio::fs::read(p)
-                .await
-                .map_err(|e| ToolFailure::invalid(format!("cannot read '{}': {e}", p.display())))?;
-            let file_name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("document")
-                .to_string();
-            let mut fields: Vec<(&str, String)> = Vec::new();
-            if let Some(t) = title {
-                fields.push(("title", t));
-            }
-            if let Some(s) = scope {
-                fields.push(("access_scope", s.as_str().to_string()));
-            }
-            if let Some(l) = level {
-                fields.push(("min_auth_level", l.to_string()));
-            }
-            fields.push(("allowed_group_ids", json!(allowed).to_string()));
-            fields.push(("denied_group_ids", json!(denied).to_string()));
-            if !tags.is_empty() {
-                fields.push(("tags", json!(tags).to_string()));
-            }
-            if let Some(d) = valid_from {
-                fields.push(("valid_from", d.to_rfc3339()));
-            }
-            if let Some(d) = valid_to {
-                fields.push(("valid_to", d.to_rfc3339()));
-            }
-            if let Some(r) = revision {
-                fields.push(("revision", r.to_string()));
-            }
-            let (boundary, body) = build_multipart(&file_name, &bytes, &fields);
-            dispatch(ctx, Method::POST, &uri, DispatchBody::Multipart { boundary, bytes: body }).await
         }
     }
 }
@@ -2622,10 +4246,197 @@ fn end_session(id: &str, principal: &PrincipalContext) -> bool {
 }
 
 pub fn mcp_routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/mcp",
-        post(mcp_post_handler).get(mcp_get_handler).delete(mcp_delete_handler),
-    )
+    Router::new()
+        .route(
+            "/mcp",
+            post(mcp_post_handler).get(mcp_get_handler).delete(mcp_delete_handler),
+        )
+        .route(
+            "/mcp/uploads/{upload_id}",
+            put(mcp_upload_put_handler)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES as usize)),
+        )
+}
+
+/// Out-of-band MCP upload target (`PUT /mcp/uploads/{upload_id}`).
+/// Uses the same Bearer auth and Origin guard as `POST /mcp`, enforces principal binding,
+/// exact `Content-Length`, one write per target, and streams to `<blob_dir>/mcp-staging/`.
+async fn mcp_upload_put_handler(
+    State(state): State<Arc<AppState>>,
+    AuthPrincipal(principal): AuthPrincipal,
+    AxumPath(upload_id): AxumPath<String>,
+    headers: HeaderMap,
+    mut body: Body,
+) -> Response {
+    if !origin_allowed(&headers) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "forbidden", "message": "Origin not allowed for /mcp" }),
+        );
+    }
+    if !state.mcp_file_uploads_enabled() {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &json!({ "error": "not_found", "message": "file uploads are not enabled" }),
+        );
+    }
+
+    let content_length_hdr = match single_header(&headers, CONTENT_LENGTH.as_str()) {
+        Ok(None) => None,
+        Ok(Some(raw)) => Some(raw.trim().parse::<u64>().map_err(|_| ())),
+        Err(_) => Some(Err(())),
+    };
+    let caller = PrincipalKey {
+        org_id: principal.org_id,
+        principal_id: principal.principal_id,
+    };
+
+    let claim = match state
+        .mcp_uploads
+        .claim_for_put(&upload_id, caller, content_length_hdr)
+        .await
+    {
+        Ok(c) => c,
+        Err(PutClaimError::NotFoundOrExpired) => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &json!({ "error": "not_found", "message": "unknown or expired upload target" }),
+            );
+        }
+        Err(PutClaimError::Forbidden) => {
+            return json_response(
+                StatusCode::FORBIDDEN,
+                &json!({ "error": "forbidden", "message": "upload target belongs to another principal" }),
+            );
+        }
+        Err(PutClaimError::AlreadyWritten) => {
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": "conflict", "message": "upload target already written" }),
+            );
+        }
+        Err(PutClaimError::MissingContentLength) => {
+            return json_response(
+                StatusCode::LENGTH_REQUIRED,
+                &json!({ "error": "length_required", "message": "Content-Length header is required" }),
+            );
+        }
+        Err(PutClaimError::InvalidContentLength) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({ "error": "bad_request", "message": "invalid Content-Length header" }),
+            );
+        }
+        Err(PutClaimError::PayloadTooLarge) => {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &json!({ "error": "payload_too_large", "message": "upload exceeds 64 MiB limit" }),
+            );
+        }
+        Err(PutClaimError::ContentLengthMismatch) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({ "error": "content_length_mismatch", "message": "Content-Length does not match declared file size" }),
+            );
+        }
+    };
+
+    if let Some(parent) = claim.part_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            state.mcp_uploads.abort_put(&upload_id);
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({ "error": "internal_error", "message": format!("staging directory error: {e}") }),
+            );
+        }
+    }
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claim.part_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(_) => {
+            state.mcp_uploads.abort_put(&upload_id);
+            return json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": "conflict", "message": "upload target already written" }),
+            );
+        }
+    };
+
+    let mut written: u64 = 0;
+    while let Some(frame_res) = body.frame().await {
+        let frame = match frame_res {
+            Ok(f) => f,
+            Err(_) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&claim.part_path).await;
+                state.mcp_uploads.abort_put(&upload_id);
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({ "error": "bad_request", "message": "failed reading upload body" }),
+                );
+            }
+        };
+        if let Ok(chunk) = frame.into_data() {
+            let next = written.saturating_add(chunk.len() as u64);
+            if next > claim.expected_size {
+                drop(file);
+                let _ = tokio::fs::remove_file(&claim.part_path).await;
+                state.mcp_uploads.abort_put(&upload_id);
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({ "error": "content_length_mismatch", "message": "body exceeds declared size" }),
+                );
+            }
+            if file.write_all(&chunk).await.is_err() {
+                drop(file);
+                let _ = tokio::fs::remove_file(&claim.part_path).await;
+                state.mcp_uploads.abort_put(&upload_id);
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({ "error": "internal_error", "message": "failed writing staged upload" }),
+                );
+            }
+            written = next;
+        }
+    }
+
+    if written != claim.expected_size {
+        drop(file);
+        let _ = tokio::fs::remove_file(&claim.part_path).await;
+        state.mcp_uploads.abort_put(&upload_id);
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({ "error": "content_length_mismatch", "message": "body shorter than declared size" }),
+        );
+    }
+
+    if file.flush().await.is_err() {
+        drop(file);
+        let _ = tokio::fs::remove_file(&claim.part_path).await;
+        state.mcp_uploads.abort_put(&upload_id);
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({ "error": "internal_error", "message": "failed flushing staged upload" }),
+        );
+    }
+    drop(file);
+
+    if tokio::fs::rename(&claim.part_path, &claim.final_path).await.is_err() {
+        let _ = tokio::fs::remove_file(&claim.part_path).await;
+        state.mcp_uploads.abort_put(&upload_id);
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({ "error": "internal_error", "message": "failed finalizing staged upload" }),
+        );
+    }
+
+    state.mcp_uploads.mark_uploaded(&upload_id);
+    StatusCode::CREATED.into_response()
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response {
@@ -3568,6 +5379,569 @@ mod tests {
         assert!(store.get(&tid, owner).is_some());
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(store.get(&tid, owner).is_none());
+        Ok(())
+    }
+
+    async fn send_put_upload(
+        app: &Router,
+        principal: Option<&PrincipalContext>,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<(StatusCode, Value), String> {
+        let mut builder = Request::builder().method(Method::PUT).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder.body(Body::from(body)).map_err(|e| e.to_string())?;
+        if let Some(p) = principal {
+            req.extensions_mut().insert(TrustedPrincipal(p.clone()));
+        }
+        let resp = match app.clone().oneshot(req).await {
+            Ok(r) => r,
+            Err(never) => match never {},
+        };
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), MAX_DISPATCH_BODY_BYTES)
+            .await
+            .map_err(|e| e.to_string())?;
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Ok((status, json))
+    }
+
+    #[tokio::test]
+    async fn http_part_c_out_of_band_put_retry_consent_and_cleanup() -> Result<(), String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let staging_tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let staging_dir = staging_tmp.path().join("mcp-staging");
+        let ingest_calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&ingest_calls);
+        let hook: IngestDispatchHook = Arc::new(move |req: IngestDispatchRequest| {
+            let calls = Arc::clone(&calls_clone);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if req.remote_ocr.as_deref() == Some("ask") {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "remote_ocr_consent_required",
+                            "code": "remote_ocr_consent_required",
+                            "message": "1 of 2 pages require consent",
+                            "pages_needing_ocr": 1,
+                            "total_pages": 2,
+                        }),
+                    ));
+                }
+                Ok((
+                    StatusCode::CREATED,
+                    json!({
+                        "file_name": req.file_name,
+                        "mime_type": req.mime_type,
+                        "bytes_len": req.bytes.len(),
+                        "remote_ocr": req.remote_ocr,
+                    }),
+                ))
+            })
+        });
+
+        let state = AppState::new_offline_for_test()
+            .map_err(|e| e.to_string())?
+            .with_mcp_file_uploads(true)
+            .with_mcp_staging_dir(staging_dir.clone())
+            .with_mcp_ingest_hook(hook);
+        let app = crate::build_router(Arc::clone(&state));
+        let alice = test_principal().map_err(|e| e.to_string())?;
+        let bob = test_principal().map_err(|e| e.to_string())?;
+
+        let modern_hdrs = [
+            (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+            (METHOD_HEADER, "tools/call"),
+            (NAME_HEADER, "rag_ingest"),
+        ];
+        let payload_bytes = b"%PDF-1.4\nhello out-of-band";
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(payload_bytes));
+        let file_arg = json!({
+            "id": "file-1",
+            "name": "folder/scan.pdf",
+            "mimeType": "application/pdf",
+            "size": payload_bytes.len(),
+            "digest": { "algorithm": "sha-256", "value": digest }
+        });
+
+        // 1. Without `upload` declaration -> 400 JSON-RPC -32021 with requiredCapabilities.
+        let (st, _, body) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: {}
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], JSONRPC_MISSING_REQUIRED_CLIENT_CAPABILITY);
+        assert_eq!(
+            body["error"]["data"]["requiredCapabilities"]["extensions"][EXT_FILES]["upload"],
+            json!({})
+        );
+
+        let upload_caps = json!({
+            "extensions": {
+                EXT_FILES: { "upload": {} },
+                EXT_TASKS: {}
+            }
+        });
+
+        // 2. Metadata check fails first (bad type / oversize) -> isError, no upload target.
+        let (st, _, bad_meta) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": {
+                        "bucket": "docs",
+                        "file": { "id": "f-bad", "mimeType": "video/mp4", "size": 100 }
+                    },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bad_meta["result"]["resultType"], "complete");
+        assert_eq!(bad_meta["result"]["isError"], true);
+
+        // 3. Initial out-of-band call -> upload_required (BEFORE any task!).
+        let (st, _, upload_req) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: { "extensions": { EXT_FILES: { "upload": {} } } }
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(upload_req["result"]["resultType"], "upload_required");
+        assert_eq!(
+            upload_req["result"]["_meta"][META_SERVER_INFO]["name"],
+            "openrag"
+        );
+        let target = &upload_req["result"]["uploads"][0];
+        assert_eq!(target["fileId"], "file-1");
+        assert_eq!(target["method"], "PUT");
+        assert_eq!(target["headers"]["Content-Type"], "application/pdf");
+        assert_eq!(target["credentials"], "include");
+        assert!(target["expiresAt"].as_str().is_some());
+        let rel_path = target["path"]
+            .as_str()
+            .ok_or_else(|| "missing upload path".to_string())?;
+        assert!(rel_path.starts_with("/uploads/"));
+        let upload_id = rel_path.trim_start_matches("/uploads/");
+        let put_uri = format!("/mcp{rel_path}");
+        let req_state = upload_req["result"]["requestState"]
+            .as_str()
+            .ok_or_else(|| "missing requestState".to_string())?
+            .to_string();
+
+        // 4. Retry BEFORE PUT -> isError, ingest NOT called.
+        let (st, _, retry_missing) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "requestState": req_state,
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: { "extensions": { EXT_FILES: { "upload": {} } } }
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(retry_missing["result"]["isError"], true);
+        assert_eq!(ingest_calls.load(Ordering::SeqCst), 0);
+
+        // 5. PUT guards: unauth 401, unknown id 404, wrong principal 403, missing/wrong Content-Length.
+        let (st, _) = send_put_upload(&app, None, &put_uri, &[], payload_bytes.to_vec()).await?;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            "/mcp/uploads/nonexistent_upload_id",
+            &[("content-length", "5")],
+            b"hello".to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        let len_str = payload_bytes.len().to_string();
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&bob),
+            &put_uri,
+            &[("content-length", &len_str)],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+
+        let (st, _) = send_put_upload(&app, Some(&alice), &put_uri, &[], payload_bytes.to_vec()).await?;
+        assert_eq!(st, StatusCode::LENGTH_REQUIRED);
+
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            &put_uri,
+            &[("content-length", "999")],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // 6. Valid PUT -> 201 empty body, staged file exists; second PUT -> 409!
+        let (st, put_body) = send_put_upload(
+            &app,
+            Some(&alice),
+            &put_uri,
+            &[("content-length", &len_str), ("content-type", "application/pdf")],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(put_body, Value::Null);
+        let staged_path = staging_dir.join(upload_id);
+        assert!(staged_path.is_file(), "staged file should exist before retry");
+
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            &put_uri,
+            &[("content-length", &len_str)],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // 7. Retry with changed arguments -> -32602.
+        let (st, _, changed_args) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "other-bucket", "file": file_arg },
+                    "requestState": req_state,
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: { "extensions": { EXT_FILES: { "upload": {} } } }
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(changed_args["error"]["code"], JSONRPC_INVALID_PARAMS);
+
+        // 8. Retry with exact args -> ingested, and staged file deleted afterwards!
+        let (st, _, ingested) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "requestState": req_state,
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: { "extensions": { EXT_FILES: { "upload": {} } } }
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ingested["result"]["resultType"], "complete");
+        assert_eq!(ingested["result"]["isError"], false);
+        assert_eq!(ingested["result"]["structuredContent"]["file_name"], "scan.pdf");
+        assert_eq!(ingested["result"]["structuredContent"]["bytes_len"], payload_bytes.len());
+        assert!(!staged_path.exists(), "staged file must be deleted after retry");
+
+        // 9. Out-of-band upload + Part B consent: staged file kept until consent retry, then deleted!
+        let elicit_upload_caps = json!({
+            "elicitation": { "form": {} },
+            "extensions": { EXT_FILES: { "upload": {} } }
+        });
+        let (_, _, up2) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: elicit_upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(up2["result"]["resultType"], "upload_required");
+        let rel2 = up2["result"]["uploads"][0]["path"]
+            .as_str()
+            .ok_or_else(|| "missing rel2".to_string())?;
+        let uid2 = rel2.trim_start_matches("/uploads/");
+        let rs_up2 = up2["result"]["requestState"]
+            .as_str()
+            .ok_or_else(|| "missing rs_up2".to_string())?;
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            &format!("/mcp{rel2}"),
+            &[("content-length", &len_str)],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::CREATED);
+        let staged2 = staging_dir.join(uid2);
+        assert!(staged2.is_file());
+
+        // Retry after PUT hits 409 -> InputRequiredResult; staged file stays on disk!
+        let (_, _, consent_req) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "requestState": rs_up2,
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: elicit_upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(consent_req["result"]["resultType"], "input_required");
+        assert!(staged2.is_file(), "staged file must survive while waiting for consent");
+        let rs_consent = consent_req["result"]["requestState"]
+            .as_str()
+            .ok_or_else(|| "missing rs_consent".to_string())?;
+
+        // Consent retry -> ingested with allow, staged file deleted!
+        let (_, _, consent_done) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "requestState": rs_consent,
+                    "inputResponses": {
+                        "remote_ocr": { "action": "accept", "content": { "send": true } }
+                    },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: elicit_upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(consent_done["result"]["resultType"], "complete");
+        assert_eq!(consent_done["result"]["isError"], false);
+        assert_eq!(consent_done["result"]["structuredContent"]["remote_ocr"], "allow");
+        assert!(!staged2.exists(), "staged file must be deleted after consent retry");
+
+        // 10. Sweep removes abandoned staged files once their requestState expires.
+        let (_, _, up3) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: { "extensions": { EXT_FILES: { "upload": {} } } }
+                    }
+                }
+            })),
+        )
+        .await?;
+        let rel3 = up3["result"]["uploads"][0]["path"]
+            .as_str()
+            .ok_or_else(|| "missing rel3".to_string())?;
+        let uid3 = rel3.trim_start_matches("/uploads/");
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            &format!("/mcp{rel3}"),
+            &[("content-length", &len_str)],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::CREATED);
+        let staged3 = staging_dir.join(uid3);
+        assert!(staged3.is_file());
+        state
+            .mcp_uploads
+            .sweep_expired_at(Utc::now().timestamp() + REQUEST_STATE_TTL_SECS + 10)
+            .await;
+        assert!(!staged3.exists(), "expired staged file must be swept");
+
+        // 11. With Tasks extension declared: upload_required comes BEFORE task; retry creates task!
+        let (_, _, up4) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(up4["result"]["resultType"], "upload_required");
+        let rel4 = up4["result"]["uploads"][0]["path"]
+            .as_str()
+            .ok_or_else(|| "missing rel4".to_string())?;
+        let uid4 = rel4.trim_start_matches("/uploads/");
+        let rs_up4 = up4["result"]["requestState"]
+            .as_str()
+            .ok_or_else(|| "missing rs_up4".to_string())?;
+        let (st, _) = send_put_upload(
+            &app,
+            Some(&alice),
+            &format!("/mcp{rel4}"),
+            &[("content-length", &len_str)],
+            payload_bytes.to_vec(),
+        )
+        .await?;
+        assert_eq!(st, StatusCode::CREATED);
+        let staged4 = staging_dir.join(uid4);
+        assert!(staged4.is_file());
+
+        let (_, _, task_created) = send_mcp_http(
+            &app,
+            Some(&alice),
+            Method::POST,
+            &modern_hdrs,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": {
+                    "name": "rag_ingest",
+                    "arguments": { "bucket": "docs", "file": file_arg },
+                    "requestState": rs_up4,
+                    "_meta": {
+                        META_PROTOCOL_VERSION: "2026-07-28",
+                        META_CLIENT_CAPABILITIES: upload_caps
+                    }
+                }
+            })),
+        )
+        .await?;
+        assert_eq!(task_created["result"]["resultType"], "task");
+        let task_id = task_created["result"]["taskId"]
+            .as_str()
+            .ok_or_else(|| "missing taskId".to_string())?;
+        let mut done_task = Value::Null;
+        for _ in 0..40 {
+            let (_, _, get_resp) = send_mcp_http(
+                &app,
+                Some(&alice),
+                Method::POST,
+                &[
+                    (PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                    (METHOD_HEADER, "tasks/get"),
+                    (NAME_HEADER, task_id),
+                ],
+                Some(json!({
+                    "jsonrpc": "2.0", "id": 13, "method": "tasks/get",
+                    "params": {
+                        "taskId": task_id,
+                        "_meta": {
+                            META_PROTOCOL_VERSION: "2026-07-28",
+                            META_CLIENT_CAPABILITIES: upload_caps
+                        }
+                    }
+                })),
+            )
+            .await?;
+            if get_resp["result"]["status"] == "completed" {
+                done_task = get_resp["result"].clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(done_task["status"], "completed");
+        assert_eq!(done_task["result"]["isError"], false);
+        assert!(!staged4.exists(), "staged file must be deleted after task completes");
+
         Ok(())
     }
 }

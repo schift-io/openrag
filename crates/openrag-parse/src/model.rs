@@ -192,6 +192,16 @@ pub enum OcrExecutionTarget {
     OfflineFallback,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOcrConsent {
+    #[default]
+    Default,
+    Ask,
+    Allow,
+    Deny,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsePolicyCtx {
     pub auth_level: AuthLevel,
@@ -200,6 +210,8 @@ pub struct ParsePolicyCtx {
     pub batch: bool,
     pub ocr_task: OcrTask,
     pub tenant_key: Option<String>,
+    #[serde(default)]
+    pub remote_ocr: RemoteOcrConsent,
 }
 
 impl Default for ParsePolicyCtx {
@@ -211,6 +223,7 @@ impl Default for ParsePolicyCtx {
             batch: false,
             ocr_task: OcrTask::Markdown,
             tenant_key: None,
+            remote_ocr: RemoteOcrConsent::Default,
         }
     }
 }

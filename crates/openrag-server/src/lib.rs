@@ -26,6 +26,7 @@ pub mod error;
 pub mod llm_cli;
 pub mod llm_router;
 pub mod mcp;
+mod mcp_mrtr;
 mod mcp_skills;
 mod mcp_tasks;
 pub mod state;

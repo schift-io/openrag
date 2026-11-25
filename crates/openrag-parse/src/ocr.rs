@@ -13,7 +13,7 @@ use tokio::process::Command;
 use crate::aliases::extract_parenthetical_aliases;
 use crate::model::{
     sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrBlock, OcrExecutionTarget,
-    OcrPolicyDecision, OcrTask, ParsePolicyCtx, ParsedDocument, ParsedPage,
+    OcrPolicyDecision, OcrTask, ParsePolicyCtx, ParsedDocument, ParsedPage, RemoteOcrConsent,
 };
 
 pub const DEFAULT_SHARE_DAILY_LIMIT: u32 = 50;
@@ -495,6 +495,41 @@ fn ocr_pages_by_index(
     Ok(out)
 }
 
+#[cfg(test)]
+pub(crate) type FakeOcrHook = std::sync::Arc<
+    dyn Fn(&[u8], &str, Sensitivity, bool, OcrTask) -> Result<SchiftOcrResponse, OpenRagError>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static FAKE_OCR_HOOK: FakeOcrHook;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_fake_ocr_hook<F, T>(hook: FakeOcrHook, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    FAKE_OCR_HOOK.scope(hook, fut).await
+}
+
+async fn invoke_ocr_client(
+    client: &SchiftOcrClient,
+    image_bytes: &[u8],
+    filename: &str,
+    mode: Sensitivity,
+    batch: bool,
+    task: OcrTask,
+) -> Result<SchiftOcrResponse, OpenRagError> {
+    #[cfg(test)]
+    if let Ok(res) = FAKE_OCR_HOOK.try_with(|h| h(image_bytes, filename, mode, batch, task)) {
+        return res;
+    }
+    client.run_ocr(image_bytes, filename, mode, batch, task).await
+}
+
 /// Sends a PDF to the OCR endpoint once and fills the listed pages (0-based) with its text.
 /// Used for scanned pages, which have no text layer; pages that have one keep it.
 #[allow(clippy::too_many_arguments)]
@@ -516,8 +551,7 @@ pub async fn ocr_pdf_pages(
         }
     }
     let fname = filename.unwrap_or("document.pdf");
-    let resp = client
-        .run_ocr(bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
+    let resp = invoke_ocr_client(client, bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
         .await?;
     let by_index = ocr_pages_by_index(&resp)?;
     for &i in pages {
@@ -714,7 +748,21 @@ pub async fn parse_image_with_ocr(
         return Err(OpenRagError::Validation("image has zero dimensions".into()));
     }
 
-    let policy = resolve_ocr_policy_with_target(cfg, ctx, remote_client.is_some())?;
+    let effective_remote_client = match ctx.remote_ocr {
+        RemoteOcrConsent::Deny => None,
+        _ => remote_client,
+    };
+    let policy = resolve_ocr_policy_with_target(cfg, ctx, effective_remote_client.is_some())?;
+    if policy.execution_target == OcrExecutionTarget::SchiftCloud
+        && effective_remote_client.is_some()
+        && ctx.remote_ocr == RemoteOcrConsent::Ask
+    {
+        // Ask before consuming quota or sending bytes to the remote OCR service.
+        return Err(OpenRagError::RemoteOcrConsentRequired {
+            pages_needing_ocr: 1,
+            total_pages: 1,
+        });
+    }
     if policy.effective_mode == Sensitivity::Share {
         if let Some(q) = quota {
             let tenant = ctx.tenant_key.as_deref().unwrap_or("default");
@@ -726,11 +774,17 @@ pub async fn parse_image_with_ocr(
     let dewarped = dewarp_image(&rgb_raw, cfg);
 
     if policy.execution_target == OcrExecutionTarget::SchiftCloud {
-        if let Some(client) = remote_client {
+        if let Some(client) = effective_remote_client {
             let fname = filename.unwrap_or("page.png");
-            let resp = client
-                .run_ocr(bytes, fname, policy.effective_mode, ctx.batch, ctx.ocr_task)
-                .await?;
+            let resp = invoke_ocr_client(
+                client,
+                bytes,
+                fname,
+                policy.effective_mode,
+                ctx.batch,
+                ctx.ocr_task,
+            )
+            .await?;
             return build_doc_from_schift_response(bytes, format, filename, &dewarped, resp, policy);
         }
     }

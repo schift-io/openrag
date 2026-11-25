@@ -1056,6 +1056,7 @@ impl Watcher {
             denied_group_ids: Vec::new(),
             sensitivity: None,
             ocr_mode: None,
+            remote_ocr: openrag_parse::RemoteOcrConsent::Default,
             batch: false,
             tags: Vec::new(),
             external_backend: None,

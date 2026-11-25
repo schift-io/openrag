@@ -27,7 +27,7 @@ pub use hwp::{escape_html, parse_hml, parse_hwp5, parse_hwp_family, parse_hwpx, 
 pub use model::{
     sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrBlock, OcrExecutionTarget,
     OcrPolicyDecision, OcrTask, ParsePolicyCtx, ParsedDocument, ParsedFigure, ParsedPage,
-    RenderedPageThumbnail,
+    RemoteOcrConsent, RenderedPageThumbnail,
 };
 pub use ocr::{
     detect_foreground_blocks, dewarp_image, ocr_pdf_pages, ocr_whole_pdf, parse_image_with_ocr,
@@ -250,20 +250,31 @@ impl DocumentParser {
                     return Ok(doc);
                 }
                 if let Some(client) = ocr {
-                    ocr_pdf_pages(
-                        &mut doc,
-                        bytes,
-                        filename,
-                        &scan_pages,
-                        cfg,
-                        ctx,
-                        Some(&self.share_quota),
-                        client,
-                    )
-                    .await?;
-                    // ocr_pdf_pages names the native engine; this text came from kordoc.
-                    doc.parser_engine = "kordoc+schift_ocr".to_string();
-                    return Ok(doc);
+                    match ctx.remote_ocr {
+                        RemoteOcrConsent::Ask => {
+                            return Err(OpenRagError::RemoteOcrConsentRequired {
+                                pages_needing_ocr: scan_pages.len(),
+                                total_pages: doc.pages.len(),
+                            });
+                        }
+                        RemoteOcrConsent::Deny => {}
+                        RemoteOcrConsent::Allow | RemoteOcrConsent::Default => {
+                            ocr_pdf_pages(
+                                &mut doc,
+                                bytes,
+                                filename,
+                                &scan_pages,
+                                cfg,
+                                ctx,
+                                Some(&self.share_quota),
+                                client,
+                            )
+                            .await?;
+                            // ocr_pdf_pages names the native engine; this text came from kordoc.
+                            doc.parser_engine = "kordoc+schift_ocr".to_string();
+                            return Ok(doc);
+                        }
+                    }
                 }
                 if scan_pages.len() == doc.pages.len() {
                     return Err(OpenRagError::Validation(
@@ -277,9 +288,26 @@ impl DocumentParser {
             Ok(v) => v,
             // The native parser cannot walk every PDF (e.g. compressed object streams).
             Err(OpenRagError::Validation(msg)) if msg.starts_with("corrupt PDF") => match ocr {
-                Some(client) => {
-                    return ocr_whole_pdf(bytes, filename, cfg, ctx, Some(&self.share_quota), client).await
-                }
+                Some(client) => match ctx.remote_ocr {
+                    RemoteOcrConsent::Ask => {
+                        return Err(OpenRagError::RemoteOcrConsentRequired {
+                            pages_needing_ocr: 1,
+                            total_pages: 1,
+                        });
+                    }
+                    RemoteOcrConsent::Deny => return Err(OpenRagError::Validation(msg)),
+                    RemoteOcrConsent::Allow | RemoteOcrConsent::Default => {
+                        return ocr_whole_pdf(
+                            bytes,
+                            filename,
+                            cfg,
+                            ctx,
+                            Some(&self.share_quota),
+                            client,
+                        )
+                        .await;
+                    }
+                },
                 None => return Err(OpenRagError::Validation(msg)),
             },
             Err(e) => return Err(e),
@@ -288,9 +316,29 @@ impl DocumentParser {
             return Ok(doc);
         }
         if let Some(client) = ocr {
-            ocr_pdf_pages(&mut doc, bytes, filename, &scan_pages, cfg, ctx, Some(&self.share_quota), client)
-                .await?;
-            return Ok(doc);
+            match ctx.remote_ocr {
+                RemoteOcrConsent::Ask => {
+                    return Err(OpenRagError::RemoteOcrConsentRequired {
+                        pages_needing_ocr: scan_pages.len(),
+                        total_pages: doc.pages.len(),
+                    });
+                }
+                RemoteOcrConsent::Deny => {}
+                RemoteOcrConsent::Allow | RemoteOcrConsent::Default => {
+                    ocr_pdf_pages(
+                        &mut doc,
+                        bytes,
+                        filename,
+                        &scan_pages,
+                        cfg,
+                        ctx,
+                        Some(&self.share_quota),
+                        client,
+                    )
+                    .await?;
+                    return Ok(doc);
+                }
+            }
         }
         if scan_pages.len() == doc.pages.len() {
             return Err(OpenRagError::Validation(
@@ -552,5 +600,347 @@ EOF"#,
             println!("page {} chars={}", page.page_no, page.raw_markdown.chars().count());
         }
         Ok(())
+    }
+
+    fn make_fake_ocr_hook(
+        response: SchiftOcrResponse,
+    ) -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, crate::ocr::FakeOcrHook) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let hook = Arc::new(move |_: &[u8], _: &str, _: openrag_core::Sensitivity, _: bool, _: OcrTask| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(response.clone())
+        });
+        (calls, hook)
+    }
+
+    fn tiny_png_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([240, 240, 240]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut cursor, image::ImageFormat::Png)?;
+        Ok(cursor.into_inner())
+    }
+
+    #[tokio::test]
+    async fn remote_ocr_consent_native_pdf_branch() -> TestResult {
+        use std::sync::atomic::Ordering;
+
+        let ocr_resp: SchiftOcrResponse = serde_json::from_value(serde_json::json!({
+            "pages": [
+                {"page_no": 1, "result": {"markdown": "OCR page 1"}},
+                {"page_no": 2, "result": {"markdown": "OCR page 2"}}
+            ]
+        }))?;
+        let (calls, hook) = make_fake_ocr_hook(ocr_resp);
+
+        crate::ocr::with_fake_ocr_hook(hook, async move {
+            let mut parser = DocumentParser::new();
+            parser.ocr_client = Some(SchiftOcrClient::new("http://ocr.test.invalid", None)?);
+
+            let mut cfg = crate::pdf::tests::test_parse_cfg();
+            cfg.pdf_engine = "native".into();
+
+            // 2-page mixed PDF: page 1 has text, page 2 is scanned (empty).
+            let mixed = crate::pdf::tests::pdf_with_pages(&[Some("Native page one"), None]);
+            let all_empty = crate::pdf::tests::pdf_with_pages(&[None]);
+            let text_only = crate::pdf::tests::pdf_with_pages(&[Some("Already readable")]);
+
+            // Text-only PDF with Ask never needs remote OCR -> succeeds without asking or calling OCR.
+            let ok_text = parser
+                .parse(
+                    &text_only,
+                    Some("application/pdf"),
+                    Some("readable.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Ask,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(ok_text.pages.len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Mixed PDF with Ask -> consent error (1 of 2), calls nothing.
+            let ask_err = parser
+                .parse(
+                    &mixed,
+                    Some("application/pdf"),
+                    Some("mixed.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Ask,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                ask_err,
+                Err(OpenRagError::RemoteOcrConsentRequired {
+                    pages_needing_ocr: 1,
+                    total_pages: 2,
+                })
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Mixed PDF with Deny -> keeps page 2 empty, calls nothing.
+            let deny_mixed = parser
+                .parse(
+                    &mixed,
+                    Some("application/pdf"),
+                    Some("mixed.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(deny_mixed.pages.len(), 2);
+            assert!(deny_mixed.pages[0].raw_markdown.contains("Native page one"));
+            assert!(deny_mixed.pages[1].raw_markdown.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // All-empty PDF with Deny -> today's refusal error, calls nothing.
+            let deny_empty = parser
+                .parse(
+                    &all_empty,
+                    Some("application/pdf"),
+                    Some("scan.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&deny_empty, Err(OpenRagError::Validation(m)) if m.contains("no text layer")),
+                "{deny_empty:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Default and Allow -> call OCR as before.
+            for (expected_calls, consent) in [(1, RemoteOcrConsent::Default), (2, RemoteOcrConsent::Allow)]
+            {
+                let doc = parser
+                    .parse(
+                        &mixed,
+                        Some("application/pdf"),
+                        Some("mixed.pdf"),
+                        &cfg,
+                        &ParsePolicyCtx {
+                            remote_ocr: consent,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                assert_eq!(doc.parser_engine, "pdf_native+schift_ocr");
+                assert!(doc.pages[0].raw_markdown.contains("Native page one"));
+                assert_eq!(doc.pages[1].raw_markdown, "OCR page 2");
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn remote_ocr_consent_kordoc_branch() -> TestResult {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir()?;
+        let ocr_resp: SchiftOcrResponse = serde_json::from_value(serde_json::json!({
+            "pages": [
+                {"page_no": 1, "result": {"markdown": "OCR k1"}},
+                {"page_no": 2, "result": {"markdown": "OCR k2"}}
+            ]
+        }))?;
+        let (calls, hook) = make_fake_ocr_hook(ocr_resp);
+
+        let mixed_script = write_fake_kordoc(
+            tmp.path(),
+            "kordoc-mixed.sh",
+            r#"printf '{"success":true,"fileType":"pdf","pageCount":2,"pages":[{"pageNumber":1,"markdown":"Kordoc page 1"},{"pageNumber":2,"markdown":""}]}'"#,
+        )?;
+        let empty_script = write_fake_kordoc(
+            tmp.path(),
+            "kordoc-all-empty.sh",
+            r#"printf '{"success":true,"fileType":"pdf","pageCount":2,"pages":[{"pageNumber":1,"markdown":""},{"pageNumber":2,"markdown":""}]}'"#,
+        )?;
+
+        crate::ocr::with_fake_ocr_hook(hook, async move {
+            let pdf = crate::pdf::tests::pdf_with_pages(&[Some("Native"), None]);
+            let cfg = crate::pdf::tests::test_parse_cfg();
+
+            let mut parser = parser_with_kordoc(mixed_script);
+            parser.ocr_client = Some(SchiftOcrClient::new("http://ocr.test.invalid", None)?);
+
+            // Ask -> 1 of 2 pages, no OCR call.
+            let ask_err = parser
+                .parse(
+                    &pdf,
+                    Some("application/pdf"),
+                    Some("kdoc.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Ask,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                ask_err,
+                Err(OpenRagError::RemoteOcrConsentRequired {
+                    pages_needing_ocr: 1,
+                    total_pages: 2,
+                })
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Deny on mixed -> keeps page 2 empty, no OCR call.
+            let deny_doc = parser
+                .parse(
+                    &pdf,
+                    Some("application/pdf"),
+                    Some("kdoc.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(deny_doc.parser_engine, "kordoc");
+            assert_eq!(deny_doc.pages[0].raw_markdown, "Kordoc page 1");
+            assert!(deny_doc.pages[1].raw_markdown.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Deny on all-empty -> refuses with today's error, no OCR call.
+            let mut empty_parser = parser_with_kordoc(empty_script);
+            empty_parser.ocr_client = Some(SchiftOcrClient::new("http://ocr.test.invalid", None)?);
+            let deny_empty = empty_parser
+                .parse(
+                    &pdf,
+                    Some("application/pdf"),
+                    Some("blank.pdf"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(&deny_empty, Err(OpenRagError::Validation(m)) if m.contains("kordoc OCR found no text")),
+                "{deny_empty:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Default and Allow -> call OCR and produce kordoc+schift_ocr.
+            for (expected_calls, consent) in [(1, RemoteOcrConsent::Default), (2, RemoteOcrConsent::Allow)]
+            {
+                let doc = parser
+                    .parse(
+                        &pdf,
+                        Some("application/pdf"),
+                        Some("kdoc.pdf"),
+                        &cfg,
+                        &ParsePolicyCtx {
+                            remote_ocr: consent,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                assert_eq!(doc.parser_engine, "kordoc+schift_ocr");
+                assert_eq!(doc.pages[0].raw_markdown, "Kordoc page 1");
+                assert_eq!(doc.pages[1].raw_markdown, "OCR k2");
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn remote_ocr_consent_image_branch() -> TestResult {
+        use std::sync::atomic::Ordering;
+
+        let ocr_resp: SchiftOcrResponse = serde_json::from_value(serde_json::json!({
+            "result": {"markdown": "OCR image text"}
+        }))?;
+        let (calls, hook) = make_fake_ocr_hook(ocr_resp);
+
+        crate::ocr::with_fake_ocr_hook(hook, async move {
+            let mut parser = DocumentParser::new();
+            parser.ocr_client = Some(SchiftOcrClient::new("http://ocr.test.invalid", None)?);
+            let cfg = crate::pdf::tests::test_parse_cfg();
+            let png = tiny_png_bytes()?;
+
+            // Ask -> 1 of 1 pages, calls nothing, consumes no share quota.
+            let ask_err = parser
+                .parse(
+                    &png,
+                    Some("image/png"),
+                    Some("scan.png"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Ask,
+                        tenant_key: Some("t-ask".into()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                ask_err,
+                Err(OpenRagError::RemoteOcrConsentRequired {
+                    pages_needing_ocr: 1,
+                    total_pages: 1,
+                })
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(parser.share_quota.used_today("t-ask"), 0);
+
+            // Deny -> offline fallback, calls nothing.
+            let deny_doc = parser
+                .parse(
+                    &png,
+                    Some("image/png"),
+                    Some("scan.png"),
+                    &cfg,
+                    &ParsePolicyCtx {
+                        remote_ocr: RemoteOcrConsent::Deny,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(deny_doc.parser_engine, "offline_ocr");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Default and Allow -> call OCR.
+            for (expected_calls, consent) in [(1, RemoteOcrConsent::Default), (2, RemoteOcrConsent::Allow)]
+            {
+                let doc = parser
+                    .parse(
+                        &png,
+                        Some("image/png"),
+                        Some("scan.png"),
+                        &cfg,
+                        &ParsePolicyCtx {
+                            remote_ocr: consent,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                assert_eq!(doc.parser_engine, "schift_ocr");
+                assert_eq!(doc.full_markdown, "OCR image text");
+                assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            }
+            Ok(())
+        })
+        .await
     }
 }

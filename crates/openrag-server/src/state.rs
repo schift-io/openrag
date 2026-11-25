@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,8 @@ use openrag_pii::{
     InMemoryVaultStore, MasterKek, PiiEngine,
 };
 use crate::llm_router::{LlmHttpTransport, ReqwestLlmTransport};
+use crate::mcp::IngestDispatchHook;
+use crate::mcp_mrtr::{McpUploadStore, RequestStateNonceStore};
 use openrag_retrieve::{
     HybridRetriever, InMemoryHybridRetriever, InMemoryRetrieveBackend, PgHybridRetriever,
     PgRetrieveBackend,
@@ -121,6 +123,7 @@ pub struct AppStateParts {
     search_space_config: SearchSpaceConfig,
     master_kek: MasterKek,
     blob_store: Arc<dyn ThumbnailBlobStore>,
+    mcp_staging_dir: PathBuf,
 }
 
 pub struct AppState {
@@ -147,6 +150,10 @@ pub struct AppState {
     pub in_memory_concepts: InMemoryConceptStore,
     pub http_client: reqwest::Client,
     pub llm_transport: Arc<dyn LlmHttpTransport>,
+    pub mcp_uploads: Arc<McpUploadStore>,
+    pub mcp_nonces: Arc<RequestStateNonceStore>,
+    pub(crate) mcp_file_uploads_override: Option<bool>,
+    pub(crate) mcp_ingest_hook: Option<IngestDispatchHook>,
 }
 
 impl AppState {
@@ -207,6 +214,12 @@ impl AppState {
         let master_kek = resolve_master_kek()?;
 
         let blob_store = blob_store_from_env().await?;
+        let mcp_staging_dir = match non_empty_env("OPENRAG_BLOB_DIR") {
+            Some(dir) => PathBuf::from(dir).join("mcp-staging"),
+            None => std::env::temp_dir()
+                .join("openrag-blobs")
+                .join("mcp-staging"),
+        };
 
         Self::build_with_parts(AppStateParts {
             mode,
@@ -218,6 +231,7 @@ impl AppState {
             search_space_config,
             master_kek,
             blob_store,
+            mcp_staging_dir,
         })
     }
 
@@ -225,6 +239,9 @@ impl AppState {
         let pipeline = default_pipeline_config();
         let search_space_config = default_search_space_config();
         let master_kek = resolve_master_kek_dev_default();
+        let mcp_staging_dir = std::env::temp_dir()
+            .join(format!("openrag-test-blobs-{}", Uuid::new_v4().simple()))
+            .join("mcp-staging");
         Self::build_with_parts(AppStateParts {
             mode: OpenRagMode::Offline,
             app_pool: None,
@@ -235,6 +252,7 @@ impl AppState {
             search_space_config,
             master_kek,
             blob_store: Arc::new(InMemoryBlobStore::new()),
+            mcp_staging_dir,
         })
     }
 
@@ -249,6 +267,7 @@ impl AppState {
             search_space_config,
             master_kek,
             blob_store,
+            mcp_staging_dir,
         } = parts;
         let pii_engine = Arc::new(RwLock::new(PiiEngine::from_config(&pipeline.pii)));
         let pipeline_config = Arc::new(RwLock::new(pipeline.clone()));
@@ -352,7 +371,67 @@ impl AppState {
             in_memory_concepts,
             http_client,
             llm_transport,
+            mcp_uploads: Arc::new(McpUploadStore::new(mcp_staging_dir)),
+            mcp_nonces: Arc::new(RequestStateNonceStore::new()),
+            mcp_file_uploads_override: None,
+            mcp_ingest_hook: None,
         }))
+    }
+
+    pub fn mcp_file_uploads_enabled(&self) -> bool {
+        self.mcp_file_uploads_override
+            .unwrap_or_else(mcp_file_uploads_from_env)
+    }
+
+    #[doc(hidden)]
+    pub fn with_mcp_file_uploads(&self, enabled: bool) -> Arc<Self> {
+        self.clone_with_mcp(Some(enabled), None, None)
+    }
+
+    #[doc(hidden)]
+    pub fn with_mcp_staging_dir(&self, staging_dir: PathBuf) -> Arc<Self> {
+        self.clone_with_mcp(None, Some(Arc::new(McpUploadStore::new(staging_dir))), None)
+    }
+
+    #[doc(hidden)]
+    pub fn with_mcp_ingest_hook(&self, hook: IngestDispatchHook) -> Arc<Self> {
+        self.clone_with_mcp(None, None, Some(hook))
+    }
+
+    fn clone_with_mcp(
+        &self,
+        file_uploads_override: Option<bool>,
+        mcp_uploads: Option<Arc<McpUploadStore>>,
+        mcp_ingest_hook: Option<IngestDispatchHook>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            mode: self.mode,
+            app_pool: self.app_pool.clone(),
+            worker_pool: self.worker_pool.clone(),
+            admin_pool: self.admin_pool.clone(),
+            default_org_id: self.default_org_id,
+            pipeline_config: Arc::clone(&self.pipeline_config),
+            search_space_config: self.search_space_config.clone(),
+            master_kek: self.master_kek.clone(),
+            pii_engine: Arc::clone(&self.pii_engine),
+            in_memory_vault: Arc::clone(&self.in_memory_vault),
+            parser: Arc::clone(&self.parser),
+            thumbnailer: self.thumbnailer.clone(),
+            text_embedder: Arc::clone(&self.text_embedder),
+            has_text_model: self.has_text_model,
+            blob_store: Arc::clone(&self.blob_store),
+            memory_router: Arc::clone(&self.memory_router),
+            kumiho_backend: Arc::clone(&self.kumiho_backend),
+            in_memory_retrieve: Arc::clone(&self.in_memory_retrieve),
+            in_memory_eval: Arc::clone(&self.in_memory_eval),
+            in_memory_concepts: self.in_memory_concepts.clone(),
+            http_client: self.http_client.clone(),
+            llm_transport: Arc::clone(&self.llm_transport),
+            mcp_uploads: mcp_uploads.unwrap_or_else(|| Arc::clone(&self.mcp_uploads)),
+            mcp_nonces: Arc::clone(&self.mcp_nonces),
+            mcp_file_uploads_override: file_uploads_override.or(self.mcp_file_uploads_override),
+            mcp_ingest_hook: mcp_ingest_hook.or_else(|| self.mcp_ingest_hook.clone()),
+        })
     }
 
     pub fn with_mode_and_transport(
@@ -383,6 +462,10 @@ impl AppState {
             in_memory_concepts: self.in_memory_concepts.clone(),
             http_client: self.http_client.clone(),
             llm_transport,
+            mcp_uploads: Arc::clone(&self.mcp_uploads),
+            mcp_nonces: Arc::clone(&self.mcp_nonces),
+            mcp_file_uploads_override: self.mcp_file_uploads_override,
+            mcp_ingest_hook: self.mcp_ingest_hook.clone(),
         })
     }
 
@@ -491,6 +574,10 @@ pub fn non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn mcp_file_uploads_from_env() -> bool {
+    std::env::var("OPENRAG_MCP_FILE_UPLOADS").as_deref() == Ok("1")
 }
 
 /// Registers every pg_pinecone index for automatic rebuilds (what migration 014 does) on each

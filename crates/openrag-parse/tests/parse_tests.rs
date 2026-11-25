@@ -225,6 +225,7 @@ fn f12_ocr_mode_guard_and_share_quota() -> Result<(), Box<dyn std::error::Error>
             batch: false,
             ocr_task: OcrTask::Markdown,
             tenant_key: None,
+            ..Default::default()
         },
     )?;
     assert_eq!(d2.effective_mode, Sensitivity::Share);
@@ -240,6 +241,7 @@ fn f12_ocr_mode_guard_and_share_quota() -> Result<(), Box<dyn std::error::Error>
             batch: false,
             ocr_task: OcrTask::Markdown,
             tenant_key: None,
+            ..Default::default()
         },
     )?;
     assert_eq!(d5.effective_mode, Sensitivity::Private);
@@ -255,6 +257,7 @@ fn f12_ocr_mode_guard_and_share_quota() -> Result<(), Box<dyn std::error::Error>
             batch: false,
             ocr_task: OcrTask::Markdown,
             tenant_key: None,
+            ..Default::default()
         },
     )?;
     assert_eq!(d8.effective_mode, Sensitivity::Zdr);
@@ -279,6 +282,7 @@ fn f12_ocr_mode_guard_and_share_quota() -> Result<(), Box<dyn std::error::Error>
             batch: true,
             ocr_task: OcrTask::Markdown,
             tenant_key: None,
+            ..Default::default()
         },
     );
     assert!(matches!(

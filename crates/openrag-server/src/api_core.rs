@@ -26,6 +26,7 @@ use openrag_memory::{
 use openrag_parse::{
     resolve_ocr_policy, sha256_hex_bytes, sha256_hex_str, DocumentFormat, OcrTask,
     ParsePolicyCtx, ParsePersister, ParsedDocument, ParsedPage, PersistParsedDocumentInput,
+    RemoteOcrConsent,
 };
 use openrag_pii::{
     GuardEngine, GuardPolicyRuntime, GuardRepo, InMemoryConceptAliasLookup, PiiEngine,
@@ -396,6 +397,7 @@ pub(crate) struct IngestPayload {
     pub(crate) denied_group_ids: Vec<Uuid>,
     pub(crate) sensitivity: Option<Sensitivity>,
     pub(crate) ocr_mode: Option<Sensitivity>,
+    pub(crate) remote_ocr: RemoteOcrConsent,
     pub(crate) batch: bool,
     pub(crate) tags: Vec<String>,
     pub(crate) external_backend: Option<String>,
@@ -445,6 +447,7 @@ async fn upload_or_create_document_handler(
             denied_group_ids: req_json.denied_group_ids,
             sensitivity: req_json.sensitivity,
             ocr_mode: req_json.ocr_mode,
+            remote_ocr: RemoteOcrConsent::Default,
             batch: req_json.batch,
             tags: req_json.tags,
             external_backend: req_json.external_backend,
@@ -496,6 +499,7 @@ pub(crate) async fn parse_multipart_ingest(mut multipart: Multipart) -> Result<I
         denied_group_ids: Vec::new(),
         sensitivity: None,
         ocr_mode: None,
+        remote_ocr: RemoteOcrConsent::Default,
         batch: false,
         tags: Vec::new(),
         external_backend: None,
@@ -561,6 +565,28 @@ pub(crate) async fn parse_multipart_ingest(mut multipart: Multipart) -> Result<I
             "mode" | "ocr_mode" => {
                 if let Some(s) = non_empty_utf8(&data) {
                     payload.ocr_mode = Some(parse_sensitivity(&s)?);
+                }
+            }
+            "remote_ocr" => {
+                let raw = std::str::from_utf8(&data).map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_remote_ocr",
+                        "remote_ocr must be ask, allow, or deny",
+                    )
+                })?;
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    payload.remote_ocr = match trimmed.to_ascii_lowercase().as_str() {
+                        "ask" => RemoteOcrConsent::Ask,
+                        "allow" => RemoteOcrConsent::Allow,
+                        "deny" => RemoteOcrConsent::Deny,
+                        other => {
+                            return Err(ApiError::bad_request(
+                                "invalid_remote_ocr",
+                                format!("remote_ocr must be ask, allow, or deny (got '{other}')"),
+                            ));
+                        }
+                    };
                 }
             }
             "batch" => {
@@ -639,6 +665,7 @@ pub(crate) async fn ingest_document_into_bucket(
         batch: payload.batch,
         ocr_task: OcrTask::Markdown,
         tenant_key: Some(principal.org_id.to_string()),
+        remote_ocr: payload.remote_ocr,
     };
 
     let mut ocr_decision = resolve_ocr_policy(&pipeline.parse, &parse_ctx)?;
@@ -4289,5 +4316,118 @@ mod tests {
             &neutralize_literal_pii_tokens("LaunderTitle [PII:EMAIL:deadbeef]"),
         );
         assert_eq!(empty_chunks, vec!["LaunderTitle [PII-LITERAL:EMAIL:deadbeef]"]);
+    }
+
+    #[tokio::test]
+    async fn rest_multipart_remote_ocr_field_and_409_mapping() -> Result<(), String> {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        let state = AppState::new_offline_for_test().map_err(|e| e.to_string())?;
+        let app = crate::build_router(state);
+        let principal = PrincipalContext::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            AuthLevel::new(5).map_err(|e| e.to_string())?,
+        );
+
+        let send_multipart = |fields: &[(&str, String)]| {
+            let app = app.clone();
+            let principal = principal.clone();
+            let (boundary, body) = crate::mcp::build_multipart("scan.pdf", b"%PDF-1.4\n", fields);
+            async move {
+                let mut req = Request::builder()
+                    .method(Method::POST)
+                    .uri("/v2/buckets/default/documents")
+                    .header(CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+                    .body(Body::from(body))
+                    .map_err(|e| e.to_string())?;
+                req.extensions_mut()
+                    .insert(crate::auth::TrustedPrincipal(principal));
+                let resp = match app.oneshot(req).await {
+                    Ok(r) => r,
+                    Err(never) => match never {},
+                };
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                Ok::<(StatusCode, Value), String>((status, json))
+            }
+        };
+
+        // Invalid `remote_ocr` value -> 400 invalid_remote_ocr.
+        let (st, body) = send_multipart(&[("remote_ocr", "maybe".into())]).await?;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_remote_ocr");
+
+        // Absent `remote_ocr` -> accepted by multipart parser (reaches DB check, unchanged).
+        let (st_absent, body_absent) = send_multipart(&[]).await?;
+        assert_eq!(st_absent, StatusCode::BAD_REQUEST);
+        assert_eq!(body_absent["code"], "config_error");
+
+        // Valid `remote_ocr=ask` -> accepted by multipart parser too.
+        let (st_ask, body_ask) = send_multipart(&[("remote_ocr", "ask".into())]).await?;
+        assert_eq!(st_ask, StatusCode::BAD_REQUEST);
+        assert_eq!(body_ask["code"], "config_error");
+
+        // Verify `parse_multipart_ingest` parses ask / allow / deny / absent and rejects bad values.
+        async fn parse_with(remote_ocr: Option<&str>) -> Result<Result<IngestPayload, ApiError>, String> {
+            let mut fields = Vec::new();
+            if let Some(v) = remote_ocr {
+                fields.push(("remote_ocr", v.to_string()));
+            }
+            let (boundary, body) = crate::mcp::build_multipart("scan.pdf", b"data", &fields);
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/")
+                .header(CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+                .body(Body::from(body))
+                .map_err(|e| e.to_string())?;
+            let mp = Multipart::from_request(req, &())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(parse_multipart_ingest(mp).await)
+        }
+        assert_eq!(
+            parse_with(None).await?.map_err(|e| e.message)?.remote_ocr,
+            RemoteOcrConsent::Default
+        );
+        assert_eq!(
+            parse_with(Some("ask")).await?.map_err(|e| e.message)?.remote_ocr,
+            RemoteOcrConsent::Ask
+        );
+        assert_eq!(
+            parse_with(Some("allow")).await?.map_err(|e| e.message)?.remote_ocr,
+            RemoteOcrConsent::Allow
+        );
+        assert_eq!(
+            parse_with(Some("deny")).await?.map_err(|e| e.message)?.remote_ocr,
+            RemoteOcrConsent::Deny
+        );
+        let bad = parse_with(Some("force")).await?;
+        assert!(matches!(bad, Err(ApiError { status: StatusCode::BAD_REQUEST, .. })));
+
+        // Verify `RemoteOcrConsentRequired` maps to HTTP 409 with the exact API error JSON shape.
+        let resp = ApiError::from(OpenRagError::RemoteOcrConsentRequired {
+            pages_needing_ocr: 3,
+            total_pages: 7,
+        })
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let raw = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .map_err(|e| e.to_string())?;
+        let err_json: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        assert_eq!(err_json["error"], "remote_ocr_consent_required");
+        assert_eq!(err_json["code"], "remote_ocr_consent_required");
+        assert_eq!(err_json["pages_needing_ocr"], 3);
+        assert_eq!(err_json["total_pages"], 7);
+        assert!(err_json["message"].as_str().is_some_and(|m| !m.is_empty()));
+
+        Ok(())
     }
 }

@@ -103,6 +103,20 @@ impl From<OpenRagError> for ApiError {
             } => Self::guard_blocked(surface, reason, matched_rule_ids, matched_categories),
             OpenRagError::NotFound(msg) => Self::not_found(msg),
             OpenRagError::Conflict(msg) => Self::conflict(msg),
+            OpenRagError::RemoteOcrConsentRequired {
+                pages_needing_ocr,
+                total_pages,
+            } => Self {
+                status: StatusCode::CONFLICT,
+                code: "remote_ocr_consent_required".into(),
+                message: format!(
+                    "{pages_needing_ocr} of {total_pages} pages require consent before sending to remote OCR"
+                ),
+                details: Some(json!({
+                    "pages_needing_ocr": pages_needing_ocr,
+                    "total_pages": total_pages,
+                })),
+            },
             OpenRagError::ExternalAdapter { adapter, message } => {
                 if message.starts_with("403") {
                     Self::forbidden("external_adapter_forbidden", format!("{adapter}: {message}"))
