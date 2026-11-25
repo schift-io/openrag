@@ -7,7 +7,7 @@ use openrag_core::{AccessScope, BBoxNorm1000, OpenRagError, PgPineconeSearchConf
 use openrag_db::{DbPool, RlsTransaction};
 use openrag_memory::{ConceptGraph, DeterministicTextEmbedder, InMemoryConceptStore, TextEmbedder};
 use openrag_store::{
-    cosine_similarity, expand_tag_filter_in_memory, expand_tag_filter_rls, normalize_tag,
+    cosine_similarity, expand_tag_filter_in_memory, expand_tag_filter_rls, l2_normalize, normalize_tag,
     push_tag_filter_predicates, tokenize_bm25, Bm25DocInput, Bm25Hit, Bm25Index, Bm25Query,
     Bm25Store, ExpandedTagFilter, IndexBinding, PgPineconeManager, TagTable, VectorHit,
     VectorSearchQuery, VectorTable,
@@ -23,6 +23,31 @@ use crate::query::{
 use crate::types::{
     BackendExecutionInput, BackendExecutionOutput, HydratedCandidate, RetrieveSpace, TagOnlyHit,
 };
+
+/// The query vector, averaged with the embedding of the caller's hypothetical answer when one is
+/// given (HyDE). The passage is embedded with the document prompt, so it lands in the same space as
+/// stored chunks; the sum is renormalized to unit length.
+async fn query_vector_with_hyde<E: TextEmbedder + ?Sized>(
+    embedder: &E,
+    query_text: &str,
+    hypothetical_answer: Option<&str>,
+) -> Result<Vec<f32>, OpenRagError> {
+    let q = embedder.embed_query(query_text).await?;
+    let Some(h) = hypothetical_answer else {
+        return Ok(q);
+    };
+    let hv = embedder.embed_text(h).await?;
+    if hv.len() != q.len() {
+        return Err(OpenRagError::Internal(format!(
+            "hypothetical answer embedding has {} dimensions, query has {}",
+            hv.len(),
+            q.len()
+        )));
+    }
+    let sum: Vec<f32> = q.iter().zip(&hv).map(|(a, b)| a + b).collect();
+    l2_normalize(&sum)
+}
+
 
 #[async_trait]
 pub trait RetrieveBackend: Send + Sync {
@@ -132,7 +157,7 @@ impl RetrieveBackend for PgRetrieveBackend {
                     &expanded_terms,
                     &input.effective_tag_filter,
                 );
-                self.embedder.embed_query(&embed_text).await?
+                query_vector_with_hyde(&*self.embedder, &embed_text, input.hypothetical_answer.as_deref()).await?
             }
         };
 
@@ -1451,7 +1476,7 @@ impl RetrieveBackend for InMemoryRetrieveBackend {
                     &expanded_terms,
                     &input.effective_tag_filter,
                 );
-                self.embedder.embed_query(&embed_text).await?
+                query_vector_with_hyde(&*self.embedder, &embed_text, input.hypothetical_answer.as_deref()).await?
             }
         };
 
@@ -1674,5 +1699,37 @@ impl RetrieveBackend for InMemoryRetrieveBackend {
         sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         sorted.truncate(limit as usize);
         Ok(sorted.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod hyde_tests {
+    use super::*;
+
+    fn norm(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[tokio::test]
+    async fn without_a_hypothetical_answer_the_query_vector_is_unchanged() -> Result<(), OpenRagError> {
+        let e = DeterministicTextEmbedder::default();
+        let plain = e.embed_query("출장비 한도").await?;
+        let got = query_vector_with_hyde(&e, "출장비 한도", None).await?;
+        assert_eq!(got, plain);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hypothetical_answer_is_averaged_in_and_renormalized() -> Result<(), OpenRagError> {
+        let e = DeterministicTextEmbedder::default();
+        let q = e.embed_query("출장비 한도").await?;
+        let h = e.embed_text("국내 출장 숙박비는 1박 7만 원까지 실비로 지급한다.").await?;
+        let got = query_vector_with_hyde(&e, "출장비 한도", Some("국내 출장 숙박비는 1박 7만 원까지 실비로 지급한다.")).await?;
+        assert!((norm(&got) - 1.0).abs() < 1e-4);
+        let cq = cosine_similarity(&got, &q)?;
+        let ch = cosine_similarity(&got, &h)?;
+        assert!(cq > 0.0 && ch > 0.0, "the result leans toward both: {cq} {ch}");
+        assert_ne!(got, q);
+        Ok(())
     }
 }

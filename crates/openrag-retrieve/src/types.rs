@@ -193,6 +193,10 @@ pub struct SearchRequest {
     /// With `latest_revision_only`, only what was in force at this instant survives.
     #[serde(default)]
     pub as_of: Option<DateTime<Utc>>,
+    /// A short passage that would answer the query, written by the calling AI (HyDE). When set,
+    /// it is embedded as a document and averaged with the query vector; text search is unchanged.
+    #[serde(default)]
+    pub hypothetical_answer: Option<String>,
 }
 
 impl Default for SearchRequest {
@@ -213,6 +217,7 @@ impl Default for SearchRequest {
             tag_filter: None,
             facet_limit: DEFAULT_FACET_LIMIT,
             as_of: None,
+            hypothetical_answer: None,
         }
     }
 }
@@ -449,6 +454,8 @@ pub struct HydratedCandidate {
 pub struct BackendExecutionInput {
     pub clean_query: String,
     pub explicit_query_vector: Option<Vec<f32>>,
+    /// HyDE passage from the caller; ignored when `explicit_query_vector` is set.
+    pub hypothetical_answer: Option<String>,
     pub bucket_id: Option<Uuid>,
     pub spaces: Vec<RetrieveSpace>,
     pub effective_tag_filter: TagFilter,

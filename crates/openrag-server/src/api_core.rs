@@ -1334,6 +1334,8 @@ struct BucketSearchHttpRequest {
     facet_limit: Option<i64>,
     /// Reference time for validity filtering/labels (RFC 3339). Default: now.
     as_of: Option<DateTime<Utc>>,
+    /// HyDE passage written by the caller (see `SearchRequest::hypothetical_answer`).
+    hypothetical_answer: Option<String>,
 }
 
 async fn search_bucket_handler(
@@ -1389,6 +1391,7 @@ async fn search_bucket_handler(
         tag_filter,
         facet_limit: req.facet_limit.unwrap_or(50),
         as_of: req.as_of,
+        hypothetical_answer: req.hypothetical_answer,
     };
 
     let retriever = state
