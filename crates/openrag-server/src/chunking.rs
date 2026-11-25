@@ -1776,20 +1776,23 @@ Cancer)에서 발표한 2008년 선진국의 연령표준화 암발생률은";
 
     #[test]
     fn config_chunker_defaults_and_yaml_parsing() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(ChunkerKind::default(), ChunkerKind::Fixed);
+        assert_eq!(ChunkerKind::default(), ChunkerKind::Structure);
 
         let base = include_str!("../../../configs/pipeline.default.yaml");
         let cfg = PipelineConfig::from_yaml_str(base)?;
-        assert_eq!(cfg.store.chunker, ChunkerKind::Fixed);
+        assert_eq!(cfg.store.chunker, ChunkerKind::Structure);
 
-        let as_struct = base.replace("chunker: fixed", "chunker: structure");
+        let as_fixed = base.replace("chunker: structure", "chunker: fixed");
+        assert_eq!(PipelineConfig::from_yaml_str(&as_fixed)?.store.chunker, ChunkerKind::Fixed);
+
+        let as_struct = as_fixed.replace("chunker: fixed", "chunker: structure");
         assert_eq!(PipelineConfig::from_yaml_str(&as_struct)?.store.chunker, ChunkerKind::Structure);
 
-        let as_sem = base.replace("chunker: fixed", "chunker: semantic");
+        let as_sem = base.replace("chunker: structure", "chunker: semantic");
         assert_eq!(PipelineConfig::from_yaml_str(&as_sem)?.store.chunker, ChunkerKind::Semantic);
 
-        let omitted = base.replace("  chunker: fixed\n", "");
-        assert_eq!(PipelineConfig::from_yaml_str(&omitted)?.store.chunker, ChunkerKind::Fixed);
+        let omitted = base.replace("  chunker: structure\n", "");
+        assert_eq!(PipelineConfig::from_yaml_str(&omitted)?.store.chunker, ChunkerKind::Structure);
 
         // Verify serde lowercase roundtrip directly.
         let mut map = HashMap::new();

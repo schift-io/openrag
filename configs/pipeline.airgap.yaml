@@ -74,8 +74,9 @@ store:
   # Embed corpus chunks as "title: <document title> | text: <chunk>". Off: it showed no retrieval gain
   # on the Allganize KO benchmark, and the title already counts in the lexical rerank.
   embed_document_title: false
-  # Page chunking strategy: fixed, structure, or semantic.
-  chunker: fixed
+  # Page chunking strategy: fixed, structure, or semantic. structure splits at headings, lists and
+  # tables; on the Allganize KO benchmark (kordoc PDFs) it matched or beat fixed at page@5 and page@1.
+  chunker: structure
   # pg_pinecone search: share of clusters probed per query and exact re-ranking pool (x100 rows).
   # 0 keeps pg_pinecone's own value.
   pg_pinecone_search:

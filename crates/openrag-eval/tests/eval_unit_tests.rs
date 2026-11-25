@@ -238,7 +238,7 @@ retrieve:
     let parsed_fixture = parse_pipeline_yaml_tolerant(fixture_yaml)?;
     assert_eq!(parsed_fixture.store.dim, 256);
     assert!(!parsed_fixture.store.embed_document_title);
-    assert_eq!(parsed_fixture.store.chunker, openrag_core::ChunkerKind::Fixed);
+    assert_eq!(parsed_fixture.store.chunker, openrag_core::ChunkerKind::Structure);
     assert!((parsed_fixture.retrieve.latest_revision_boost - 0.15).abs() < 1e-6);
 
     let fixture_enabled = fixture_yaml.replace("bm25: pg_search", "bm25: pg_search\n  embed_document_title: true");
