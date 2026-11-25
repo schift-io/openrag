@@ -596,6 +596,8 @@ pub fn default_pipeline_config() -> PipelineConfig {
         profile: PipelineProfile::Standard,
         parse: ParseConfig {
             hwp_engine: "kordoc".into(),
+            pdf_engine: "kordoc".into(),
+            kordoc_ocr: true,
             ocr_engine: "schift_ocr".into(),
             dewarp_enabled: true,
             pdf_native_enabled: true,

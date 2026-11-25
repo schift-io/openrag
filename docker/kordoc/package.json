@@ -1,0 +1,8 @@
+{
+  "name": "openrag-kordoc",
+  "private": true,
+  "description": "kordoc CLI bundled in the OpenRAG API image (HWP and PDF parsing, local OCR)",
+  "dependencies": {
+    "kordoc": "4.25.15"
+  }
+}

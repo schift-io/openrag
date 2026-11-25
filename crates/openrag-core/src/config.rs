@@ -22,10 +22,22 @@ pub struct OcrModeRule {
     pub required_mode: Sensitivity,
 }
 
+fn default_pdf_engine() -> String {
+    "kordoc".to_string()
+}
+
+const fn default_kordoc_ocr() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParseConfig {
     pub hwp_engine: String,
+    #[serde(default = "default_pdf_engine")]
+    pub pdf_engine: String,
+    #[serde(default = "default_kordoc_ocr")]
+    pub kordoc_ocr: bool,
     pub ocr_engine: String,
     pub dewarp_enabled: bool,
     pub pdf_native_enabled: bool,

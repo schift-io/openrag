@@ -3,6 +3,10 @@ profile: airgap
 
 parse:
   hwp_engine: kordoc
+  # PDF parser engine: "kordoc" (CLI with local OCR) or "native" (built-in extractor).
+  pdf_engine: kordoc
+  # Run kordoc's local Korean OCR (--ocr) on PDF pages without a usable text layer.
+  kordoc_ocr: true
   ocr_engine: local_vllm
   dewarp_enabled: true
   pdf_native_enabled: true

@@ -124,6 +124,36 @@ fn store_chunker_defaults_and_parsing() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn parse_pdf_engine_and_kordoc_ocr_defaults_and_parsing() -> Result<(), Box<dyn std::error::Error>> {
+    let base = include_str!("../../../configs/pipeline.default.yaml");
+    let parsed = PipelineConfig::from_yaml_str(base)?;
+    assert_eq!(parsed.parse.pdf_engine, "kordoc");
+    assert!(parsed.parse.kordoc_ocr);
+
+    let airgap = include_str!("../../../configs/pipeline.airgap.yaml");
+    let parsed_airgap = PipelineConfig::from_yaml_str(airgap)?;
+    assert_eq!(parsed_airgap.parse.pdf_engine, "kordoc");
+    assert!(parsed_airgap.parse.kordoc_ocr);
+
+    let omitted = base
+        .replace("  pdf_engine: kordoc\n", "")
+        .replace("  kordoc_ocr: true\n", "");
+    assert_ne!(omitted, base);
+    let parsed_omitted = PipelineConfig::from_yaml_str(&omitted)?;
+    assert_eq!(parsed_omitted.parse.pdf_engine, "kordoc");
+    assert!(parsed_omitted.parse.kordoc_ocr);
+
+    let explicit = base
+        .replace("pdf_engine: kordoc", "pdf_engine: native")
+        .replace("kordoc_ocr: true", "kordoc_ocr: false");
+    assert_ne!(explicit, base);
+    let parsed_explicit = PipelineConfig::from_yaml_str(&explicit)?;
+    assert_eq!(parsed_explicit.parse.pdf_engine, "native");
+    assert!(!parsed_explicit.parse.kordoc_ocr);
+    Ok(())
+}
+
+#[test]
 fn invalid_configs_are_rejected() {
     let base = include_str!("../../../configs/pipeline.default.yaml");
 
