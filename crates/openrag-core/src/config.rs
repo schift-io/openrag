@@ -139,7 +139,7 @@ pub enum ChunkerKind {
 }
 
 const fn default_embed_document_title() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,7 +154,7 @@ pub struct StoreConfig {
     pub outbox_max_attempts: u32,
     #[serde(default)]
     pub pg_pinecone_search: PgPineconeSearchConfig,
-    /// Include the document title when embedding corpus chunks.
+    /// Include the document title when embedding corpus chunks (default off).
     #[serde(default = "default_embed_document_title")]
     pub embed_document_title: bool,
     /// Page chunking strategy (`fixed`, `structure`, or `semantic`).

@@ -110,7 +110,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
-            embed_document_title: true,
+            embed_document_title: false,
             chunker: ChunkerKind::Fixed,
         },
         retrieve: RetrieveConfig {

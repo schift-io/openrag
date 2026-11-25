@@ -84,18 +84,18 @@ fn pg_pinecone_search_defaults_and_bounds() -> Result<(), Box<dyn std::error::Er
 fn embed_document_title_defaults_and_parsing() -> Result<(), Box<dyn std::error::Error>> {
     let base = include_str!("../../../configs/pipeline.default.yaml");
     let parsed = PipelineConfig::from_yaml_str(base)?;
-    assert!(parsed.store.embed_document_title);
+    assert!(!parsed.store.embed_document_title);
 
     let airgap = include_str!("../../../configs/pipeline.airgap.yaml");
-    assert!(PipelineConfig::from_yaml_str(airgap)?.store.embed_document_title);
+    assert!(!PipelineConfig::from_yaml_str(airgap)?.store.embed_document_title);
 
-    let disabled = base.replace("embed_document_title: true", "embed_document_title: false");
-    assert_ne!(disabled, base);
-    assert!(!PipelineConfig::from_yaml_str(&disabled)?.store.embed_document_title);
+    let enabled = base.replace("embed_document_title: false", "embed_document_title: true");
+    assert_ne!(enabled, base);
+    assert!(PipelineConfig::from_yaml_str(&enabled)?.store.embed_document_title);
 
-    let omitted = base.replace("  embed_document_title: true\n", "");
+    let omitted = base.replace("  embed_document_title: false\n", "");
     assert_ne!(omitted, base);
-    assert!(PipelineConfig::from_yaml_str(&omitted)?.store.embed_document_title);
+    assert!(!PipelineConfig::from_yaml_str(&omitted)?.store.embed_document_title);
     Ok(())
 }
 

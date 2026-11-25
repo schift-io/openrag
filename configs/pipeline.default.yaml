@@ -87,8 +87,9 @@ store:
   external_mirror: none
   outbox_batch_size: 64
   outbox_max_attempts: 3
-  # Include the document title when embedding corpus chunks.
-  embed_document_title: true
+  # Embed corpus chunks as "title: <document title> | text: <chunk>". Off: it showed no retrieval gain
+  # on the Allganize KO benchmark, and the title already counts in the lexical rerank.
+  embed_document_title: false
   # Page chunking strategy: fixed, structure, or semantic.
   chunker: fixed
   # pg_pinecone search: share of clusters probed per query and exact re-ranking pool (x100 rows).
