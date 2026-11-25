@@ -23,7 +23,8 @@ Rust와 PostgreSQL 17/18로 만들었고, 누가 어떤 문서를 볼 수 있는
 - **문서 폴더를 지켜봐요.** 폴더에 파일을 넣거나 고치거나 지우면 30초 안에 검색에 반영돼요. 옮기거나 이름을
   바꾼 파일은 내용 해시로 알아봐서 다시 읽지 않고, 지운 파일은 검색에서만 빼고 기록은 남겨요. 엑셀·CSV는
   안내 카드로 찾고 칸 값은 AI가 필요한 행만 읽거나, 찾는 값이 든 행만 골라 가요.
-- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, DOCX·PPTX·HTML도 읽어요. 스캔한 PDF와 이미지는 Schift OCR로 읽어요. 키워드
+- **한국어 문서에 맞췄어요.** HWP·HWPX·HML을 표까지 살려 읽고, DOCX·PPTX·HTML도 읽어요. PDF는 kordoc으로 읽고, 스캔한 페이지는
+  서버 안에서 kordoc의 한국어 OCR로 읽어요. 사진 파일과 kordoc이 못 읽은 페이지만 Schift OCR로 보내요. 키워드
   검색은 한국어 형태소 분석(`pg_search` Lindera)을 써요.
 - **AI 모델을 들고 있지 않아요.** 답은 연결한 Claude Code·Codex가 쓰거나, 사내 LLM 서버(vLLM 등)를
   연결하면 서버가 직접 써요.
@@ -81,7 +82,7 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
    ┌──────────────────────────────────▼──────────────────────────────────┐
    │ OpenRAG API (Rust, 프로세스 하나)                                     │
    │  • 권한: ARN + 권한 그룹 + 등급(1~10), PostgreSQL RLS                │
-   │  • 문서 읽기: kordoc(HWP 계열), PDF, DOCX·PPTX·HTML, Schift OCR      │
+   │  • 문서 읽기: kordoc(HWP 계열·PDF), DOCX·PPTX·HTML, Schift OCR       │
    │  • 문서 폴더: 30초마다 훑어 추가·수정·이동·삭제를 반영(SHA-256)      │
    │  • 개인정보 가드: allow · warn · mask · block                        │
    │  • 색인: 바뀐 내용만 다시 색인(SHA-256), 실패 3회면 격리             │
@@ -100,6 +101,10 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 - **임베딩**은 `google/embeddinggemma-2`를 256차원으로 쓰도록 맞춰 뒀어요(기본 구성과 폐쇄망 구성
   모두 이 모델을 같이 띄워요). 한국어 검색 평가(Ko-StrategyQA)에서 nDCG@10 0.781이 나왔고, BM25를 섞으면 0.703으로 떨어져서
   기본으로는 섞지 않아요.
+- **PDF와 청킹**: Allganize 한국어 RAG 평가(PDF 59개, 질문 257개)에서 정답 페이지가 상위 5위 안에 든
+  비율이 kordoc으로 읽을 때 0.848, pdftotext로 읽을 때 0.724였어요. 페이지는 제목·목록·표 경계에서
+  나눠요(`store.chunker: structure`). 고정 길이로 자를 때와 비교하면 정답 페이지를 1위에 올린 질문이 9개
+  늘고 2개 줄었어요.
 - **메모리와 위키**: 대화에서 얻은 사실을 고칠 수 없는 패치(`amend` · `supersede` · `retract` · `redact`)로
   쌓고, DB 안의 위키는 `.md`/Obsidian과 양방향으로 동기화해요.
 - **페이지 썸네일**은 기본으로 꺼져 있어요(`thumbnail.enabled: false`). 켜면 S3 호환 저장소
@@ -109,9 +114,9 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 
 | 도구 | 하는 일 |
 | --- | --- |
-| `rag_search` | 내가 볼 수 있는 문서에서 찾기. 기본으로 지금 효력이 있는 문서만 찾아요 |
+| `rag_search` | 내가 볼 수 있는 문서에서 찾기. 기본으로 지금 효력이 있는 문서만 찾아요. 막연한 질문에는 AI가 예상 답(`hypothetical_answer`)을 같이 보내 비슷한 문단을 찾아요 |
 | `rag_ask` | 문서를 근거로 서버가 직접 답하기(서버에 LLM을 연결했을 때만) |
-| `rag_ingest` | 텍스트를 버킷에 넣기. 파일 경로는 stdio 연결에서만 돼요 |
+| `rag_ingest` | 텍스트나 파일을 버킷에 넣기. 파일 경로는 stdio 연결에서만, HTTP 연결은 파일 올리기를 켰을 때 파일을 직접 받아요 |
 | `rag_get_page` | 문서 한 페이지 읽기(가린 본문, 그림 위치, 썸네일 링크) |
 | `rag_list_documents` | 버킷에 들어 있는 문서 목록(원본 경로, 판, 효력) |
 | `rag_read_sheet` | 엑셀·CSV의 행 읽기와 값 찾기. 검색은 안내 카드로 파일을 찾고, 칸 값은 이걸로 읽거나 `find`로 그 값이 든 행만 골라요 |
@@ -125,6 +130,17 @@ HTTP 클라이언트 ───────────────▶ /v2/bucket
 | `concept_link` / `concept_resolve` | 같은 뜻의 용어(한글·영어 등) 묶기 / 찾기 |
 
 모든 도구 호출은 호출한 사람의 권한으로 돌고, 결과의 개인정보는 가려져요.
+
+MCP는 2026-07-28 규격과 이전 규격(2025-06-18, 2025-03-26, 2024-11-05)을 둘 다 받아요. 새 규격으로 붙는
+클라이언트는 이런 것도 써요.
+
+- **스킬**: 검색 요령을 담은 `skill://openrag-search/SKILL.md`를 읽어 가요.
+- **작업(Tasks)**: 폴더 훑기와 파일 적재처럼 오래 걸리는 호출은 작업으로 돌리고, 클라이언트가 끝날 때까지
+  상태를 물어봐요.
+- **원격 OCR 전에 묻기**: 클라이언트가 사용자에게 물어볼 수 있으면(elicitation), kordoc이 못 읽은 페이지를
+  회사 밖 Schift OCR로 보내기 전에 먼저 물어봐요. 거절하면 그 페이지는 글자 없이 넣고, 취소하면 넣지 않아요.
+- **파일 올리기**: 서버에 `OPENRAG_MCP_FILE_UPLOADS=1`을 넣으면 `rag_ingest`가 파일을 받아요. 4MiB까지는
+  요청에 담아 보내고, 그보다 크면 64MiB까지 서버가 알려 주는 주소로 따로 올려요. 기본은 꺼져 있어요.
 
 Claude Code·Codex 외의 MCP 클라이언트도 HTTP 주소와 키만 넣으면 돼요. Cursor(`.cursor/mcp.json`)는 이렇게 써요.
 
@@ -194,7 +210,8 @@ OpenRAG는 LLM을 내장하지 않아요. 기본으로는 연결한 Claude Code�
 
 ## 설정 파일 (`configs/`)
 
-- `pipeline.default.yaml`: 기본 구성. 256차원 임베딩, `pg_pinecone` native, kordoc, 등급별 Schift OCR 모드,
+- `pipeline.default.yaml`: 기본 구성. 256차원 임베딩, `pg_pinecone` native, kordoc(PDF 포함, 로컬 OCR),
+  `structure` 청킹, 등급별 Schift OCR 모드,
   개인정보 가드 규칙, 등급 8 이상 사내 LLM 전용
 - `pipeline.airgap.yaml`: 폐쇄망 구성. 로컬 임베딩·사내 LLM, 바깥 연결 허용 목록, 엄격한 가드
 - `search_space.example.yaml`: AutoRAG 탐색 공간. 개인정보 유출 0건, 권한 위반 0건을 통과해야만 채택해요

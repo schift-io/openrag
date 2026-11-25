@@ -46,7 +46,8 @@ Claude Code / Codex ──(MCP: rag_search)───────┘   찾은 문
 - **문서 폴더**: 서버가 이 폴더를 계속 지켜보면서 파일을 넣고, 고친 파일은 새 판으로 바꾸고, 지운 파일은
   검색에서 빼요([7장](#7-문서-넣기고치기지우기)). 기본으로 HWP, HWPX, MD, PDF, DOCX, PPTX, HTML, XLSX, CSV를
   읽고, 하위 폴더까지 다 봐요.
-- (선택) **Schift OCR 키**: 스캔한 PDF나 사진(PNG, JPG, WEBP)에서 글자를 읽을 때 필요해요([10장](#10-스캔본-읽기ocr)).
+- (선택) **Schift OCR 키**: 사진(PNG, JPG, WEBP)과, 서버 안 OCR이 읽지 못한 PDF 페이지를 읽을 때 필요해요.
+  스캔한 PDF는 키 없이도 서버 안에서 읽어요([10장](#10-스캔본-읽기ocr)).
 
 호스트에 따로 설치할 프로그램은 없어요. 설정에 쓰는 `openrag` 명령은 서버 이미지 안에 들어 있어요.
 
@@ -446,14 +447,26 @@ $E openrag key revoke <키 ID>        # 바로 막기. 그 키로 오는 요청�
 
 ## 10. 스캔본 읽기(OCR)
 
-HWP·HWPX·MD·TXT, 그리고 글자가 들어 있는 PDF는 서버 안에서 바로 읽어요. 스캔한 PDF와 사진
-(PNG, JPG, WEBP)은 OCR이 있어야 글자를 읽을 수 있어요.
+HWP·HWPX·MD·TXT는 서버 안에서 바로 읽어요. PDF는 서버 이미지에 들어 있는 kordoc이 읽어요. 글자 층이 있는
+페이지는 그 글자를 쓰고, 스캔한 페이지는 kordoc의 한국어 OCR로 서버 안에서 읽어요. OCR 모델도 이미지에 들어
+있어서, 스캔한 PDF는 Schift OCR 키 없이도 검색되고 회사 밖으로 나가는 것도 없어요.
 
-- PDF에 글자 층이 없는 페이지(스캔한 페이지)가 있으면 PDF를 Schift OCR에 보내서 그 페이지를 채워요.
-  글자 층이 있는 페이지는 원래 글자를 그대로 써요.
-- 이때 PDF 전체가 한 번에 가요. Schift 사용량도 전체 페이지 수로 잡혀요.
-- OCR을 설정하지 않았는데 글자가 하나도 없는 PDF를 넣으면, 빈 문서로 넣지 않고 오류로 알려 줘요
-  (`this PDF has no text layer (a scan?) and OCR is not configured`).
+- 서버 안 OCR은 CPU로 돌아서 느려요. 스캔한 4쪽짜리 PDF가 x86 서버에서 15초쯤 걸렸어요. 한 PDF가 10분을
+  넘기면 멈추고 내장 파서로 읽어요.
+- kordoc이 실패하면 서버의 내장 파서로 읽어요. 내장 파서는 스캔한 페이지를 읽지 못하고, 한글 문서에서 내보낸
+  PDF는 글자를 많이 놓쳐요.
+- 서버 안 OCR만 끄려면 `configs/pipeline.default.yaml`의 `parse.kordoc_ocr: false`, kordoc을 아예 쓰지
+  않으려면 `parse.pdf_engine: native`로 바꾸세요.
+
+Schift OCR은 이럴 때만 써요.
+
+- 사진 파일(PNG, JPG, WEBP)
+- 서버 안 OCR로도 글자가 나오지 않은 PDF 페이지
+
+이때 PDF 전체가 한 번에 가요. Schift 사용량도 전체 페이지 수로 잡혀요.
+
+- Schift OCR을 설정하지 않았으면 그런 페이지는 글자 없이 넣어요. PDF 전체에 글자가 하나도 없으면 빈 문서로
+  넣지 않고 오류로 알려 줘요.
 - Schift가 바쁘다고(429) 하면 기다렸다가 다시 보내요. 최대 8번까지, 기다리는 시간은 모두 합쳐 길어야
   160초예요.
 
@@ -475,6 +488,17 @@ OCR 모드는 문서 등급에 따라 자동으로 정해져요.
 
 학습에 쓰이면 안 되는 문서는 등급 5 이상인 버킷의 폴더에 넣으세요([7장](#7-문서-넣기고치기지우기)). 기준은
 `configs/pipeline.default.yaml`의 `ocr_mode_by_auth_level`에서 바꿀 수 있어요.
+
+### 회사 밖으로 보내기 전에 묻기
+
+- MCP 2026-07-28 규격으로 붙은 클라이언트가 사용자에게 물어볼 수 있으면(elicitation), Schift로 보내기 전에
+  `scan.pdf: 2 of 6 pages have no readable text. Send those pages to Schift OCR, a cloud service, to read them?`
+  처럼 물어요. 보내기를 고르면 보내고, 거절하면 그 페이지는 글자 없이 넣고, 취소하면 문서를 넣지 않아요.
+- HTTP API로 파일을 넣을 때는 `remote_ocr` 값을 같이 보낼 수 있어요. `ask`는 보낼 페이지가 있으면 넣지 않고
+  409(`remote_ocr_consent_required`)로 알려 줘요. `allow`는 보내고, `deny`는 보내지 않아요. 값이 없으면
+  묻지 않고 보내요.
+- 문서 폴더에서 읽는 파일은 묻지 않고 보내요. 회사 밖으로 보내면 안 되는 문서가 폴더에 있으면 Schift OCR을
+  설정하지 마세요. 등급(위 표)은 Schift에 남는지만 정하고, 보내는 것 자체는 막지 않아요.
 
 ## 11. 검색 품질: 임베딩 서버
 
@@ -601,10 +625,15 @@ Docker가 쓰는 디스크가 꽉 찼어요. 처음 띄울 때는 12GB쯤 필요
 설치하는 중이라 아직 넣은 문서가 없다면, `down -v`로 볼륨까지 지우고 다시 띄우는 게 가장 확실해요. 볼륨을 지우면
 데이터베이스도 지워지니 설치 중일 때만 그렇게 하세요.
 
-### PDF를 넣었더니 `this PDF has no text layer (a scan?) and OCR is not configured`
-스캔한 PDF예요. OCR을 설정하고 다시 넣으세요([10장](#10-스캔본-읽기ocr)).
+### PDF를 넣었더니 `kordoc OCR found no text in this PDF and Schift OCR is not configured`
+서버 안 OCR로도 글자가 하나도 나오지 않은 PDF예요. 빈 페이지만 있거나 그림뿐인 PDF일 수 있어요. 글자가
+있어야 하는 문서라면 Schift OCR을 설정하고 다시 넣으세요([10장](#10-스캔본-읽기ocr)). 내장 파서로 읽을 때는
+같은 경우에 `this PDF has no text layer (a scan?) and OCR is not configured`가 나와요.
 
 ### PDF의 글자가 빠지거나 `this PDF has no text layer`가 남
+기본으로는 kordoc이 PDF를 읽어요. 아래는 kordoc을 끄거나(`parse.pdf_engine: native`) kordoc이 실패해서
+서버의 내장 파서로 읽을 때 얘기예요. 서버 로그에 `falling back to native PDF parser`가 있는지 보세요.
+
 PDF 안 글꼴에 "글자표"(ToUnicode)가 있으면 읽어요. LibreOffice와 Chrome에서 저장한 PDF로 확인했어요.
 Word·한글이 쓰는 방식(압축된 객체 묶음, 2바이트 글꼴)은 같은 구조로 만든 시험 파일로 확인했고,
 Word·한글에서 직접 저장한 파일로는 아직 시험하지 못했어요.
@@ -756,3 +785,8 @@ HTTP MCP에 헤더를 넣을 수 있는 도구면 주소 `http://<서버>:8080/m
 ```
 
 Cursor와 VS Code는 시험하지 못했어요.
+
+OpenRAG는 MCP 2026-07-28 규격과 이전 규격(2025-06-18, 2025-03-26, 2024-11-05)을 둘 다 받아요. HTTP로
+붙은 클라이언트가 파일을 직접 넣게 하려면 서버에 `OPENRAG_MCP_FILE_UPLOADS=1`을 넣으세요. 기본은 꺼져 있어요.
+4MiB까지는 요청에 담아 보내고, 그보다 크면 64MiB까지 서버가 알려 주는 주소로 따로 올려요. 올린 파일은
+넣은 뒤 서버에서 지워요. Claude Code 2.1.332는 새 규격으로 붙지만 파일 올리기는 아직 쓰지 않아요.
