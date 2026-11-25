@@ -17,6 +17,14 @@ use crate::vault::{MasterKek, VaultCrypto};
 #[async_trait]
 pub trait RedactionTextEmbedder: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError>;
+    /// Embeds a scrubbed corpus chunk alongside its optional document title.
+    async fn embed_document(
+        &self,
+        _title: Option<&str>,
+        text: &str,
+    ) -> Result<Vec<f32>, OpenRagError> {
+        self.embed_text(text).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +154,7 @@ impl CascadeRedactor {
         thumb_store: &dyn ThumbnailStore,
         text_embedder: &dyn RedactionTextEmbedder,
         kek: Option<&MasterKek>,
+        embed_document_title: bool,
     ) -> Result<RedactionJobResult, OpenRagError> {
         Self::authorize_caller(caller, &req)?;
 
@@ -190,6 +199,7 @@ impl CascadeRedactor {
             thumb_store,
             text_embedder,
             kek,
+            embed_document_title,
         )
         .await;
 
@@ -241,6 +251,7 @@ impl CascadeRedactor {
         thumb_store: &dyn ThumbnailStore,
         text_embedder: &dyn RedactionTextEmbedder,
         kek: Option<&MasterKek>,
+        embed_document_title: bool,
     ) -> Result<(), OpenRagError> {
         let org_id = req.org_id;
         let is_hard_purge = req.redaction_mode == RedactionMode::HardPurge;
@@ -695,7 +706,10 @@ impl CascadeRedactor {
         // 1. Scrub corpus.chunks
         for cid in &chunk_ids {
             let row = sqlx::query(
-                "SELECT redacted_text, bm25_text, table_html FROM corpus.chunks WHERE org_id = $1 AND id = $2",
+                "SELECT c.redacted_text, c.bm25_text, c.table_html, d.title AS doc_title
+                 FROM corpus.chunks c
+                 LEFT JOIN corpus.documents d ON d.org_id = c.org_id AND d.id = c.document_id
+                 WHERE c.org_id = $1 AND c.id = $2",
             )
             .bind(org_id)
             .bind(cid)
@@ -709,13 +723,15 @@ impl CascadeRedactor {
             let old_red: String = row.try_get("redacted_text").map_err(|e| OpenRagError::Database(e.to_string()))?;
             let old_bm25: String = row.try_get("bm25_text").map_err(|e| OpenRagError::Database(e.to_string()))?;
             let old_tbl: Option<String> = row.try_get("table_html").map_err(|e| OpenRagError::Database(e.to_string()))?;
+            let doc_title: Option<String> = row.try_get("doc_title").map_err(|e| OpenRagError::Database(e.to_string()))?;
 
             let new_red = scrub_text(&old_red, pattern.as_deref(), replacement);
             let new_bm25 = scrub_text(&old_bm25, pattern.as_deref(), replacement);
             let new_tbl = old_tbl.map(|t| scrub_text(&t, pattern.as_deref(), replacement));
             let new_hash = sha256_hex_str(&new_red);
-            // Ingestion embeds the masked chunk text; the scrubbed text replaces it.
-            let new_emb = Vector::from(text_embedder.embed_text(&new_red).await?);
+            // Match ingestion's contextual embedding so redacted chunks stay in the same vector space.
+            let embed_title = embed_document_title.then_some(doc_title.as_deref()).flatten();
+            let new_emb = Vector::from(text_embedder.embed_document(embed_title, &new_red).await?);
 
             sqlx::query(
                 "UPDATE corpus.chunks

@@ -405,6 +405,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await;
     assert!(matches!(forbidden_job, Err(OpenRagError::Forbidden(_))));
@@ -425,6 +426,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await?;
     assert_eq!(no_thumb_res.affected_counts.thumbnails_masked, 0);
@@ -453,6 +455,7 @@ async fn live_pii_profile_vault_guard_and_cascade_redaction() -> Result<(), Box<
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await?;
 
@@ -704,7 +707,8 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
             },
             &thumb_store,
             &TestTextEmbedder,
-                Some(&kek),
+            Some(&kek),
+            true,
         )
         .await;
         assert!(
@@ -728,6 +732,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await?;
     assert_eq!(doc_a_res.affected_counts.memories, 0);
@@ -796,6 +801,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
         &thumb_store,
         &TestTextEmbedder,
         None,
+        true,
     )
     .await?;
     assert!(purge_res.affected_counts.vault_entries_purged >= 1);
@@ -873,6 +879,7 @@ async fn live_cascade_redactor_cross_dept_rejection_and_post_purge_reingest() ->
         &thumb_store,
         &TestTextEmbedder,
         None,
+        true,
     )
     .await?;
     assert!(pat_purge.affected_counts.chunks >= 1);
@@ -1035,6 +1042,7 @@ async fn live_pattern_dept_kek_vault_isolation_and_empty_pattern_rejected() -> R
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await;
     assert!(
@@ -1060,6 +1068,7 @@ async fn live_pattern_dept_kek_vault_isolation_and_empty_pattern_rejected() -> R
         &thumb_store,
         &TestTextEmbedder,
         Some(&kek),
+        true,
     )
     .await?;
     assert_eq!(dept_a_purge.affected_counts.vault_entries_purged, 0);

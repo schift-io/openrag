@@ -1071,8 +1071,15 @@ pub(crate) async fn ingest_document_into_bucket(
         };
 
         let page_chunks = split_text_chunks(&page_raw_text, 1000, &doc_title);
+        let embed_title = pipeline
+            .store
+            .embed_document_title
+            .then_some(doc_title.as_str());
         for chunk_text in page_chunks {
-            let emb = state.text_embedder.embed_text(&chunk_text).await?;
+            let emb = state
+                .text_embedder
+                .embed_document(embed_title, &chunk_text)
+                .await?;
             let text_hash = sha256_hex_str(&chunk_text);
             let chunk_id = Uuid::now_v7();
             let chunk_arn = Arn::new(
@@ -1587,6 +1594,7 @@ async fn sync_documents_handler(
         policy: &policy,
         concept_lookup: &concept_lookup,
         uses_s3_vectors,
+        embed_document_title: pipeline.store.embed_document_title,
         pending_wiki_archives: &mut pending_wiki_archives,
     };
 
@@ -1705,6 +1713,7 @@ struct SyncContext<'a> {
     policy: &'a GuardPolicyRuntime,
     concept_lookup: &'a InMemoryConceptAliasLookup,
     uses_s3_vectors: bool,
+    embed_document_title: bool,
     pending_wiki_archives: &'a mut Vec<(Uuid, String)>,
 }
 
@@ -2355,6 +2364,7 @@ async fn sync_corpus_item(
                         tags: &norm_tags,
                         embed_model: state.text_embedder.model_name(),
                         embedder: state.text_embedder.as_ref(),
+                        embed_document_title: ctx.embed_document_title,
                     },
                     &guarded_page_text,
                     &mut next_chunk_idx,
@@ -2400,6 +2410,7 @@ async fn sync_corpus_item(
                         tags: &norm_tags,
                         embed_model: state.text_embedder.model_name(),
                         embedder: state.text_embedder.as_ref(),
+                        embed_document_title: ctx.embed_document_title,
                     },
                     &guarded_page_text,
                     &mut next_chunk_idx,
@@ -2597,6 +2608,7 @@ async fn sync_corpus_item(
                 tags: &norm_tags,
                 embed_model: state.text_embedder.model_name(),
                 embedder: state.text_embedder.as_ref(),
+                embed_document_title: ctx.embed_document_title,
             },
             &guarded_page_text,
             &mut next_chunk_idx,
@@ -2646,6 +2658,7 @@ struct SyncChunkInsertCtx<'a> {
     tags: &'a [String],
     embed_model: &'a str,
     embedder: &'a dyn TextEmbedder,
+    embed_document_title: bool,
 }
 
 async fn insert_sync_page(
@@ -2707,6 +2720,7 @@ async fn insert_sync_page_chunks(
 ) -> Result<usize, OpenRagError> {
     let sanitized_page_text = neutralize_literal_pii_tokens(guarded_page_text);
     let chunks = split_text_chunks(&sanitized_page_text, 1000, ctx.title);
+    let embed_title = ctx.embed_document_title.then_some(ctx.title);
     let mut inserted = 0usize;
     for chunk_text in chunks {
 
@@ -2721,7 +2735,7 @@ async fn insert_sync_page_chunks(
         )?
         .to_canonical();
         let text_hash = sha256_hex_str(&chunk_text);
-        let emb = ctx.embedder.embed_text(&chunk_text).await?;
+        let emb = ctx.embedder.embed_document(embed_title, &chunk_text).await?;
 
         sqlx::query(
             "INSERT INTO corpus.chunks (

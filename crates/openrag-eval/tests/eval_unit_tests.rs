@@ -237,7 +237,11 @@ retrieve:
 "#;
     let parsed_fixture = parse_pipeline_yaml_tolerant(fixture_yaml)?;
     assert_eq!(parsed_fixture.store.dim, 256);
+    assert!(parsed_fixture.store.embed_document_title);
     assert!((parsed_fixture.retrieve.latest_revision_boost - 0.15).abs() < 1e-6);
+
+    let fixture_disabled = fixture_yaml.replace("bm25: pg_search", "bm25: pg_search\n  embed_document_title: false");
+    assert!(!parse_pipeline_yaml_tolerant(&fixture_disabled)?.store.embed_document_title);
 
     // Reject dim != 256
     let bad_dim = fixture_yaml.replace("dim: 256", "dim: 128");

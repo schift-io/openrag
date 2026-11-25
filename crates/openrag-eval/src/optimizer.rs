@@ -110,6 +110,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
             outbox_batch_size: 64,
             outbox_max_attempts: 3,
             pg_pinecone_search: Default::default(),
+            embed_document_title: true,
         },
         retrieve: RetrieveConfig {
             spaces: vec![
@@ -316,6 +317,7 @@ struct TolerantStoreConfig {
     outbox_batch_size: Option<u32>,
     outbox_max_attempts: Option<u32>,
     pg_pinecone_search: Option<openrag_core::PgPineconeSearchConfig>,
+    embed_document_title: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,6 +513,9 @@ pub fn parse_pipeline_yaml_with_profile(
         }
         if let Some(v) = st.pg_pinecone_search {
             cfg.store.pg_pinecone_search = v;
+        }
+        if let Some(v) = st.embed_document_title {
+            cfg.store.embed_document_title = v;
         }
     }
 

@@ -67,6 +67,8 @@ store:
   external_mirror: none
   outbox_batch_size: 64
   outbox_max_attempts: 3
+  # Include the document title when embedding corpus chunks.
+  embed_document_title: true
   # pg_pinecone search: share of clusters probed per query and exact re-ranking pool (x100 rows).
   # 0 keeps pg_pinecone's own value.
   pg_pinecone_search:

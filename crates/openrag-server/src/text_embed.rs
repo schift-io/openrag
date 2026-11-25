@@ -121,9 +121,56 @@ fn mask_pii(engine: &PiiEngine, text: &str) -> String {
 fn known_prefixes(model: &str) -> Option<(&'static str, &'static str)> {
     let m = model.to_ascii_lowercase();
     if m.starts_with("google/embeddinggemma") {
-        return Some(("task: search result | query: ", "title: none | text: "));
+        return Some(("task: search result | query: ", "title: {title} | text: "));
     }
     None
+}
+
+const MAX_TITLE_CHARS: usize = 120;
+
+/// Normalizes a document title for embedding prompts: trims, collapses whitespace runs to a
+/// single space, replaces `|` with `/` so it cannot break `title: … | text: ` delimiters, and
+/// truncates to at most 120 Unicode scalar values.
+fn clean_title(raw: &str) -> Option<String> {
+    let mut cleaned = String::with_capacity(raw.len().min(MAX_TITLE_CHARS * 4));
+    let mut char_count = 0usize;
+    let mut pending_space = false;
+    for ch in raw.trim().chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            if char_count >= MAX_TITLE_CHARS {
+                break;
+            }
+            cleaned.push(' ');
+            char_count += 1;
+            pending_space = false;
+        }
+        if char_count >= MAX_TITLE_CHARS {
+            break;
+        }
+        cleaned.push(if ch == '|' { '/' } else { ch });
+        char_count += 1;
+    }
+    let cleaned = cleaned.trim_end();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn format_document_input(prefix: &str, title: Option<&str>, text: &str) -> String {
+    if prefix.contains("{title}") {
+        let rendered_prefix = prefix.replace("{title}", title.unwrap_or("none"));
+        format!("{rendered_prefix}{text}")
+    } else if let Some(title) = title {
+        format!("{prefix}{title}\n{text}")
+    } else {
+        format!("{prefix}{text}")
+    }
 }
 
 fn env_opt(name: &str) -> Option<String> {
@@ -205,8 +252,7 @@ impl HttpTextEmbedder {
         .map(Some)
     }
 
-    async fn embed_prefixed(&self, prefix: &str, text: &str) -> Result<Vec<f32>, OpenRagError> {
-        let input = format!("{prefix}{text}");
+    async fn embed_input(&self, input: String) -> Result<Vec<f32>, OpenRagError> {
         let mut req = self.client.post(&self.url).json(&json!({
             "model": self.model,
             "input": [input],
@@ -262,15 +308,34 @@ impl TextEmbedder for HttpTextEmbedder {
     }
 
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {
-        let Some(engine) = &self.pii_mask else {
-            return self.embed_prefixed(&self.document_prefix, text).await;
+        self.embed_document(None, text).await
+    }
+
+    async fn embed_document(
+        &self,
+        title: Option<&str>,
+        text: &str,
+    ) -> Result<Vec<f32>, OpenRagError> {
+        let (masked_title, masked_text);
+        let (raw_title, body) = match &self.pii_mask {
+            Some(engine) => {
+                // Mask before truncating the title so a PII span straddling the cut cannot leak.
+                let guard = engine.read().await;
+                masked_title = title
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| mask_pii(&guard, t));
+                masked_text = mask_pii(&guard, text);
+                (masked_title.as_deref(), masked_text.as_str())
+            }
+            None => (title, text),
         };
-        let masked = mask_pii(&*engine.read().await, text);
-        self.embed_prefixed(&self.document_prefix, &masked).await
+        let cleaned_title = raw_title.and_then(clean_title);
+        let input = format_document_input(&self.document_prefix, cleaned_title.as_deref(), body);
+        self.embed_input(input).await
     }
 
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {
-        self.embed_prefixed(&self.query_prefix, text).await
+        self.embed_input(format!("{}{text}", self.query_prefix)).await
     }
 }
 
@@ -300,7 +365,7 @@ mod tests {
     fn known_model_gets_card_prefixes_and_env_overrides_them() -> Result<(), OpenRagError> {
         let e = HttpTextEmbedder::new("http://127.0.0.1:1/v1/embeddings", "google/embeddinggemma-2", None, None, None)?;
         assert_eq!(e.query_prefix, "task: search result | query: ");
-        assert_eq!(e.document_prefix, "title: none | text: ");
+        assert_eq!(e.document_prefix, "title: {title} | text: ");
         assert_eq!(e.model_name(), "google/embeddinggemma-2@256d");
         let o = HttpTextEmbedder::new("http://x/v1/embeddings", "google/embeddinggemma-2", None, Some(String::new()), None)?;
         assert_eq!(o.query_prefix, "");
@@ -440,6 +505,91 @@ mod tests {
         let e = HttpTextEmbedder::new(format!("http://{addr}/v1/embeddings"), "m", None, None, None)?;
         let err = e.embed_text("x").await.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("503") && err.contains("model loading"), "{err}");
+        Ok(())
+    }
+
+    async fn start_mock_embed_server() -> Result<(String, Arc<std::sync::Mutex<Vec<Value>>>), Box<dyn std::error::Error>> {
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let rec = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let rec = Arc::clone(&rec);
+                async move {
+                    if let Ok(mut g) = rec.lock() {
+                        g.push(body);
+                    }
+                    axum::Json(json!({ "data": [{ "embedding": vec![0.5_f32; 768] }] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Ok((format!("http://{addr}/v1/embeddings"), seen))
+    }
+
+    #[tokio::test]
+    async fn embed_document_substitutes_title_and_cleans_delimiters() -> Result<(), Box<dyn std::error::Error>> {
+        let (url, seen) = start_mock_embed_server().await?;
+        let e = HttpTextEmbedder::new(url, "google/embeddinggemma-2", None, None, None)?;
+
+        e.embed_document(Some("출장비 규정"), "일비 75,000원").await?;
+        e.embed_document(Some("  2026년\n출장비\t규정 | 개정판  "), "본문").await?;
+        let long_title = "가".repeat(150);
+        e.embed_document(Some(&long_title), "본문").await?;
+        e.embed_document(None, "제목 없음").await?;
+        e.embed_document(Some("   \n\t "), "빈 제목").await?;
+
+        let got = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0]["input"][0], "title: 출장비 규정 | text: 일비 75,000원");
+        assert_eq!(got[1]["input"][0], "title: 2026년 출장비 규정 / 개정판 | text: 본문");
+        let expected_long = format!("title: {} | text: 본문", "가".repeat(120));
+        assert_eq!(got[2]["input"][0], expected_long);
+        assert_eq!(got[3]["input"][0], "title: none | text: 제목 없음");
+        assert_eq!(got[4]["input"][0], "title: none | text: 빈 제목");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embed_document_masks_pii_in_title_when_enabled() -> Result<(), Box<dyn std::error::Error>> {
+        let (url, seen) = start_mock_embed_server().await?;
+        let e = HttpTextEmbedder::new(url, "google/embeddinggemma-2", None, None, None)?
+            .with_pii_masking(Arc::new(RwLock::new(PiiEngine::default())));
+
+        e.embed_document(Some("고객 010-2345-6789 상담록"), "연락처 010-9876-5432").await?;
+
+        let got = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(got.len(), 1);
+        let input = got[0]["input"][0].as_str().unwrap_or_default();
+        assert!(!input.contains("010-2345-6789"), "title phone leaked: {input}");
+        assert!(!input.contains("010-9876-5432"), "body phone leaked: {input}");
+        assert_eq!(input, "title: 고객 [PII:PHONE] 상담록 | text: 연락처 [PII:PHONE]");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embed_document_prepends_title_for_custom_prefix_without_placeholder(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, seen) = start_mock_embed_server().await?;
+        let e = HttpTextEmbedder::new(
+            url,
+            "intfloat/multilingual-e5-large",
+            None,
+            Some("query: ".into()),
+            Some("passage: ".into()),
+        )?;
+
+        e.embed_document(Some("출장비 규정"), "일비 75,000원").await?;
+        e.embed_document(None, "제목 없음").await?;
+        e.embed_document(Some("   "), "빈 제목").await?;
+
+        let got = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["input"][0], "passage: 출장비 규정\n일비 75,000원");
+        assert_eq!(got[1]["input"][0], "passage: 제목 없음");
+        assert_eq!(got[2]["input"][0], "passage: 빈 제목");
         Ok(())
     }
 }

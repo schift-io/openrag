@@ -329,6 +329,14 @@ impl RedactionTextEmbedder for RedactionEmbedderAdapter {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {
         self.0.embed_text(text).await
     }
+
+    async fn embed_document(
+        &self,
+        title: Option<&str>,
+        text: &str,
+    ) -> Result<Vec<f32>, OpenRagError> {
+        self.0.embed_document(title, text).await
+    }
 }
 
 // ============================================================================
@@ -2840,6 +2848,7 @@ async fn studio_pii_redactions_create_handler(
         reason: req.reason,
     };
 
+    let embed_document_title = state.pipeline_config.read().await.store.embed_document_title;
     let thumb_adapter = BlobThumbnailStoreAdapter(Arc::clone(&state.blob_store));
     let embed_adapter = RedactionEmbedderAdapter(Arc::clone(&state.text_embedder));
     let res = CascadeRedactor::run_job(
@@ -2849,6 +2858,7 @@ async fn studio_pii_redactions_create_handler(
         &thumb_adapter,
         &embed_adapter,
         Some(&state.master_kek),
+        embed_document_title,
     )
     .await
     .map_err(ApiError::from)?;

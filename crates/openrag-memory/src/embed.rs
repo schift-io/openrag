@@ -9,6 +9,14 @@ pub trait TextEmbedder: Send + Sync {
     fn model_name(&self) -> &str;
     /// Embeds stored content (chunks, pages, wiki pages, memories).
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, OpenRagError>;
+    /// Embeds a document chunk alongside its optional document title.
+    async fn embed_document(
+        &self,
+        _title: Option<&str>,
+        text: &str,
+    ) -> Result<Vec<f32>, OpenRagError> {
+        self.embed_text(text).await
+    }
     /// Embeds a search query. Asymmetric models use a different instruction prefix for
     /// queries; symmetric embedders keep the default, which is the document embedding.
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>, OpenRagError> {

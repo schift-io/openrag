@@ -129,6 +129,10 @@ pub enum ExternalMirrorBackend {
     Usearch,
 }
 
+const fn default_embed_document_title() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfig {
@@ -141,6 +145,9 @@ pub struct StoreConfig {
     pub outbox_max_attempts: u32,
     #[serde(default)]
     pub pg_pinecone_search: PgPineconeSearchConfig,
+    /// Include the document title when embedding corpus chunks.
+    #[serde(default = "default_embed_document_title")]
+    pub embed_document_title: bool,
 }
 
 /// pg_pinecone (native engine) search settings, set on each search transaction with `SET LOCAL`.
