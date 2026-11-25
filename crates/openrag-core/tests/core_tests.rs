@@ -104,22 +104,26 @@ fn store_chunker_defaults_and_parsing() -> Result<(), Box<dyn std::error::Error>
     use openrag_core::ChunkerKind;
 
     let base = include_str!("../../../configs/pipeline.default.yaml");
-    assert_eq!(PipelineConfig::from_yaml_str(base)?.store.chunker, ChunkerKind::Fixed);
+    assert_eq!(PipelineConfig::from_yaml_str(base)?.store.chunker, ChunkerKind::Structure);
 
     let airgap = include_str!("../../../configs/pipeline.airgap.yaml");
-    assert_eq!(PipelineConfig::from_yaml_str(airgap)?.store.chunker, ChunkerKind::Fixed);
+    assert_eq!(PipelineConfig::from_yaml_str(airgap)?.store.chunker, ChunkerKind::Structure);
 
-    let structure = base.replace("chunker: fixed", "chunker: structure");
-    assert_ne!(structure, base);
+    let fixed = base.replace("chunker: structure", "chunker: fixed");
+    assert_ne!(fixed, base);
+    assert_eq!(PipelineConfig::from_yaml_str(&fixed)?.store.chunker, ChunkerKind::Fixed);
+
+    let structure = fixed.replace("chunker: fixed", "chunker: structure");
+    assert_ne!(structure, fixed);
     assert_eq!(PipelineConfig::from_yaml_str(&structure)?.store.chunker, ChunkerKind::Structure);
 
-    let semantic = base.replace("chunker: fixed", "chunker: semantic");
+    let semantic = base.replace("chunker: structure", "chunker: semantic");
     assert_ne!(semantic, base);
     assert_eq!(PipelineConfig::from_yaml_str(&semantic)?.store.chunker, ChunkerKind::Semantic);
 
-    let omitted = base.replace("  chunker: fixed\n", "");
+    let omitted = base.replace("  chunker: structure\n", "");
     assert_ne!(omitted, base);
-    assert_eq!(PipelineConfig::from_yaml_str(&omitted)?.store.chunker, ChunkerKind::Fixed);
+    assert_eq!(PipelineConfig::from_yaml_str(&omitted)?.store.chunker, ChunkerKind::Structure);
     Ok(())
 }
 
